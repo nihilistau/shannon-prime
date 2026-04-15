@@ -135,10 +135,11 @@ __global__ void kernel_band_quantize_simple(
     int n_bands,
     const int *band_bits, // [n_bands] bits per band (device memory)
     int band_size,        // n / n_bands
-    int total_bytes       // bytes per compressed vector
+    int total_bytes,      // bytes per compressed vector
+    int n_vecs            // number of vectors
 ) {
     int vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Bounds check handled by caller (n_vecs)
+    if (vec_idx >= n_vecs) return;
 
     const float *vec = input + (size_t)vec_idx * n;
     uint8_t *out     = output + (size_t)vec_idx * total_bytes;
@@ -204,9 +205,11 @@ __global__ void kernel_band_dequantize_simple(
     int n_bands,
     const int *band_bits,
     int band_size,
-    int total_bytes
+    int total_bytes,
+    int n_vecs
 ) {
     int vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec_idx >= n_vecs) return;
 
     const uint8_t *in = input + (size_t)vec_idx * total_bytes;
     float *vec        = output + (size_t)vec_idx * n;
@@ -337,7 +340,7 @@ void sp_cuda_band_quantize(const float *d_input, void *d_output,
     kernel_band_quantize_simple<<<grid, block, 0, s>>>(
         d_input, (uint8_t *)d_output,
         n, bc->n_bands, d_band_bits,
-        bc->band_size, bc->total_bytes
+        bc->band_size, bc->total_bytes, n_vecs
     );
 
     cudaFree(d_band_bits);
@@ -359,7 +362,7 @@ void sp_cuda_band_dequantize(const void *d_input, float *d_output,
     kernel_band_dequantize_simple<<<grid, block, 0, s>>>(
         (const uint8_t *)d_input, d_output,
         n, bc->n_bands, d_band_bits,
-        bc->band_size, bc->total_bytes
+        bc->band_size, bc->total_bytes, n_vecs
     );
 
     cudaFree(d_band_bits);
@@ -506,7 +509,7 @@ void sp_cuda_read_k(const sp_cuda_cache_t *cc,
     sp_cuda_band_dequantize(src, d_k_out, &cc->k_bands, 1, (void *)s);
 
     if (cc->config.use_mobius_mask) {
-        sp_cuda_mobius_unreorder(d_k_out, cc->d_mobius_inv, hd, 1, (void *)s);
+        sp_cuda_mobius_unreorder(d_k_out, cc->d_mobius_order, hd, 1, (void *)s);
     }
 
     sp_cuda_iwht_inplace(d_k_out, hd, 1, (void *)s);
@@ -607,7 +610,7 @@ void sp_cuda_read_k_batch(const sp_cuda_cache_t *cc,
     sp_cuda_band_dequantize(src, d_k_out, &cc->k_bands, n_pos, (void *)s);
 
     if (cc->config.use_mobius_mask) {
-        sp_cuda_mobius_unreorder(d_k_out, cc->d_mobius_inv, hd, n_pos, (void *)s);
+        sp_cuda_mobius_unreorder(d_k_out, cc->d_mobius_order, hd, n_pos, (void *)s);
     }
 
     sp_cuda_iwht_inplace(d_k_out, hd, n_pos, (void *)s);

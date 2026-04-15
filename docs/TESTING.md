@@ -7,7 +7,7 @@ cd shannon-prime
 make test-all
 ```
 
-This runs all 6 test suites (109 tests total). Every suite must pass before shipping.
+This runs all 7 test suites (116 tests total). Every suite must pass before shipping.
 
 For individual suites:
 
@@ -15,6 +15,7 @@ For individual suites:
 make test-core          # C core math (31 tests)
 make test-adreno        # Adreno/ARM mobile (14 tests)
 make test-vulkan        # Vulkan + CPU fallback (4 tests)
+make test-cuda          # CUDA backend on a real NVIDIA GPU (7 tests)
 make test-integration   # llama.cpp integration (7 tests)
 make test-torch         # PyTorch backend (28 tests)
 make test-comfyui       # ComfyUI + Wan architecture (25 tests)
@@ -100,6 +101,42 @@ Without Vulkan SDK, exercises the CPU fallback path through the Vulkan API surfa
 **K Pipeline (1 test):** Write + read K, correlation >0.990.
 **V Pipeline (1 test):** Write + read V, correlation >0.950.
 **Batch Ops (1 test):** Write + read 8 positions in batch, average correlation >0.990.
+
+### CUDA (7 tests)
+
+```bash
+make test-cuda
+```
+
+Runs against a real NVIDIA GPU via the CUDA runtime. Requires `nvcc` and a host
+C/C++ compiler (on Windows, the MSVC environment must be sourced before invoking
+`make` — e.g. from a Developer Command Prompt, or by wrapping via
+`scripts/build_test_cuda.bat`). Default architecture is `sm_75` (Turing); override
+with `make test-cuda NVCC_ARCH=-arch=sm_80` (Ampere), `-arch=sm_86`,
+`-arch=sm_89` (Ada), `-arch=sm_90` (Hopper), etc. The API takes device pointers,
+so the test harness stages host↔device with `cudaMemcpy`.
+
+**Init (1 test):** `sp_cuda_cache_init()` with the default stream succeeds after
+confirming at least one CUDA device is present.
+**K Pipeline (1 test):** Write + read K through the full GPU chain
+(WHT → Möbius reorder → band quantize → dequantize → Möbius unreorder → iWHT),
+correlation >0.990.
+**V Pipeline (1 test):** Same shape, no Möbius, V config (flat 3-bit),
+correlation >0.950.
+**K Batch (1 test):** 8-position batch, avg correlation >0.990. Catches
+per-vector indexing bugs in the batch kernels that single-vector tests miss.
+**V Batch (1 test):** 8-position batch, avg correlation >0.950.
+**Multi-layer/head (1 test):** 4 layers × 2 heads × 4 positions = 32 K vectors
+across distinct cache slots. Minimum correlation >0.980. Catches per-slot
+offset bugs in the K cache addressing.
+**Memory diagnostic (1 test):** `sp_cuda_print_memory()` runs without crashing
+and reports ~76 bytes/vector for K (vs 256 fp16) and ~50 bytes for V.
+
+If K fails but V passes: the Möbius unreorder path is broken. Check that the
+read path passes `d_mobius_order` (same table as reorder), not an inverse.
+If both K and V produce wildly out-of-range values (e.g. 1e30+): the band
+quantize/dequantize kernels are writing out-of-bounds — check that the
+kernels bounds-check `vec_idx` against `n_vecs`.
 
 ### llama.cpp Integration (7 tests)
 
