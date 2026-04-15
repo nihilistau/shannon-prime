@@ -11,6 +11,13 @@
 #include <string.h>
 #include <stdio.h>
 
+// Build-time backend gates. Define SP_HAVE_ADRENO when linking against
+// backends/adreno/shannon_prime_adreno.c. The other backends remain
+// commented out here until their bridge cases are written.
+#ifdef SP_HAVE_ADRENO
+  #include "../backends/adreno/shannon_prime_adreno.h"
+#endif
+
 // ============================================================================
 // Internal context
 // ============================================================================
@@ -19,11 +26,13 @@ struct sp_llama_ctx_s {
     sp_llama_params_t  params;
     sp_config_t        config;
 
-    // Backend-specific cache (exactly one is active)
-    sp_shadow_cache_t  cpu_cache;      // CPU backend
+    // Backend-specific cache (exactly one is active).
+    sp_shadow_cache_t  cpu_cache;      // CPU backend — always compiled
+#ifdef SP_HAVE_ADRENO
+    sp_adreno_cache_t  adreno_cache;   // ARM NEON (Tier 1/2) backend
+#endif
     // sp_cuda_cache_t    cuda_cache;  // CUDA backend (when linked)
     // sp_vulkan_cache_t *vulkan_cache; // Vulkan backend
-    // sp_adreno_cache_t  adreno_cache; // Adreno backend
 
     int active_backend;  // Which backend is in use
     int n_positions;     // Current max written position
@@ -80,7 +89,19 @@ sp_llama_ctx_t *sp_llama_init(const sp_llama_params_t *params) {
     parse_env_bits("SHANNON_PRIME_V_BITS", cfg.v_band_bits, 1, v_defaults);
     cfg.use_mobius_mask = parse_env_bool("SHANNON_PRIME_MOBIUS", 1);
 
-    return sp_llama_init_config(params, &cfg);
+    // Allow the caller to request a specific backend via env var.
+    // Valid values: "cpu" (default), "adreno". Unknown values → caller's
+    // params->backend is used unchanged.
+    sp_llama_params_t p = *params;
+    const char *b = getenv("SHANNON_PRIME_BACKEND");
+    if (b) {
+        if (strcmp(b, "cpu") == 0)            p.backend = SP_BACKEND_CPU;
+#ifdef SP_HAVE_ADRENO
+        else if (strcmp(b, "adreno") == 0)    p.backend = SP_BACKEND_ADRENO;
+#endif
+    }
+
+    return sp_llama_init_config(&p, &cfg);
 }
 
 sp_llama_ctx_t *sp_llama_init_config(const sp_llama_params_t *params,
@@ -115,9 +136,18 @@ sp_llama_ctx_t *sp_llama_init_config(const sp_llama_params_t *params,
         }
         break;
     }
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO: {
+        if (sp_adreno_cache_init(&ctx->adreno_cache, cfg,
+                                  params->max_seq_len) != 0) {
+            free(ctx);
+            return NULL;
+        }
+        break;
+    }
+#endif
     // case SP_BACKEND_CUDA: ...
     // case SP_BACKEND_VULKAN: ...
-    // case SP_BACKEND_ADRENO: ...
     }
 
     if (parse_env_bool("SHANNON_PRIME_VERBOSE", 0)) {
@@ -143,6 +173,11 @@ void sp_llama_free(sp_llama_ctx_t *ctx) {
         sp_shadow_cache_free(&ctx->cpu_cache);
         break;
     }
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_cache_free(&ctx->adreno_cache);
+        break;
+#endif
     }
 
     free(ctx);
@@ -167,6 +202,11 @@ void sp_llama_write_k(sp_llama_ctx_t *ctx,
     default:
         sp_shadow_write_k(&ctx->cpu_cache, layer, head, pos, k_vec);
         break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_write_k(&ctx->adreno_cache, layer, head, pos, k_vec);
+        break;
+#endif
     }
     if (pos >= ctx->n_positions) ctx->n_positions = pos + 1;
 }
@@ -179,6 +219,11 @@ void sp_llama_write_v(sp_llama_ctx_t *ctx,
     default:
         sp_shadow_write_v(&ctx->cpu_cache, layer, head, pos, v_vec);
         break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_write_v(&ctx->adreno_cache, layer, head, pos, v_vec);
+        break;
+#endif
     }
 }
 
@@ -214,6 +259,11 @@ void sp_llama_read_k(const sp_llama_ctx_t *ctx,
     default:
         sp_shadow_read_k(&ctx->cpu_cache, layer, head, pos, k_out);
         break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_read_k(&ctx->adreno_cache, layer, head, pos, k_out);
+        break;
+#endif
     }
 }
 
@@ -225,6 +275,11 @@ void sp_llama_read_v(const sp_llama_ctx_t *ctx,
     default:
         sp_shadow_read_v(&ctx->cpu_cache, layer, head, pos, v_out);
         break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_read_v(&ctx->adreno_cache, layer, head, pos, v_out);
+        break;
+#endif
     }
 }
 
@@ -254,6 +309,13 @@ void sp_llama_read_v_batch(const sp_llama_ctx_t *ctx,
 
 void sp_llama_clear_range(sp_llama_ctx_t *ctx,
                           int start_pos, int end_pos) {
+    if (ctx->active_backend != SP_BACKEND_CPU) {
+        // TODO: adreno/cuda/vulkan clear_range. The eval-callback hook doesn't
+        // need this during inference (round-trip is in-place), so leave as
+        // no-op for non-CPU backends until a caller actually needs it.
+        return;
+    }
+
     // Zero out the compressed cache in the given range
     int n_slots = ctx->config.n_layers * ctx->config.n_heads_kv;
 
@@ -274,8 +336,22 @@ sp_llama_memory_t sp_llama_memory(const sp_llama_ctx_t *ctx) {
     int n = ctx->n_positions;
     int hd = ctx->config.head_dim;
 
-    mem.compressed_bytes = (size_t)n_slots * n *
-        (ctx->cpu_cache.k_bands.total_bytes + ctx->cpu_cache.v_bands.total_bytes);
+    // Both backends expose .k_bands / .v_bands with the same total_bytes
+    // derived from config. Read whichever is active.
+    int k_total_bytes = 0;
+    int v_total_bytes = 0;
+#ifdef SP_HAVE_ADRENO
+    if (ctx->active_backend == SP_BACKEND_ADRENO) {
+        k_total_bytes = ctx->adreno_cache.k_bands.total_bytes;
+        v_total_bytes = ctx->adreno_cache.v_bands.total_bytes;
+    } else
+#endif
+    {
+        k_total_bytes = ctx->cpu_cache.k_bands.total_bytes;
+        v_total_bytes = ctx->cpu_cache.v_bands.total_bytes;
+    }
+
+    mem.compressed_bytes = (size_t)n_slots * n * (k_total_bytes + v_total_bytes);
     mem.baseline_bytes = (size_t)n_slots * n * hd * 2 * 2; // K+V × fp16
     mem.compression_ratio = (mem.compressed_bytes > 0)
         ? (float)mem.baseline_bytes / (float)mem.compressed_bytes
