@@ -82,10 +82,22 @@ sp_llama_ctx_t *sp_llama_init(const sp_llama_params_t *params) {
     sp_config_t cfg;
     sp_config_init(&cfg, params->head_dim, params->n_layers, params->n_heads_kv);
 
-    // Override from environment
-    int k_defaults[] = {5, 5, 4, 3};
-    int v_defaults[] = {3};
-    parse_env_bits("SHANNON_PRIME_K_BITS", cfg.k_band_bits, 4, k_defaults);
+    // Adaptive K band count. Paper's finding: band_size below ~32 starves
+    // the band with too few coefficients to meaningfully split the energy
+    // decay. hd>=128 gets 4 bands (5/5/4/3, ~32 elts per band); hd==64 gets
+    // 3 bands (5/4/4, ~21 elts per band) — the mobile-safe config from the
+    // Shannon-Prime paper §3.5. V is always flat 3-bit regardless of head_dim.
+    int k_n_bands_default = (params->head_dim >= 128) ? 4 : 3;
+    int k_defaults_hd128[] = {5, 5, 4, 3};
+    int k_defaults_hd64 [] = {5, 4, 4, 4};   // 4th entry only used if env overrides n_bands
+    int v_defaults[]        = {3};
+
+    const int * k_defaults = (k_n_bands_default == 4) ? k_defaults_hd128 : k_defaults_hd64;
+    cfg.k_n_bands = k_n_bands_default;
+
+    // Override from environment (SHANNON_PRIME_K_BITS may carry a differently-
+    // sized comma list; parse_env_bits will pad with the last value).
+    parse_env_bits("SHANNON_PRIME_K_BITS", cfg.k_band_bits, k_n_bands_default, k_defaults);
     parse_env_bits("SHANNON_PRIME_V_BITS", cfg.v_band_bits, 1, v_defaults);
     cfg.use_mobius_mask = parse_env_bool("SHANNON_PRIME_MOBIUS", 1);
 
