@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+*.spv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CUDA
+*.cubin
+*.ptx
+*.fatbin
+
+# Temporary
+*.tmp
+*.bak
+
+# Don't ignore these
+!.gitkeep

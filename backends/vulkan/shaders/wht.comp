@@ -1,0 +1,67 @@
+// Shannon-Prime VHT2: Exact Spectral KV Cache Compression
+// Copyright (C) 2026 Ray Daniels. All Rights Reserved.
+//
+// Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
+// Commercial license available — contact raydaniels@gmail.com
+//
+// See LICENSE in the project root for full terms.
+
+// GLSL Compute Shader: In-place Walsh-Hadamard Transform
+//
+// Processes one vector per workgroup using shared memory butterfly.
+// n must be power of 2 and <= max workgroup size (typically 256 or 1024).
+//
+// For head_dim=128: log2(128)=7 barrier-synchronized passes.
+// For head_dim=64:  log2(64)=6 passes.
+
+#version 450
+
+layout(local_size_x_id = 0) in; // Specialization constant for workgroup size
+
+layout(set = 0, binding = 0) buffer Data {
+    float data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n;         // Vector length (power of 2)
+    uint n_vecs;    // Number of vectors
+};
+
+shared float smem[256]; // Max head_dim=256
+
+void main() {
+    uint vec_idx = gl_WorkGroupID.x;
+    uint tid     = gl_LocalInvocationID.x;
+
+    if (vec_idx >= n_vecs) return;
+
+    uint base = vec_idx * n;
+
+    // Load into shared memory
+    if (tid < n) {
+        smem[tid] = data[base + tid];
+    }
+    barrier();
+
+    // Butterfly passes
+    for (uint len = 1u; len < n; len <<= 1u) {
+        if (tid < n) {
+            uint grp  = tid / (len << 1u);
+            uint pos  = tid % (len << 1u);
+            uint boff = grp * (len << 1u);
+
+            if (pos < len) {
+                float u = smem[boff + pos];
+                float v = smem[boff + pos + len];
+                smem[boff + pos]       = u + v;
+                smem[boff + pos + len] = u - v;
+            }
+        }
+        barrier();
+    }
+
+    // Write back
+    if (tid < n) {
+        data[base + tid] = smem[tid];
+    }
+}

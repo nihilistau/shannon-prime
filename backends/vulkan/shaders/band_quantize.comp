@@ -1,0 +1,134 @@
+// Shannon-Prime VHT2: Exact Spectral KV Cache Compression
+// Copyright (C) 2026 Ray Daniels. All Rights Reserved.
+//
+// Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
+// Commercial license available — contact raydaniels@gmail.com
+//
+// See LICENSE in the project root for full terms.
+
+// GLSL Compute Shader: VHT2 Banded Quantization
+//
+// Processes one vector per workgroup.
+// Phase 1: shared-memory reduction to find max(abs) per band → scale
+// Phase 2: each thread quantizes its element
+// Phase 3: sequential bit packing per band (thread 0)
+//
+// This is the "simple" version — one workgroup per vector.
+// Production optimization: parallel bit packing via warp shuffle.
+
+#version 450
+
+layout(local_size_x = 128) in; // Must be >= band_size
+
+layout(set = 0, binding = 0) readonly buffer Input {
+    float input_data[];
+};
+
+layout(set = 0, binding = 1) writeonly buffer Output {
+    uint output_data[];  // Packed output (reinterpreted as bytes)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n;             // Vector length (head_dim)
+    uint n_bands;       // Number of bands
+    uint band_size;     // n / n_bands
+    uint total_words;   // Output words per vector (total_bytes / 4, rounded up)
+    uint band_bits_0;   // Bits for band 0
+    uint band_bits_1;   // Bits for band 1
+    uint band_bits_2;   // Bits for band 2
+    uint band_bits_3;   // Bits for band 3
+};
+
+shared float smem_abs[128]; // For reduction
+shared float band_scale;    // Result of reduction
+
+uint get_band_bits(uint band) {
+    if (band == 0u) return band_bits_0;
+    if (band == 1u) return band_bits_1;
+    if (band == 2u) return band_bits_2;
+    return band_bits_3;
+}
+
+void main() {
+    uint vec_idx = gl_WorkGroupID.x;
+    uint tid     = gl_LocalInvocationID.x;
+
+    uint in_base  = vec_idx * n;
+    uint out_base = vec_idx * total_words;
+
+    // Process each band sequentially (bands are small: 32 elements each)
+    uint out_word_offset = 0u;
+    uint out_bit_offset  = 0u;
+
+    for (uint b = 0u; b < n_bands; b++) {
+        uint bits = get_band_bits(b);
+        uint max_val = (1u << (bits - 1u)) - 1u;
+        uint band_start = b * band_size;
+
+        // Phase 1: Find max(abs) in this band via shared-memory reduction
+        float my_abs = 0.0;
+        if (tid < band_size) {
+            my_abs = abs(input_data[in_base + band_start + tid]);
+        }
+        smem_abs[tid] = my_abs;
+        barrier();
+
+        // Simple reduction (band_size is small)
+        for (uint s = 64u; s > 0u; s >>= 1u) {
+            if (tid < s && tid + s < band_size) {
+                smem_abs[tid] = max(smem_abs[tid], smem_abs[tid + s]);
+            }
+            barrier();
+        }
+
+        if (tid == 0u) {
+            float amax = smem_abs[0];
+            band_scale = (amax > 0.0) ? amax / float(max_val) : 0.0;
+
+            // Write scale as fp16 (stored in first 2 bytes of band output)
+            // For simplicity, store as float scale in first word
+            output_data[out_base + out_word_offset] =
+                floatBitsToUint(band_scale);
+            out_word_offset++;
+        }
+        barrier();
+
+        // Phase 2: Quantize each element
+        // Thread 0 handles packing sequentially for correctness.
+        // (Production version: parallel packing with subgroup ops)
+        if (tid == 0u) {
+            uint bit_buffer = 0u;
+            uint bit_pos    = 0u;
+
+            for (uint i = 0u; i < band_size; i++) {
+                float val = input_data[in_base + band_start + i];
+                float inv_scale = (band_scale > 0.0) ? 1.0 / band_scale : 0.0;
+
+                int q = int(round(val * inv_scale));
+                q = clamp(q, -int(max_val), int(max_val));
+                uint u = uint(q + int(max_val));
+
+                bit_buffer |= (u << bit_pos);
+                bit_pos += bits;
+
+                while (bit_pos >= 32u) {
+                    output_data[out_base + out_word_offset] = bit_buffer;
+                    out_word_offset++;
+                    bit_buffer >>= 32u;
+                    bit_pos -= 32u;
+                    // Handle bits that crossed the word boundary
+                    if (bit_pos > 0u) {
+                        bit_buffer = u >> (bits - bit_pos);
+                    }
+                }
+            }
+
+            // Flush remaining bits
+            if (bit_pos > 0u) {
+                output_data[out_base + out_word_offset] = bit_buffer;
+                out_word_offset++;
+            }
+        }
+        barrier();
+    }
+}
