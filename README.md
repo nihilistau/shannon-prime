@@ -35,7 +35,10 @@ shannon-prime/
 │   └── adreno/                Qualcomm Snapdragon: NEON, Hexagon, big.LITTLE
 ├── tools/
 │   ├── shannon_prime_llama.*   llama.cpp integration (7/7 tests)
-│   └── shannon_prime_comfyui.py ComfyUI + Wan 2.1/2.2 (25/25 tests)
+│   ├── shannon_prime_comfyui.py ComfyUI + Wan 2.1/2.2 (25/25 tests)
+│   ├── sp_inject_freqs.py     GGUF frequency injection (zero retraining PPL improvement)
+│   ├── sp_compress_model.py   Weight spectral analysis and VHT2 compression
+│   └── sp_benchmark.py        Compression benchmark and spectral analysis
 ├── tests/                     109 tests across 6 suites
 └── docs/                      Full documentation
 ```
@@ -45,6 +48,7 @@ shannon-prime/
 | Document | Contents |
 |----------|----------|
 | [docs/Shannon-Prime.md](docs/Shannon-Prime.md) | Theory, pipeline, license rationale, key results |
+| [docs/TOOLS.md](docs/TOOLS.md) | Command-line tools: benchmark, freq injection, weight compression |
 | [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) | llama.cpp: hook points, API, env vars, GQA support |
 | [docs/INTEGRATION-COMFYUI.md](docs/INTEGRATION-COMFYUI.md) | ComfyUI: Wan 2.1/2.2 MoE, expert switching, linear wrapper |
 | [docs/BACKEND-CUDA.md](docs/BACKEND-CUDA.md) | CUDA kernels, memory layout, building |

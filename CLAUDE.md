@@ -64,8 +64,11 @@ backends/
 tools/
   shannon_prime_llama   llama.cpp integration layer (C)
   shannon_prime_comfyui ComfyUI integration (Python, Wan 2.1/2.2 aware)
+  sp_inject_freqs.py    GGUF frequency injection (zero-retraining PPL improvement)
+  sp_compress_model.py  Weight spectral analysis and VHT2 compression
+  sp_benchmark.py       Compression benchmark and spectral analysis (no model needed)
 tests/                 6 test suites
-docs/                  8 documentation files
+docs/                  9 documentation files
 ```
 
 ## Key Files
