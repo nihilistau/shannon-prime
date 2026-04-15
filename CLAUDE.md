@@ -52,6 +52,26 @@ make test-torch  # PyTorch backend (28 tests)
 6. K gets Möbius reorder, V does not (self-attention). Both get reorder (cross-attention).
 7. The Möbius mask is cross-platform invariant. K corr 0.997 on both hd=128 and hd=64.
 
+## WHY These Specific Choices (Do Not "Optimize" Without Understanding)
+
+- 5/5/4/3 is not arbitrary. It mirrors measured WHT energy decay. The correct
+  optimization direction is ADAPTIVE allocation (measure energy, allocate bits
+  proportionally), not trying different fixed configs.
+
+- The NaN guard exists because aggressive bit configs (4/4/3 and below on hd=64)
+  produce NaN at chunk 2+ despite healthy single-chunk correlations. The NaN appears
+  in attention softmax after accumulated compressed history. Ship config (5/4/4) is
+  NaN-safe, but the guard is defense-in-depth for users who override defaults.
+
+- Cross-attention in Wan models has NO RoPE on K/V. Both K and V get Möbius reorder
+  and matching bit allocation. This is DIFFERENT from self-attention where only K
+  gets reorder and V gets flat quant. The agent must check which attention type
+  it's working with before applying compression.
+
+- This is NOT just a cache system. It's a theory (Position Is Arithmetic) with
+  cache compression as a validated consequence. If extending the Vilenkin path
+  or modifying frequency generation, read Position_Is_Arithmetic_v7.md first.
+
 ## Architecture
 
 ```
