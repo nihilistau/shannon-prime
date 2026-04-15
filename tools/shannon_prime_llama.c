@@ -231,19 +231,35 @@ void sp_llama_write_k_batch(sp_llama_ctx_t *ctx,
                             int layer, int head,
                             int start_pos, int n_pos,
                             const float *k_vecs) {
-    int hd = ctx->config.head_dim;
-    for (int i = 0; i < n_pos; i++) {
-        sp_llama_write_k(ctx, layer, head, start_pos + i, k_vecs + i * hd);
+    switch (ctx->active_backend) {
+    case SP_BACKEND_CPU:
+    default:
+        sp_shadow_write_k_batch(&ctx->cpu_cache, layer, head, start_pos, n_pos, k_vecs);
+        break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_write_k_batch(&ctx->adreno_cache, layer, head, start_pos, n_pos, k_vecs);
+        break;
+#endif
     }
+    int last_pos = start_pos + n_pos - 1;
+    if (last_pos >= ctx->n_positions) ctx->n_positions = last_pos + 1;
 }
 
 void sp_llama_write_v_batch(sp_llama_ctx_t *ctx,
                             int layer, int head,
                             int start_pos, int n_pos,
                             const float *v_vecs) {
-    int hd = ctx->config.head_dim;
-    for (int i = 0; i < n_pos; i++) {
-        sp_llama_write_v(ctx, layer, head, start_pos + i, v_vecs + i * hd);
+    switch (ctx->active_backend) {
+    case SP_BACKEND_CPU:
+    default:
+        sp_shadow_write_v_batch(&ctx->cpu_cache, layer, head, start_pos, n_pos, v_vecs);
+        break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_write_v_batch(&ctx->adreno_cache, layer, head, start_pos, n_pos, v_vecs);
+        break;
+#endif
     }
 }
 
@@ -287,9 +303,16 @@ void sp_llama_read_k_batch(const sp_llama_ctx_t *ctx,
                            int layer, int head,
                            int start_pos, int n_pos,
                            float *k_out) {
-    int hd = ctx->config.head_dim;
-    for (int i = 0; i < n_pos; i++) {
-        sp_llama_read_k(ctx, layer, head, start_pos + i, k_out + i * hd);
+    switch (ctx->active_backend) {
+    case SP_BACKEND_CPU:
+    default:
+        sp_shadow_read_k_batch(&ctx->cpu_cache, layer, head, start_pos, n_pos, k_out);
+        break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_read_k_batch(&ctx->adreno_cache, layer, head, start_pos, n_pos, k_out);
+        break;
+#endif
     }
 }
 
@@ -297,9 +320,16 @@ void sp_llama_read_v_batch(const sp_llama_ctx_t *ctx,
                            int layer, int head,
                            int start_pos, int n_pos,
                            float *v_out) {
-    int hd = ctx->config.head_dim;
-    for (int i = 0; i < n_pos; i++) {
-        sp_llama_read_v(ctx, layer, head, start_pos + i, v_out + i * hd);
+    switch (ctx->active_backend) {
+    case SP_BACKEND_CPU:
+    default:
+        sp_shadow_read_v_batch(&ctx->cpu_cache, layer, head, start_pos, n_pos, v_out);
+        break;
+#ifdef SP_HAVE_ADRENO
+    case SP_BACKEND_ADRENO:
+        sp_adreno_read_v_batch(&ctx->adreno_cache, layer, head, start_pos, n_pos, v_out);
+        break;
+#endif
     }
 }
 

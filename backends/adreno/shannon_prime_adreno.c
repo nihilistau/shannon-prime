@@ -717,9 +717,9 @@ void sp_adreno_write_k(sp_adreno_cache_t *ac,
     // WHT forward
     do_wht_f32(scratch, hd, ac->decode_target);
 
-    // Möbius reorder
+    // Möbius reorder — use ac->scratch_b as tmp (no malloc)
     if (ac->config.use_mobius_mask) {
-        sp_mobius_reorder(scratch, &ac->mobius_mask);
+        sp_mobius_reorder_ex(scratch, &ac->mobius_mask, ac->scratch_b);
     }
 
     // Quantize into cache
@@ -768,7 +768,7 @@ void sp_adreno_write_k_f16(sp_adreno_cache_t *ac,
 #endif
 
     if (ac->config.use_mobius_mask) {
-        sp_mobius_reorder(ac->scratch_a, &ac->mobius_mask);
+        sp_mobius_reorder_ex(ac->scratch_a, &ac->mobius_mask, ac->scratch_b);
     }
 
     int slot = layer * ac->config.n_heads_kv + head;
@@ -814,7 +814,8 @@ void sp_adreno_read_k(const sp_adreno_cache_t *ac,
     sp_neon_band_dequantize(ac->k_cache + offset, k_out, &ac->k_bands);
 
     if (ac->config.use_mobius_mask) {
-        sp_mobius_unreorder(k_out, &ac->mobius_mask);
+        sp_mobius_unreorder_ex(k_out, &ac->mobius_mask,
+                               ((sp_adreno_cache_t *)ac)->scratch_b);
     }
 
     do_iwht_f32(k_out, hd, ac->decode_target);
@@ -836,6 +837,53 @@ void sp_adreno_read_v(const sp_adreno_cache_t *ac,
     sp_nan_guard_f32(v_out, hd, 65504.0f);
 
     ((sp_adreno_cache_t *)ac)->n_reads++;
+}
+
+// ============================================================================
+// Batch variants — tight loop over singletons, reusing ac->scratch_{a,b}.
+// Amortizes one level of function-call / dispatch overhead across n_pos
+// vectors. The NEON inner loops (WHT, Möbius gather, band quantize) stay
+// warm in icache across iterations.
+// ============================================================================
+
+void sp_adreno_write_k_batch(sp_adreno_cache_t *ac,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *k_vecs) {
+    int hd = ac->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_adreno_write_k(ac, layer, head, start_pos + i, k_vecs + (size_t)i * hd);
+    }
+}
+
+void sp_adreno_write_v_batch(sp_adreno_cache_t *ac,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *v_vecs) {
+    int hd = ac->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_adreno_write_v(ac, layer, head, start_pos + i, v_vecs + (size_t)i * hd);
+    }
+}
+
+void sp_adreno_read_k_batch(const sp_adreno_cache_t *ac,
+                            int layer, int head,
+                            int start_pos, int n_pos,
+                            float *k_out) {
+    int hd = ac->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_adreno_read_k(ac, layer, head, start_pos + i, k_out + (size_t)i * hd);
+    }
+}
+
+void sp_adreno_read_v_batch(const sp_adreno_cache_t *ac,
+                            int layer, int head,
+                            int start_pos, int n_pos,
+                            float *v_out) {
+    int hd = ac->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_adreno_read_v(ac, layer, head, start_pos + i, v_out + (size_t)i * hd);
+    }
 }
 
 // ============================================================================

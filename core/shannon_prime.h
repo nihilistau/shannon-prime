@@ -115,6 +115,13 @@ void sp_mobius_reorder(float *wht_coeffs, const sp_mobius_mask_t *mask);
 // Inverse reorder (restore original index order after dequantization).
 void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask);
 
+// Caller-owned-scratch variants. `scratch` must be at least mask->n floats
+// and is writable. Used on the hot path to avoid malloc per KV vector.
+void sp_mobius_reorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+                          float *scratch);
+void sp_mobius_unreorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+                            float *scratch);
+
 // ============================================================================
 // VHT2 banded quantization
 // ============================================================================
@@ -230,8 +237,13 @@ typedef struct {
     uint8_t           **v_cache;     // same layout
     int                *seq_len;     // per-layer current sequence length
 
-    // Scratch buffers for WHT (per-thread in threaded backends)
-    float              *wht_scratch; // head_dim floats
+    // Scratch buffers (callee-owned; callers must serialize across threads).
+    // wht_scratch      primary WHT working buffer for write path
+    // mobius_scratch   scratch for Möbius reorder tmp (hot path, avoids malloc)
+    // read_scratch     WHT buffer for read path (avoids malloc per read)
+    float              *wht_scratch;    // head_dim floats
+    float              *mobius_scratch; // head_dim floats
+    float              *read_scratch;   // head_dim floats
 } sp_shadow_cache_t;
 
 // Initialize shadow cache. Backend allocates compressed storage.
@@ -261,6 +273,28 @@ void sp_shadow_read_k(const sp_shadow_cache_t *sc,
 void sp_shadow_read_v(const sp_shadow_cache_t *sc,
                       int layer, int head, int pos,
                       float *v_out);
+
+// Batch variants — process n_pos contiguous vectors with a single setup.
+// k_vecs / v_vecs must be contiguous [n_pos × head_dim] arrays.
+// These are the real batches: they run in a tight loop over the persistent
+// scratch buffers (no per-vector malloc) so they amortize pipeline cost
+// across the batch. start_pos + n_pos must fit within the cache's max_seq.
+void sp_shadow_write_k_batch(sp_shadow_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *k_vecs);
+void sp_shadow_write_v_batch(sp_shadow_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *v_vecs);
+void sp_shadow_read_k_batch (const sp_shadow_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             float *k_out);
+void sp_shadow_read_v_batch (const sp_shadow_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             float *v_out);
 
 // ============================================================================
 // NaN guard — clamp reconstructed values to safe range

@@ -229,15 +229,32 @@ void sp_mobius_mask_free(sp_mobius_mask_t *mask) {
     mask->order = NULL;
 }
 
+// Caller-owned-scratch variants. Used on the hot path (shadow cache,
+// Adreno backend) to avoid malloc per KV vector.
+void sp_mobius_reorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+                          float *scratch) {
+    int n = mask->n;
+    for (int i = 0; i < n; i++) {
+        scratch[i] = wht_coeffs[mask->order[i]];
+    }
+    memcpy(wht_coeffs, scratch, n * sizeof(float));
+}
+
+void sp_mobius_unreorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+                            float *scratch) {
+    int n = mask->n;
+    for (int i = 0; i < n; i++) {
+        scratch[mask->order[i]] = wht_coeffs[i];
+    }
+    memcpy(wht_coeffs, scratch, n * sizeof(float));
+}
+
+// Malloc-owning variants retained for existing callers (tests, research code).
 void sp_mobius_reorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
     int n = mask->n;
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
-
-    for (int i = 0; i < n; i++) {
-        tmp[i] = wht_coeffs[mask->order[i]];
-    }
-    memcpy(wht_coeffs, tmp, n * sizeof(float));
+    sp_mobius_reorder_ex(wht_coeffs, mask, tmp);
     free(tmp);
 }
 
@@ -245,11 +262,7 @@ void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
     int n = mask->n;
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
-
-    for (int i = 0; i < n; i++) {
-        tmp[mask->order[i]] = wht_coeffs[i];
-    }
-    memcpy(wht_coeffs, tmp, n * sizeof(float));
+    sp_mobius_unreorder_ex(wht_coeffs, mask, tmp);
     free(tmp);
 }
 
@@ -611,9 +624,14 @@ int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
         }
     }
 
-    // Allocate scratch buffer
-    sc->wht_scratch = (float *)malloc(cfg->head_dim * sizeof(float));
-    if (!sc->wht_scratch) return -1;
+    // Allocate persistent scratch buffers so the hot path never mallocs.
+    // wht_scratch     : write-path WHT buffer
+    // mobius_scratch  : Möbius reorder/unreorder tmp (shared between write+read)
+    // read_scratch    : read-path WHT buffer (independent of write path)
+    sc->wht_scratch    = (float *)malloc(cfg->head_dim * sizeof(float));
+    sc->mobius_scratch = (float *)malloc(cfg->head_dim * sizeof(float));
+    sc->read_scratch   = (float *)malloc(cfg->head_dim * sizeof(float));
+    if (!sc->wht_scratch || !sc->mobius_scratch || !sc->read_scratch) return -1;
 
     // Cache storage will be allocated by backend (depends on max_seq_len)
     sc->k_cache = NULL;
@@ -628,35 +646,31 @@ void sp_shadow_cache_free(sp_shadow_cache_t *sc) {
         sp_mobius_mask_free(&sc->mobius_mask);
     }
     free(sc->wht_scratch);
+    free(sc->mobius_scratch);
+    free(sc->read_scratch);
     free(sc->seq_len);
     // k_cache and v_cache freed by backend
-    sc->wht_scratch = NULL;
-    sc->seq_len = NULL;
+    sc->wht_scratch    = NULL;
+    sc->mobius_scratch = NULL;
+    sc->read_scratch   = NULL;
+    sc->seq_len        = NULL;
 }
 
 // Write path: raw KV → WHT → Möbius reorder → band quantize → store
+// Hot path: uses persistent sc->wht_scratch + sc->mobius_scratch. No malloc.
 void sp_shadow_write_k(sp_shadow_cache_t *sc,
                        int layer, int head, int pos,
                        const float *k_vec) {
     int hd = sc->config.head_dim;
     float *scratch = sc->wht_scratch;
 
-    // Copy to scratch
     memcpy(scratch, k_vec, hd * sizeof(float));
-
-    // WHT forward
     sp_wht_inplace_f32(scratch, hd);
 
-    // Normalize (WHT is unnormalized; scale by 1/sqrt(N) for symmetric form)
-    // For quantization we keep unnormalized — scale absorbs it
-    // (The scale per band captures the actual magnitude)
-
-    // Möbius reorder (squarefree first)
     if (sc->config.use_mobius_mask) {
-        sp_mobius_reorder(scratch, &sc->mobius_mask);
+        sp_mobius_reorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
-    // Band quantize
     int slot = layer * sc->config.n_heads_kv + head;
     uint8_t *dest = sc->k_cache[slot] + (size_t)pos * sc->k_bands.total_bytes;
     sp_band_quantize(scratch, dest, &sc->k_bands);
@@ -680,62 +694,92 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
 }
 
 // Read path: load → band dequantize → Möbius unreorder → inverse WHT → KV
+// Hot path: uses persistent sc->read_scratch + sc->mobius_scratch. No malloc.
+// The `const` on sc is a contract for thread-call-safety, not true immutability
+// — we write into sc->read_scratch / sc->mobius_scratch. Callers must serialize.
 void sp_shadow_read_k(const sp_shadow_cache_t *sc,
                       int layer, int head, int pos,
                       float *k_out) {
     int hd = sc->config.head_dim;
-    // Note: read path needs its own scratch to be thread-safe.
-    // For reference impl, we allocate locally.
-    // Backends should use thread-local scratch.
-    float *scratch = (float *)malloc(hd * sizeof(float));
+    float *scratch = sc->read_scratch;
 
     int slot = layer * sc->config.n_heads_kv + head;
     const uint8_t *src = sc->k_cache[slot] + (size_t)pos * sc->k_bands.total_bytes;
 
-    // Dequantize
     sp_band_dequantize(src, scratch, &sc->k_bands);
 
-    // Möbius unreorder
     if (sc->config.use_mobius_mask) {
-        sp_mobius_unreorder(scratch, &sc->mobius_mask);
+        sp_mobius_unreorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
-    // Inverse WHT (same as forward, then divide by N)
     sp_wht_inplace_f32(scratch, hd);
     float inv_n = 1.0f / (float)hd;
-    for (int i = 0; i < hd; i++) {
-        scratch[i] *= inv_n;
-    }
+    for (int i = 0; i < hd; i++) scratch[i] *= inv_n;
 
-    // NaN guard (defense in depth — ship config shouldn't need it)
-    sp_nan_guard_f32(scratch, hd, 65504.0f); // fp16 max
-
+    sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(k_out, scratch, hd * sizeof(float));
-    free(scratch);
 }
 
 void sp_shadow_read_v(const sp_shadow_cache_t *sc,
                       int layer, int head, int pos,
                       float *v_out) {
     int hd = sc->config.head_dim;
-    float *scratch = (float *)malloc(hd * sizeof(float));
+    float *scratch = sc->read_scratch;
 
     int slot = layer * sc->config.n_heads_kv + head;
     const uint8_t *src = sc->v_cache[slot] + (size_t)pos * sc->v_bands.total_bytes;
 
     sp_band_dequantize(src, scratch, &sc->v_bands);
 
-    // No Möbius unreorder for V
     sp_wht_inplace_f32(scratch, hd);
     float inv_n = 1.0f / (float)hd;
-    for (int i = 0; i < hd; i++) {
-        scratch[i] *= inv_n;
-    }
+    for (int i = 0; i < hd; i++) scratch[i] *= inv_n;
 
     sp_nan_guard_f32(scratch, hd, 65504.0f);
-
     memcpy(v_out, scratch, hd * sizeof(float));
-    free(scratch);
+}
+
+// Batch variants. Tight loop reusing the persistent scratch. Zero mallocs
+// per batch, amortizes the "copy → transform → store/load → transform
+// → copy" pipeline setup across n_pos vectors.
+void sp_shadow_write_k_batch(sp_shadow_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *k_vecs) {
+    int hd = sc->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_shadow_write_k(sc, layer, head, start_pos + i, k_vecs + (size_t)i * hd);
+    }
+}
+
+void sp_shadow_write_v_batch(sp_shadow_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *v_vecs) {
+    int hd = sc->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_shadow_write_v(sc, layer, head, start_pos + i, v_vecs + (size_t)i * hd);
+    }
+}
+
+void sp_shadow_read_k_batch(const sp_shadow_cache_t *sc,
+                            int layer, int head,
+                            int start_pos, int n_pos,
+                            float *k_out) {
+    int hd = sc->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_shadow_read_k(sc, layer, head, start_pos + i, k_out + (size_t)i * hd);
+    }
+}
+
+void sp_shadow_read_v_batch(const sp_shadow_cache_t *sc,
+                            int layer, int head,
+                            int start_pos, int n_pos,
+                            float *v_out) {
+    int hd = sc->config.head_dim;
+    for (int i = 0; i < n_pos; i++) {
+        sp_shadow_read_v(sc, layer, head, start_pos + i, v_out + (size_t)i * hd);
+    }
 }
 
 // ============================================================================

@@ -252,6 +252,26 @@ void sp_adreno_write_v_f16(sp_adreno_cache_t *ac,
                            int layer, int head, int pos,
                            const void *v_vec_f16);
 
+// Batch variants — contiguous [n_pos × head_dim] input/output, single-
+// dispatch into a tight loop that reuses the persistent scratch buffers
+// on sp_adreno_cache_t (no malloc per vector, NEON pipeline stays warm).
+void sp_adreno_write_k_batch(sp_adreno_cache_t *ac,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *k_vecs);
+void sp_adreno_write_v_batch(sp_adreno_cache_t *ac,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *v_vecs);
+void sp_adreno_read_k_batch (const sp_adreno_cache_t *ac,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             float *k_out);
+void sp_adreno_read_v_batch (const sp_adreno_cache_t *ac,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             float *v_out);
+
 // ============================================================================
 // Diagnostics
 // ============================================================================
