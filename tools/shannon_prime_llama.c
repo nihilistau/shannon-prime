@@ -70,6 +70,24 @@ static void parse_env_bits(const char *name, int *bits, int n, const int *defaul
     }
 }
 
+// Variant that infers the band count from the env string's comma count.
+// Returns the number of values parsed (1..max_n), or 0 when the env var
+// is unset. Callers can then use the returned count to override the
+// default n_bands.
+static int parse_env_bits_autocount(const char *name, int *bits, int max_n) {
+    const char *v = getenv(name);
+    if (!v || !*v) return 0;
+
+    int i = 0;
+    const char *p = v;
+    while (i < max_n && *p) {
+        bits[i++] = atoi(p);
+        while (*p && *p != ',') p++;
+        if (*p == ',') p++;
+    }
+    return i;
+}
+
 // ============================================================================
 // Lifecycle
 // ============================================================================
@@ -112,11 +130,27 @@ sp_llama_ctx_t *sp_llama_init(const sp_llama_params_t *params) {
     int v_defaults[] = { v_bits_default };
     cfg.k_n_bands = k_n_bands_default;
 
-    // Override from environment. parse_env_bits pads short env lists with
-    // the last value, so an env like K_BITS=5,5,4,3 on a 3-band cfg uses
-    // only the first three entries (5,5,4).
-    parse_env_bits("SHANNON_PRIME_K_BITS", cfg.k_band_bits, k_n_bands_default, k_defaults);
-    parse_env_bits("SHANNON_PRIME_V_BITS", cfg.v_band_bits, 1, v_defaults);
+    // Environment overrides. If SHANNON_PRIME_K_BITS or _V_BITS are set,
+    // the number of comma-separated values determines the band count
+    // (capped by SP_MAX_BANDS). E.g. `SHANNON_PRIME_K_BITS=3,3,3,3,3`
+    // → 5 bands at 3 bits each. When the env var is unset we fall back
+    // to the head-dim-adaptive defaults.
+    int k_override_n = parse_env_bits_autocount(
+        "SHANNON_PRIME_K_BITS", cfg.k_band_bits, SP_MAX_BANDS);
+    if (k_override_n > 0) {
+        cfg.k_n_bands = k_override_n;
+    } else {
+        memcpy(cfg.k_band_bits, k_defaults, k_n_bands_default * sizeof(int));
+    }
+
+    int v_override_n = parse_env_bits_autocount(
+        "SHANNON_PRIME_V_BITS", cfg.v_band_bits, SP_MAX_BANDS);
+    if (v_override_n > 0) {
+        cfg.v_n_bands = v_override_n;
+    } else {
+        cfg.v_band_bits[0] = v_bits_default;
+        cfg.v_n_bands      = 1;
+    }
     cfg.use_mobius_mask = parse_env_bool("SHANNON_PRIME_MOBIUS", 1);
 
     // Allow the caller to request a specific backend via env var.
