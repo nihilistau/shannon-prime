@@ -82,21 +82,39 @@ sp_llama_ctx_t *sp_llama_init(const sp_llama_params_t *params) {
     sp_config_t cfg;
     sp_config_init(&cfg, params->head_dim, params->n_layers, params->n_heads_kv);
 
-    // Adaptive K band count. Paper's finding: band_size below ~32 starves
-    // the band with too few coefficients to meaningfully split the energy
-    // decay. hd>=128 gets 4 bands (5/5/4/3, ~32 elts per band); hd==64 gets
-    // 3 bands (5/4/4, ~21 elts per band) — the mobile-safe config from the
-    // Shannon-Prime paper §3.5. V is always flat 3-bit regardless of head_dim.
-    int k_n_bands_default = (params->head_dim >= 128) ? 4 : 3;
+    // Adaptive K band count. Paper §3.5: band_size below ~32 starves the
+    // band with too few coefficients to meaningfully split the energy
+    // decay. hd>=128 → 4 bands (5/5/4/3, ~32 elts/band, paper's ship);
+    // hd==64 → 3 bands (5/4/4, ~21 elts/band, paper's "mobile safe").
+    //
+    // Adaptive V bit width. Paper's flat 3-bit V is validated on hd=128
+    // (Qwen3-8B); on hd=64 (Dolphin 1B) measured PPL at flat 3-bit is
+    // catastrophic (≈119 on wikitext-2 32-chunk vs baseline ~11.6). A
+    // bit-sweep at hd=64 shows 5-bit is the minimum that preserves
+    // quality (PPL 13.4); banding V adds nothing on top (5/5 == flat 5).
+    // So for hd=64 we keep V flat but bump to 5-bit. The "flat beats
+    // banded" invariant is preserved; only the bit count is head-dim
+    // adaptive.
+    int k_n_bands_default;
+    int v_bits_default;
+    const int * k_defaults;
     int k_defaults_hd128[] = {5, 5, 4, 3};
-    int k_defaults_hd64 [] = {5, 4, 4, 4};   // 4th entry only used if env overrides n_bands
-    int v_defaults[]        = {3};
-
-    const int * k_defaults = (k_n_bands_default == 4) ? k_defaults_hd128 : k_defaults_hd64;
+    int k_defaults_hd64 [] = {5, 4, 4, 4}; // 4th entry unused unless env overrides
+    if (params->head_dim >= 128) {
+        k_n_bands_default = 4;
+        k_defaults        = k_defaults_hd128;
+        v_bits_default    = 3;  // paper ship
+    } else {
+        k_n_bands_default = 3;
+        k_defaults        = k_defaults_hd64;
+        v_bits_default    = 5;  // hd=64 minimum; 3-bit is catastrophic here
+    }
+    int v_defaults[] = { v_bits_default };
     cfg.k_n_bands = k_n_bands_default;
 
-    // Override from environment (SHANNON_PRIME_K_BITS may carry a differently-
-    // sized comma list; parse_env_bits will pad with the last value).
+    // Override from environment. parse_env_bits pads short env lists with
+    // the last value, so an env like K_BITS=5,5,4,3 on a 3-band cfg uses
+    // only the first three entries (5,5,4).
     parse_env_bits("SHANNON_PRIME_K_BITS", cfg.k_band_bits, k_n_bands_default, k_defaults);
     parse_env_bits("SHANNON_PRIME_V_BITS", cfg.v_band_bits, 1, v_defaults);
     cfg.use_mobius_mask = parse_env_bool("SHANNON_PRIME_MOBIUS", 1);
