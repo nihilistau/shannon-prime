@@ -2,8 +2,6 @@
 
 **Exact Spectral KV Cache Compression via the Multiplicative Lattice**
 
-Copyright (C) 2026 Ray Daniels. Dual-licensed AGPLv3 / Commercial.
-
 ---
 
 Shannon-Prime compresses the transformer KV cache by exploiting the spectral structure that RoPE imprints on key vectors. Ship configuration: **3.4–3.8× total KV compression at <1.25% perplexity cost.** The 5/5/4/3 bit allocation beats lossless fp16 by 0.04%.
