@@ -104,4 +104,3 @@ for step, sigma in enumerate(sigmas):
 
 **Commercial license** available for proprietary integration. The commercial aspect is secondary — the primary goal is that the work belongs to the commons and is protected from closure.
 
-Contact: Ray Daniels — raydaniels@gmail.com
