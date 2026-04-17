@@ -216,6 +216,172 @@ int sp_vilenkin_extract_pass(const sp_vilenkin_basis_t *vb,
 void sp_vilenkin_pass_free(sp_vilenkin_pass_t *pass);
 
 // ============================================================================
+// Sqfree + spinor aggressive path (additive to WHT ship path)
+// ============================================================================
+//
+//   1. Squarefree basis padding (pad head_dim to clean Vilenkin dimension)
+//   2. Knight-ranked mask with Möbius CSR predictor
+//   3. N-bit residual quantization + spinor sheet bit
+//
+// Implementation: core/shannon_prime_sqfree.c
+// WHT ship path (core/shannon_prime.c) is untouched.
+
+// ============================================================================
+// Squarefree basis helpers
+// ============================================================================
+
+// Known sqfree pad dimensions for common head_dim values:
+//   hd=64  → 66  = 2·3·11
+//   hd=128 → 154 = 2·7·11
+//   hd=256 → 330 = 2·3·5·11
+#define SP_SQFREE_PAD_64    66
+#define SP_SQFREE_PAD_128   154
+#define SP_SQFREE_PAD_256   330
+
+// Test if n is squarefree and factors into {2,3,5,7,11,13}.
+bool sp_is_sqfree_factorable(int n);
+
+// Find next sqfree dimension ≥ head_dim that factors into small primes.
+int sp_sqfree_pad_dim(int head_dim);
+
+// Pad vector from head_dim to pad_dim with mean-fill.
+// out must be at least pad_dim floats. Writes pad_dim values.
+void sp_sqfree_pad_f32(const float *in, int head_dim,
+                       float *out, int pad_dim);
+
+// Truncate: just copy first head_dim values.
+void sp_sqfree_unpad_f32(const float *in, float *out, int head_dim);
+
+// ============================================================================
+// Knight-ranked mask + Möbius CSR predictor
+// ============================================================================
+//
+// The Knight mask partitions pad_dim indices into:
+//   - Skeleton: top-K squarefree by variance (stored directly)
+//   - Residual: non-squarefree not in skeleton (Möbius-predicted + quantized)
+//
+// The CSR table encodes: for residual index r, predict as
+//   pred[r] = Σ μ(d) · skel_vals[slot(n/d)]
+// over divisors d of (r+1) where μ(d)≠0 and (n/d)-1 is in skeleton.
+
+typedef struct {
+    int      pad_dim;            // Padded dimension
+    int      sk_k;               // Skeleton size (actual, may be < requested)
+    int     *skeleton_idx;       // (sk_k,) indices into [0, pad_dim)
+    int      n_res;              // Number of residual positions
+    int     *residual_idx;       // (n_res,) indices into [0, pad_dim)
+
+    // CSR representation of Möbius predictor
+    int     *csr_offsets;        // (n_res + 1,) — residual[i] uses terms
+                                 //   [offsets[i], offsets[i+1])
+    int     *csr_skel_slot;      // (n_terms,) — skeleton slot index
+    int8_t  *csr_mu_sign;        // (n_terms,) — μ(d) values (±1)
+    int      n_terms;            // Total CSR entries
+
+    // Residual config
+    int      residual_bits;      // 1, 2, 3, or 4 (3 is the Pareto point)
+    bool     use_spinor;         // Store 1-bit sheet per residual position
+} sp_knight_mask_t;
+
+// Build the mask for the given padded dimension.
+// variance: pad_dim floats of per-index variance (from calibration), or NULL.
+// If NULL, uses index order (squarefree first).
+int sp_knight_mask_init(sp_knight_mask_t *mask, int pad_dim, int sk_k,
+                        const float *variance);
+void sp_knight_mask_free(sp_knight_mask_t *mask);
+
+// ============================================================================
+// N-bit symmetric residual quantization
+// ============================================================================
+
+// Quantize: levels[i] = round((vals[i] / step) + center), clamped to [0, 2^nbits - 1]
+// where step = 2*mag/(L-1), center = (L-1)/2, L = 2^nbits.
+// mag is typically mean(|vals|).
+void sp_quantize_residual(const float *vals, int n, int nbits, float mag,
+                          uint8_t *levels);
+
+// Dequantize: vals[i] = (levels[i] - center) * step
+void sp_dequantize_residual(const uint8_t *levels, int n, int nbits, float mag,
+                            float *vals);
+
+// ============================================================================
+// Sqfree shadow cache — aggressive compression path
+// ============================================================================
+//
+// Same interface as sp_shadow_cache_t but uses:
+//   - Vilenkin-Hartley transform on sqfree-padded vectors
+//   - Knight skeleton + Möbius CSR predictor
+//   - N-bit residual + spinor sheet bit
+//
+// Validated result (Qwen3-8B Q8 hd=128):
+//   K+μ+3bit+spinor 3/3/3/3/3:  PPL 7.32 @ 3.3×
+//   (matches MOBIUS default 7.31 @ 2.6×, +27% compression)
+
+typedef struct {
+    sp_config_t         config;
+    sp_knight_mask_t    mask;
+    sp_band_config_t    k_bands;       // Operates on skeleton, not full dim
+    sp_band_config_t    v_bands;
+    sp_vilenkin_basis_t vilenkin;       // Transform basis for pad_dim
+
+    int                 pad_dim;       // Sqfree padded head dimension
+    int                 residual_bits; // 1-4 (default 3)
+    bool                use_spinor;    // Enable sheet bit correction
+
+    // Compressed storage per slot = (layer * n_heads + head)
+    // Each position stores: banded skeleton + residual levels + mag + sheet bits
+    uint8_t           **k_cache;
+    uint8_t           **v_cache;
+
+    // Scratch buffers (per-thread serialized)
+    float              *pad_scratch;   // pad_dim floats
+    float              *coeff_scratch; // pad_dim floats
+    float              *pred_scratch;  // n_res floats
+} sp_sqfree_cache_t;
+
+int  sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
+                          int max_seq_len, int residual_bits, bool use_spinor);
+void sp_sqfree_cache_free(sp_sqfree_cache_t *sc);
+
+// Write/read — same signatures as sp_shadow_cache but uses the sqfree path
+void sp_sqfree_write_k(sp_sqfree_cache_t *sc,
+                       int layer, int head, int pos,
+                       const float *k_vec);
+void sp_sqfree_write_v(sp_sqfree_cache_t *sc,
+                       int layer, int head, int pos,
+                       const float *v_vec);
+void sp_sqfree_read_k(const sp_sqfree_cache_t *sc,
+                      int layer, int head, int pos,
+                      float *k_out);
+void sp_sqfree_read_v(const sp_sqfree_cache_t *sc,
+                      int layer, int head, int pos,
+                      float *v_out);
+
+// Batch variants
+void sp_sqfree_write_k_batch(sp_sqfree_cache_t *sc,
+                             int layer, int head,
+                             int start_pos, int n_pos,
+                             const float *k_vecs);
+void sp_sqfree_read_k_batch(const sp_sqfree_cache_t *sc,
+                            int layer, int head,
+                            int start_pos, int n_pos,
+                            float *k_out);
+
+// ============================================================================
+// Scaling law — K-corr → PPL design rule
+// ============================================================================
+//
+// Empirical: log(PPL/base) ≈ 4700 · (1 − K_corr)² / (params^1.1 · bits^1.5)
+//
+// Use as pre-bench filter: if predicted_ppl_ratio > 1.05, skip the config.
+
+float sp_predicted_ppl_ratio(float k_corr, float params_b, int bits);
+bool  sp_is_pareto_viable(float k_corr, float params_b, int bits,
+                          float budget);
+float sp_min_k_corr_for_budget(float params_b, int bits, float budget);
+
+
+// ============================================================================
 // Shadow cache — the integration point
 // ============================================================================
 //

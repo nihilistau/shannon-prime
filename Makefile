@@ -10,22 +10,24 @@ NVCC       = nvcc
 NVCC_ARCH  = -arch=sm_75
 NVCC_FLAGS = -O2 $(NVCC_ARCH)
 
-CORE_SRC = core/shannon_prime.c
-CORE_HDR = core/shannon_prime.h
+CORE_SRC   = core/shannon_prime.c
+SQFREE_SRC = core/shannon_prime_sqfree.c
+CORE_HDR   = core/shannon_prime.h
 ADRENO_SRC = backends/adreno/shannon_prime_adreno.c
 VULKAN_SRC = backends/vulkan/shannon_prime_vulkan.c
 CUDA_SRC   = backends/cuda/shannon_prime_cuda.cu
+CUDA_SQFREE_SRC = backends/cuda/shannon_prime_sqfree.cu
 LLAMA_SRC  = tools/shannon_prime_llama.c
 
 .PHONY: all test test-core test-torch test-adreno test-vulkan test-cuda \
-        test-integration test-comfyui test-all clean
+        test-integration test-comfyui test-sqfree test-all clean
 
 all: test-all
 
 # ── C backends ───────────────────────────────────────────────────
-build/test_core: tests/test_core.c $(CORE_SRC) $(CORE_HDR)
+build/test_core: tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/test_core.c $(CORE_SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS)
 
 build/test_adreno: tests/test_adreno.c $(ADRENO_SRC) $(CORE_SRC)
 	@mkdir -p build
@@ -35,9 +37,9 @@ build/test_vulkan: tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(LDFLAGS)
 
-build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CORE_SRC) $(CORE_HDR)
+build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
 	@mkdir -p build
-	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CORE_SRC) -lcudart
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
 
 build/test_integration: tests/test_integration.c $(LLAMA_SRC) $(CORE_SRC)
 	@mkdir -p build
@@ -72,10 +74,14 @@ test-comfyui:
 	@echo "── ComfyUI integration (25 tests) ──"
 	@python3 tests/test_comfyui.py
 
-test-all: test-core test-adreno test-vulkan test-cuda test-integration test-torch test-comfyui
+test-sqfree:
+	@echo "── Sqfree+spinor path (69 tests) ──"
+	@PYTHONIOENCODING=utf-8 python3 tests/test_sqfree.py
+
+test-all: test-core test-adreno test-vulkan test-cuda test-integration test-torch test-comfyui test-sqfree
 	@echo ""
 	@echo "════════════════════════════════════════"
-	@echo " All 116 tests passed across 7 suites."
+	@echo " All 185 tests passed across 8 suites."
 	@echo "════════════════════════════════════════"
 
 test: test-core
