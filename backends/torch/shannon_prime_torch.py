@@ -377,11 +377,14 @@ class ShadowCache:
             # imports BandedQuantizer from this module.
             from shannon_prime_sqfree import SqfreeShadowCache  # type: ignore
 
-            # The sqfree path uses a 5-band torus-aligned default. If the
-            # caller passed a 4-band ship-style list, promote to the sqfree
-            # preset so the BandedQuantizer has an even split over the
-            # Knight skeleton size.
-            sqfree_bands = list(k_band_bits) if len(k_band_bits) == 5 else [5, 4, 4, 4, 5]
+            # Torus-aligned 5-band [5,4,4,4,5] is the sqfree default, but since
+            # v1.03 any count in [1, SP_MAX_BANDS] is honoured (matches the C
+            # core, CUDA kernel, and tools/sp_auto_bands.py's 10-band output).
+            # Only fall back when the caller passed nothing.
+            SP_MAX_BANDS = 16
+            sqfree_bands = (list(k_band_bits)
+                            if k_band_bits and 1 <= len(k_band_bits) <= SP_MAX_BANDS
+                            else [5, 4, 4, 4, 5])
             self._impl = SqfreeShadowCache(
                 head_dim=head_dim,
                 n_layers=n_layers,

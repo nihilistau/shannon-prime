@@ -345,7 +345,11 @@ void sp_cuda_band_quantize(const float *d_input, void *d_output,
                            const sp_band_config_t *bc,
                            int n_vecs, void *stream) {
     cudaStream_t s = (cudaStream_t)stream;
-    int n = bc->band_size * bc->n_bands;
+    // Must be the logical head_dim, not band_size * n_bands. The kernel
+    // uses `n` as both the per-vector stride AND the last-band upper
+    // bound, so when head_dim % n_bands != 0 (e.g. 10 bands @ hd=128)
+    // multiplying silently orphans the tail coefficients.
+    int n = bc->head_dim;
 
     // Upload band_bits to device
     int *d_band_bits;
@@ -370,7 +374,7 @@ void sp_cuda_band_dequantize(const void *d_input, float *d_output,
                              const sp_band_config_t *bc,
                              int n_vecs, void *stream) {
     cudaStream_t s = (cudaStream_t)stream;
-    int n = bc->band_size * bc->n_bands;
+    int n = bc->head_dim;  // see comment in sp_cuda_band_quantize
 
     int *d_band_bits;
     cudaMalloc(&d_band_bits, bc->n_bands * sizeof(int));

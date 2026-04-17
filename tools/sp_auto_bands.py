@@ -16,11 +16,17 @@
 #
 #   python tools/sp_auto_bands.py \
 #       --dump /tmp/k_dump.bin \
-#       --head-dim 154 \
+#       --head-dim 128 \
 #       --n-bands 10 \
-#       --total-bits 30 \
-#       --min-bits 2 --max-bits 6
-#   # → "5,4,4,3,3,3,2,2,2,2"
+#       --total-bits 35 \
+#       --min-bits 3 --max-bits 6
+#   # → "4,4,4,4,4,3,3,3,3,3"
+#
+# `--head-dim` is the dump's element count (the llama hook writes raw K
+# at the model's head_dim, not pad_dim). For sqfree models the analyser
+# operates on a proxy basis — the Walsh basis at head_dim — which is a
+# monotonic-decay stand-in for the runtime's sqfree-Vilenkin bands.
+# The bit ordering holds but absolute magnitudes aren't comparable.
 #
 # The allocation follows
 #     bits_b ≈ round( total_bits × log2(var_b + eps) / Σ_b log2(var_b + eps) )
@@ -82,13 +88,17 @@ def _vht2_vilenkin(x: np.ndarray, primes: list[int]) -> np.ndarray:
 
 
 def _factor_small_primes(n: int) -> list[int]:
+    # Must match core/shannon_prime.c's SP_VHT2_MAX_P (=11). The runtime VHT2
+    # won't apply a 13-point stage, so accepting 13 here would let us report
+    # energies on a basis the runtime can't produce.
     factors = []
-    for p in (2, 3, 5, 7, 11, 13):
+    for p in (2, 3, 5, 7, 11):
         while n % p == 0:
             factors.append(p)
             n //= p
     if n != 1:
-        raise ValueError(f"head_dim has a prime factor > 13, got remainder {n}")
+        raise ValueError(f"head_dim has a prime factor > 11 (core VHT2 cap), "
+                         f"got remainder {n}")
     return factors
 
 
@@ -136,12 +146,17 @@ def main() -> int:
     ap.add_argument("--dump", required=True,
                     help="Path to K-dump .bin (fp32) produced by SHANNON_PRIME_DUMP_K")
     ap.add_argument("--head-dim", type=int, required=True,
-                    help="Head dimension of the dumped vectors (pad_dim for sqfree)")
+                    help="Element count of each dumped vector. The llama hook "
+                         "writes raw K at the model's head_dim (not pad_dim), "
+                         "so pass 128 for a hd=128 model even when sqfree is on.")
     ap.add_argument("--n-bands", type=int, required=True,
                     help="Target number of bands (e.g. 10)")
     ap.add_argument("--total-bits", type=int, required=True,
                     help="Sum of bits across bands (e.g. 30 for 10×3 avg)")
-    ap.add_argument("--min-bits", type=int, default=2)
+    # Default min-bits is 3 per CLAUDE.md invariant #3: "3-bit floor; 2-bit
+    # is catastrophic" (measured at PPL=428.78 on Qwen3-8B 10×2 — see
+    # logs/cuda_qwen3_sqfree_10band_2.json). Override at your own risk.
+    ap.add_argument("--min-bits", type=int, default=3)
     ap.add_argument("--max-bits", type=int, default=6)
     ap.add_argument("--max-vecs", type=int, default=8192,
                     help="Cap on K vectors to read (default 8192)")

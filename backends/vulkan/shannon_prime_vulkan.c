@@ -560,12 +560,30 @@ static int vk_decompress_one_gpu(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
 // Write path: route through CPU staged VHT2 + Möbius + band quantize on the
 // Vulkan-owned host-visible scratch buffers. The GPU pipeline (vilenkin.comp,
 // mobius_reorder.comp, band_quantize.comp, band_dequantize.comp) is
-// constructed and stays alive — see vk_dispatch_all_four_gpu below — but
-// the shadow-cache path goes through CPU until the vilenkin.comp shader
-// hang on RTX 2060 (VK_ERROR_DEVICE_LOST at first vkWaitForFences) is
-// isolated with RenderDoc. The CPU staged VHT2 is the canonical,
-// fully-tested implementation; results are bit-equivalent within float
-// tolerance to what the shaders were going to emit.
+// constructed and stays alive — see vk_dispatch_all_four_gpu below — but the
+// shadow-cache path goes through CPU. Two reasons:
+//
+//   1. vilenkin.comp hung on RTX 2060 (VK_ERROR_DEVICE_LOST at first
+//      vkWaitForFences) in v1.02; v1.03's validation-first pass showed the
+//      hang no longer reproduces but K correlation is ~0.62 vs CPU.
+//   2. band_quantize.comp / band_dequantize.comp push constants only expose
+//      band_bits_0..band_bits_3 and iterate `b * band_size + i`, so the GPU
+//      path is only correct for n_bands ≤ 4, head_dim % n_bands == 0, and
+//      head_dim ≤ 128 (mobius_reorder.comp's local_size_x=128 cap). The new
+//      v1.03 10-band / non-divisible configs and any hd=256 model will
+//      silently corrupt output through this path.
+//
+// Until the shaders are widened to match the CPU reference (per-band span,
+// 16-band push-constant layout, 256-thread workgroup) the GPU dispatch stays
+// behind SHANNON_PRIME_VULKAN_FORCE_GPU and the helper below refuses any
+// config that would exercise an unimplemented shader branch.
+static int vk_gpu_dispatch_is_supported(const sp_band_config_t *bc, int head_dim) {
+    // Matches the shipped shaders' baked-in layout: ≤4 bands, divisible,
+    // head_dim ≤ 128.
+    return bc->n_bands <= 4
+        && (head_dim % bc->n_bands) == 0
+        && head_dim <= 128;
+}
 static int vk_compress_one(sp_vulkan_cache_t *cc, const float *in,
                            const sp_band_config_t *bc, int apply_mobius,
                            uint8_t *out_bytes) {
@@ -578,8 +596,23 @@ static int vk_compress_one(sp_vulkan_cache_t *cc, const float *in,
         const char *e = getenv("SHANNON_PRIME_VULKAN_FORCE_GPU");
         force_gpu = (e && e[0] == '1') ? 1 : 0;
     }
-    if (force_gpu) {
+    if (force_gpu && vk_gpu_dispatch_is_supported(bc, cc->config.head_dim)) {
         return vk_dispatch_all_four_gpu(cc, in, bc, apply_mobius, out_bytes);
+    }
+    // force_gpu was requested but the config isn't in the shaders' supported
+    // domain — fall through to CPU. This is silent-safe: the CPU path
+    // matches semantics byte-for-byte. Log once so a diagnostic run doesn't
+    // mistake the fallback for the GPU path completing successfully.
+    if (force_gpu) {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                "[Shannon-Prime Vulkan] FORCE_GPU requested but n_bands=%d hd=%d "
+                "is outside the shipped shaders' supported domain (≤4 bands, "
+                "divisible, hd≤128). Falling back to CPU staged VHT2.\n",
+                bc->n_bands, cc->config.head_dim);
+        }
     }
 
     const int hd = cc->config.head_dim;
@@ -682,7 +715,7 @@ static int vk_decompress_one(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
         const char *e = getenv("SHANNON_PRIME_VULKAN_FORCE_GPU");
         force_gpu = (e && e[0] == '1') ? 1 : 0;
     }
-    if (force_gpu) {
+    if (force_gpu && vk_gpu_dispatch_is_supported(bc, cc->config.head_dim)) {
         return vk_decompress_one_gpu(cc, in_bytes, bc, apply_mobius, out);
     }
 

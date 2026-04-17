@@ -295,12 +295,13 @@ def inject_frequencies(input_path: str, output_path: str,
         print(f"    mean:   {factors.mean():.4f}")
         print(f"    std:    {factors.std():.4f}")
 
-    # v1.03: produce a real modified GGUF that inserts
-    # `blk.<i>.rope_freqs.weight` tensors carrying the blended factors.
-    # llama.cpp's tensor loader picks these up automatically (the loader
-    # marks the tensor TENSOR_NOT_REQUIRED; when present, get_rope_factors
-    # returns it ahead of the scalar-base path). No runtime env or sidecar
-    # consumer is needed; loading the output GGUF is enough.
+    # v1.03: produce a real modified GGUF that inserts a single shared
+    # `rope_freqs.weight` tensor (no `blk.<i>.` prefix) carrying the
+    # blended factors. llama.cpp's LLM_TENSOR_ROPE_FREQS resolves to the
+    # unqualified root name even though it's declared LAYER_REPEATING —
+    # every layer reads the same tensor via `get_rope_factors`. No
+    # runtime env or sidecar consumer is needed; loading the output
+    # GGUF is enough.
     #
     # Fall back to the legacy byte-identical copy + sidecar path when either
     # the `gguf` package isn't importable or the block count cannot be
@@ -336,12 +337,14 @@ def inject_frequencies(input_path: str, output_path: str,
 
 def _rewrite_gguf_with_rope_freqs(reader, input_path, output_path,
                                   arch, n_layers, factors, verbose=True):
-    """Rewrite `input_path` as `output_path` and inject `factors` as
-    `blk.<i>.rope_freqs.weight` for i in 0..n_layers-1.
+    """Rewrite `input_path` as `output_path` and inject `factors` as the
+    shared `rope_freqs.weight` tensor (read by every layer via
+    LLM_TENSOR_ROPE_FREQS — the tensor name carries no blk prefix even
+    though the category is LAYER_REPEATING).
 
-    Copies every field and existing tensor as-is; the only additions are
-    the per-layer rope_freqs tensors. Uses the `gguf` package that ships
-    with llama.cpp / Hugging Face convert scripts.
+    Copies every field and existing tensor as-is; the only change is
+    replacing (or adding) the shared rope_freqs.weight. Uses the `gguf`
+    package that ships with llama.cpp / Hugging Face convert scripts.
     """
     writer = GGUFWriter(output_path, arch)
 
