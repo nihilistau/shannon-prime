@@ -19,8 +19,9 @@ import torch
 torch.manual_seed(42)
 
 from shannon_prime_torch import (
-    wht_inplace, iwht, MobiusMask, BandedQuantizer,
-    VilenkinBasis, ShadowCache, correlation
+    vht2, MobiusMask, BandedQuantizer,
+    ShadowCache, correlation,
+    sqfree_pad_dim,
 )
 
 passed = 0
@@ -37,18 +38,22 @@ def check(cond, msg):
 
 
 # ============================================================================
-# Test 1: WHT round-trip
+# Test 1: VHT2 round-trip (self-inverse, no 1/N)
 # ============================================================================
-print("\n== WHT Round-Trip ==")
+print("\n== VHT2 Round-Trip ==")
 for hd in [32, 64, 128, 256]:
     orig = torch.randn(hd)
-    work = orig.clone()
-    wht_inplace(work.unsqueeze(0))
-    wht_inplace(work.unsqueeze(0))
-    work /= hd
-    work = work.squeeze(0) if work.dim() > 1 else work
-    err = (orig - work).abs().max().item()
-    check(err < 1e-5, f"WHT round-trip hd={hd}: max_err={err:.2e}")
+    recon = vht2(vht2(orig.unsqueeze(0))).squeeze(0)
+    err = (orig - recon).abs().max().item()
+    check(err < 1e-5, f"VHT2 round-trip hd={hd}: max_err={err:.2e}")
+
+# VHT2 also works on sqfree (non-power-of-2) dimensions
+for hd, pad in [(64, 66), (128, 154), (210, 210)]:
+    assert sqfree_pad_dim(hd) == pad or hd == pad
+    orig = torch.randn(pad)
+    recon = vht2(vht2(orig.unsqueeze(0))).squeeze(0)
+    err = (orig - recon).abs().max().item()
+    check(err < 1e-4, f"VHT2 sqfree round-trip n={pad}: max_err={err:.2e}")
 
 # ============================================================================
 # Test 2: Möbius values
@@ -93,16 +98,15 @@ for bits, max_loss, name in configs:
     n_trials = 100
     for _ in range(n_trials):
         orig = torch.randn(hd)
-        work = orig.clone()
-        wht_inplace(work.unsqueeze(0))
-        work = work.squeeze(0)
+        # Forward VHT2
+        work = vht2(orig.unsqueeze(0)).squeeze(0)
         scales, quants = bq.quantize(work.unsqueeze(0))
         recon = bq.dequantize(
             [s.unsqueeze(0) for s in [ss.squeeze(0) for ss in scales]],
             [q.unsqueeze(0) for q in [qq.squeeze(0) for qq in quants]]
         ).squeeze(0)
-        wht_inplace(recon.unsqueeze(0))
-        recon = recon.squeeze(0) / hd
+        # Inverse VHT2 (= forward, self-inverse)
+        recon = vht2(recon.unsqueeze(0)).squeeze(0)
         total_corr += correlation(orig, recon)
     avg_corr = total_corr / n_trials
     comp = hd * 2 / bq.compressed_bytes_per_vec()
@@ -121,13 +125,11 @@ t = torch.arange(hd, dtype=torch.float32)
 k_vec = (torch.cos(2 * 3.14159 * t / 7) +
          0.5 * torch.cos(2 * 3.14159 * t / 13) +
          0.3 * torch.cos(2 * 3.14159 * t / 3))
-wht_inplace(k_vec.unsqueeze(0))
-k_vec = k_vec.squeeze(0)
+k_vec = vht2(k_vec.unsqueeze(0)).squeeze(0)
 
 # V: random
 v_vec = torch.randn(hd)
-wht_inplace(v_vec.unsqueeze(0))
-v_vec = v_vec.squeeze(0)
+v_vec = vht2(v_vec.unsqueeze(0)).squeeze(0)
 
 k_energy = [(k_vec[b*band_size:(b+1)*band_size]**2).sum().item() for b in range(4)]
 v_energy = [(v_vec[b*band_size:(b+1)*band_size]**2).sum().item() for b in range(4)]
@@ -140,17 +142,14 @@ check(k_first > 0.6, f"K first-half energy: {k_first*100:.1f}% (expect >60%)")
 check(0.3 < v_first < 0.7, f"V first-half energy: {v_first*100:.1f}% (expect ~50%)")
 
 # ============================================================================
-# Test 6: Vilenkin round-trip
+# Test 6: VHT2 on multi-prime dimensions (replaces the old Vilenkin test)
 # ============================================================================
-print("\n== Vilenkin Round-Trip ==")
-for np_ in [2, 3, 4]:
-    vb = VilenkinBasis(np_)
-    hd_test = min(vb.n, 64)
-    orig = torch.randn(hd_test)
-    coeffs = vb.forward(orig.unsqueeze(0), hd_test)
-    recon = vb.inverse(coeffs, hd_test).squeeze(0)
+print("\n== VHT2 Multi-Prime Round-Trip ==")
+for n in [6, 30, 210]:  # 2·3, 2·3·5, 2·3·5·7
+    orig = torch.randn(n)
+    recon = vht2(vht2(orig.unsqueeze(0))).squeeze(0)
     err = (orig - recon).abs().max().item()
-    check(err < 1e-4, f"Vilenkin {np_}-prime (N={vb.n}, hd={hd_test}): max_err={err:.2e}")
+    check(err < 1e-4, f"VHT2 n={n} (multi-prime): max_err={err:.2e}")
 
 # ============================================================================
 # Test 7: Full VHT2 pipeline
@@ -190,25 +189,19 @@ for _ in range(n_trials):
             + 0.2*(torch.rand(hd) - 0.5))
 
     # Without Möbius
-    work = orig.clone()
-    wht_inplace(work.unsqueeze(0))
-    work = work.squeeze(0)
+    work = vht2(orig.unsqueeze(0)).squeeze(0)
     s, q = bq.quantize(work.unsqueeze(0))
     recon = bq.dequantize(s, q).squeeze(0)
-    wht_inplace(recon.unsqueeze(0))
-    recon = recon.squeeze(0) / hd
+    recon = vht2(recon.unsqueeze(0)).squeeze(0)
     total_plain += correlation(orig, recon)
 
     # With Möbius
-    work = orig.clone()
-    wht_inplace(work.unsqueeze(0))
-    work = work.squeeze(0)
+    work = vht2(orig.unsqueeze(0)).squeeze(0)
     work = mask.reorder(work)
     s, q = bq.quantize(work.unsqueeze(0))
     recon = bq.dequantize(s, q).squeeze(0)
     recon = mask.unreorder(recon)
-    wht_inplace(recon.unsqueeze(0))
-    recon = recon.squeeze(0) / hd
+    recon = vht2(recon.unsqueeze(0)).squeeze(0)
     total_mobius += correlation(orig, recon)
 
 avg_plain = total_plain / n_trials

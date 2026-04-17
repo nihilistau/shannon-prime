@@ -56,8 +56,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from backends.torch.shannon_prime_sqfree import (
     SqfreeShadowCache,
-    correlation,
 )
+from backends.torch.shannon_prime_torch import correlation
 from tools.sp_scaling_law import (
     predicted_ppl_ratio,
     is_pareto_viable,

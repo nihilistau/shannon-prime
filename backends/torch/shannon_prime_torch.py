@@ -26,40 +26,142 @@ from typing import Optional, Tuple, List
 
 
 # =============================================================================
-# WHT — Walsh-Hadamard Transform
+# VHT2 — Vilenkin-Hartley Transform (the single transform)
 # =============================================================================
+#
+# VHT2 is the squarefree-prime-factor generalization of the Walsh-Hadamard
+# Transform. Each stage applies a p x p Hartley kernel — cas(θ) = cos(θ)+sin(θ)
+# — normalized by 1/√p. At p=2 the stage is exactly the WHT butterfly divided
+# by √2, and log2(N) stacked stages give an orthonormal transform with
+# VHT2(VHT2(x)) = x (no division by N on the inverse).
+#
+# On any dimension that factors into the supported primes {2,3,5,7,11} the
+# transform works directly. Non-factoring dimensions are handled by the
+# sqfree_pad helper below (head_dim -> next small-prime sqfree multiple).
 
-def wht_inplace(x: torch.Tensor) -> torch.Tensor:
+_SMALL_PRIMES: Tuple[int, ...] = (2, 3, 5, 7, 11)
+
+
+def _factor_small_primes(n: int) -> List[int]:
+    """Prime factorization of n into the supported small-prime set.
+
+    Returns a list of prime factors (with multiplicity, smallest first).
+    Raises ValueError if any residual prime factor is > 11 — callers that need
+    to support hd=256 with a non-sqfree factoring should pad via sqfree_pad.
     """
-    In-place Walsh-Hadamard Transform (iterative butterfly).
-    
-    x: (..., n) where n is power of 2.
-    Returns x transformed in-place.
-    
-    Self-inverse: wht(wht(x)) = n * x
+    if n < 1:
+        raise ValueError(f"dim must be >= 1, got {n}")
+    d = n
+    primes: List[int] = []
+    for p in _SMALL_PRIMES:
+        while d % p == 0:
+            primes.append(p)
+            d //= p
+    if d != 1:
+        raise ValueError(
+            f"dim {n} has a prime factor > 11 (residue {d}); "
+            f"use sqfree_pad(head_dim) to find a supported dimension"
+        )
+    return primes
+
+
+def _hartley_kernel(p: int, device, dtype) -> torch.Tensor:
+    """p x p real Hartley matrix H[i,j] = cas(2πij/p) / √p.
+
+    H is real, symmetric, and orthonormal: H @ H = I. Computed in fp64 and
+    cast to the caller's dtype to minimise float rounding in the √p factor.
+    """
+    two_pi_over_p = 2.0 * math.pi / p
+    H = torch.empty((p, p), dtype=torch.float64)
+    for i in range(p):
+        for j in range(p):
+            angle = two_pi_over_p * i * j
+            H[i, j] = math.cos(angle) + math.sin(angle)
+    H /= math.sqrt(p)
+    return H.to(device=device, dtype=dtype)
+
+
+def vht2(x: torch.Tensor) -> torch.Tensor:
+    """Vilenkin-Hartley transform on the last dim.
+
+    Self-inverse: vht2(vht2(x)) ≈ x within float tolerance. For any
+    last-dim n that factors into {2,3,5,7,11}.
+
+    The iterative staged formulation is O(n · Σp) rather than the O(n²)
+    dense-matrix formulation. Returns a new tensor (not an in-place write).
     """
     n = x.shape[-1]
-    assert n > 0 and (n & (n - 1)) == 0, f"n must be power of 2, got {n}"
+    primes = _factor_small_primes(n)
 
-    h = 1
-    while h < n:
-        # Reshape to (..., n//(2*h), 2, h) for butterfly
-        x_view = x.view(*x.shape[:-1], n // (2 * h), 2, h)
-        a = x_view[..., 0, :].clone()
-        b = x_view[..., 1, :].clone()
-        x_view[..., 0, :] = a + b
-        x_view[..., 1, :] = a - b
-        h <<= 1
+    out = x
+    stride = 1
+    for p in primes:
+        outer = n // (p * stride)
+        # (..., outer, p, stride) — length-p groups live on axis -2
+        y = out.reshape(*out.shape[:-1], outer, p, stride)
+        H = _hartley_kernel(p, device=y.device, dtype=y.dtype)
+        # y_new[..., o, k, s] = Σ_j H[k, j] · y[..., o, j, s]
+        y = torch.einsum("kj,...ojs->...oks", H, y)
+        out = y.reshape(*out.shape[:-1], n)
+        stride *= p
 
-    return x
+    return out
+
+
+# ----- Backwards-compatibility shims (deprecated, thin wrappers over vht2) ---
+# Kept so callers and existing tests that import `wht_inplace` / `iwht` keep
+# working through the transition. Both now route to the single self-inverse
+# VHT2 — meaning code that was doing `wht(x); wht(x); x.div_(n)` for a
+# round-trip should drop the division: one vht2() is the inverse of another.
+
+def wht_inplace(x: torch.Tensor) -> torch.Tensor:
+    """Deprecated alias — VHT2 on the last dim, result copied back into x.
+
+    VHT2 is self-inverse with 1/√p per stage, so applying this twice is the
+    identity (no division by N required).
+    """
+    result = vht2(x)
+    if result is not x and result.shape == x.shape:
+        x.copy_(result)
+        return x
+    return result
 
 
 def iwht(x: torch.Tensor) -> torch.Tensor:
-    """Inverse WHT = forward WHT / n."""
-    n = x.shape[-1]
-    wht_inplace(x)
-    x.div_(n)
-    return x
+    """Deprecated alias — inverse VHT2 is VHT2 itself (self-inverse)."""
+    return wht_inplace(x)
+
+
+# ----- Sqfree pad helper (used when head_dim needs padding for VHT2) --------
+
+_SMALL_PRIMES_SQFREE = (2, 3, 5, 7, 11)
+
+
+def _is_small_prime_sqfree_factorable(n: int) -> bool:
+    if n < 1:
+        return False
+    d = n
+    for p in _SMALL_PRIMES_SQFREE:
+        c = 0
+        while d % p == 0:
+            d //= p
+            c += 1
+            if c > 1:
+                return False  # squared prime
+    return d == 1
+
+
+def sqfree_pad_dim(head_dim: int) -> int:
+    """Next squarefree dimension >= head_dim that factors into {2,3,5,7,11}.
+
+    hd=64  -> 66  = 2·3·11
+    hd=128 -> 154 = 2·7·11
+    hd=256 -> 330 = 2·3·5·11
+    """
+    for n in range(max(head_dim, 2), head_dim * 4):
+        if _is_small_prime_sqfree_factorable(n):
+            return n
+    raise ValueError(f"no small-prime sqfree dim found >= {head_dim}")
 
 
 # =============================================================================
@@ -220,77 +322,24 @@ class BandedQuantizer:
 
 
 # =============================================================================
-# Vilenkin-Hartley Transform (research path)
-# =============================================================================
-
-class VilenkinBasis:
-    """
-    Multi-prime Vilenkin-Hartley basis.
-    
-    Generalizes WHT from Z/2Z to Z/p1Z × Z/p2Z × ... × Z/pkZ.
-    Hartley kernel: cas(x) = cos(x) + sin(x)
-    Self-inverse: V·V = I (when normalized by 1/sqrt(p) per factor)
-    Round-trip error: 0.0000
-    
-    Progressive prime expansion monotonically increases correlation:
-      Walsh (Z/2Z):              0.9490
-      Z/2Z × Z/3Z:              0.9493
-      Z/2Z × Z/3Z × Z/5Z:      0.9500
-      Z/2Z × Z/3Z × Z/5Z × Z/7Z: 0.9513
-    """
-
-    PRIMES = [2, 3, 5, 7, 11, 13]
-
-    def __init__(self, n_primes: int, device: str = 'cpu'):
-        assert 1 <= n_primes <= len(self.PRIMES)
-        self.n_primes = n_primes
-        self.primes = self.PRIMES[:n_primes]
-        self.n = 1
-        for p in self.primes:
-            self.n *= p
-
-        # Build basis via Kronecker product
-        basis = torch.ones(1, 1, device=device)
-        for p in self.primes:
-            h = torch.zeros(p, p, device=device)
-            for i in range(p):
-                for j in range(p):
-                    angle = 2 * math.pi * i * j / p
-                    h[i, j] = (math.cos(angle) + math.sin(angle)) / math.sqrt(p)
-            basis = torch.kron(basis, h)
-
-        self.basis = basis  # (n, n) orthonormal matrix
-
-    def forward(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
-        """Project head_dim vector into Vilenkin space (zero-pads if needed)."""
-        if head_dim < self.n:
-            pad = torch.zeros(*x.shape[:-1], self.n - head_dim,
-                            device=x.device, dtype=x.dtype)
-            x = torch.cat([x, pad], dim=-1)
-        return x @ self.basis.T.to(x.device)
-
-    def inverse(self, coeffs: torch.Tensor, head_dim: int) -> torch.Tensor:
-        """Reconstruct from Vilenkin coefficients (truncates to head_dim)."""
-        # V is orthonormal (V·V = I), so inverse = V
-        full = coeffs @ self.basis.T.to(coeffs.device)
-        return full[..., :head_dim]
-
-
-# =============================================================================
 # Shadow Cache — the main integration point
 # =============================================================================
 
 class ShadowCache:
     """
     VHT2 compressed KV cache for transformer models.
-    
-    Write path: raw KV → WHT → Möbius reorder → band quantize → store
-    Read path:  load → band dequantize → Möbius unreorder → iWHT → KV
-    
+
+    Write path: raw KV -> VHT2 forward -> Mobius reorder -> band quantize -> store
+    Read path:  load   -> band dequantize -> Mobius unreorder -> VHT2 forward -> KV
+
+    The transform on the read path is the *same* VHT2 as on write — it is
+    self-inverse (each stage normalised by 1/√p), so no division by N is
+    required to recover the original vector.
+
     Ship-safe configuration:
       K: 4 bands at 5/5/4/3 bits (with Möbius reorder)
       V: 1 band at 3 bits (flat, no reorder)
-    
+
     Achieves 3.4–3.8× total compression at <1.25% PPL cost.
     Spectral regularization: 5/5/4/3 BEATS fp16 by 0.04%.
     """
@@ -329,15 +378,9 @@ class ShadowCache:
 
     def write_k(self, layer: int, head: int, pos: int,
                 k_vec: torch.Tensor):
-        """
-        Compress and store a K vector.
-        k_vec: (head_dim,) float tensor (already RoPE'd)
-        """
-        x = k_vec.clone()
-
-        # WHT forward
-        wht_inplace(x.unsqueeze(0))
-        x = x.squeeze(0) if x.dim() > 1 else x
+        """Compress and store a K vector (head_dim,) already RoPE'd."""
+        # VHT2 forward (self-inverse, 1/√p per stage)
+        x = vht2(k_vec.unsqueeze(0)).squeeze(0)
 
         # Möbius reorder (squarefree first)
         if self.mobius is not None:
@@ -355,11 +398,10 @@ class ShadowCache:
     def write_v(self, layer: int, head: int, pos: int,
                 v_vec: torch.Tensor):
         """Compress and store a V vector."""
-        x = v_vec.clone()
-        wht_inplace(x.unsqueeze(0))
-        x = x.squeeze(0) if x.dim() > 1 else x
+        # VHT2 forward
+        x = vht2(v_vec.unsqueeze(0)).squeeze(0)
 
-        # No Möbius for V (uniform spectrum — no benefit)
+        # No Möbius for V in self-attention (uniform spectrum — no benefit)
         scales, quants = self.v_quantizer.quantize(x.unsqueeze(0))
         scales = [s.squeeze(0) for s in scales]
         quants = [q.squeeze(0) for q in quants]
@@ -379,11 +421,10 @@ class ShadowCache:
         if self.mobius is not None:
             x = self.mobius.unreorder(x)
 
-        wht_inplace(x.unsqueeze(0))
-        x = x.squeeze(0) if x.dim() > 1 else x
-        x.div_(self.head_dim)
+        # Inverse == forward for the self-inverse VHT2 (no div by N).
+        x = vht2(x.unsqueeze(0)).squeeze(0)
 
-        # NaN guard
+        # NaN / overflow guard for aggressive bit configs
         x = torch.clamp(x, -65504.0, 65504.0)
         x = torch.nan_to_num(x, nan=0.0)
 
@@ -397,9 +438,8 @@ class ShadowCache:
 
         x = self.v_quantizer.dequantize(scales, quants).squeeze(0)
 
-        wht_inplace(x.unsqueeze(0))
-        x = x.squeeze(0) if x.dim() > 1 else x
-        x.div_(self.head_dim)
+        # Inverse == forward VHT2 (no div by N — self-inverse).
+        x = vht2(x.unsqueeze(0)).squeeze(0)
 
         x = torch.clamp(x, -65504.0, 65504.0)
         x = torch.nan_to_num(x, nan=0.0)

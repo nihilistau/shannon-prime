@@ -98,48 +98,110 @@ void sp_config_init(sp_config_t *cfg, int head_dim, int n_layers, int n_heads_kv
 }
 
 // ============================================================================
-// WHT — Walsh-Hadamard Transform (in-place butterfly)
+// VHT2 — Vilenkin-Hartley Transform (the single transform)
 // ============================================================================
 //
-// The WHT is self-inverse: WHT(WHT(x)) = N*x
-// This is the Z/2Z case of the Vilenkin-Hartley basis.
-// Key property: K vectors show strong spectral concentration in first bands.
-// V vectors have uniform energy distribution.
+// Staged application of p × p Hartley kernels cas(2πkj/p)/√p for each prime
+// factor p of the vector length n (factors in {2,3,5,7,11}). Each stage is
+// orthonormal, so the whole transform is self-inverse: VHT2(VHT2(x)) = x.
+//
+// At n = 2^k this collapses to the Walsh-Hadamard butterfly scaled by 1/√2
+// per stage — the spectral structure is the same as the classical WHT but
+// there is no 1/N to undo on the inverse.
 
-void sp_wht_inplace_f32(float *data, int n) {
-    if (!sp_is_power_of_2(n)) return;
+#define SP_VHT2_MAX_P 11
 
-    // Standard iterative butterfly
-    for (int len = 1; len < n; len <<= 1) {
-        for (int i = 0; i < n; i += len << 1) {
-            for (int j = 0; j < len; j++) {
-                float u = data[i + j];
-                float v = data[i + j + len];
-                data[i + j]       = u + v;
-                data[i + j + len] = u - v;
+static const int _sp_vht2_primes[] = {2, 3, 5, 7, 11};
+static const int _sp_vht2_n_primes = 5;
+
+// Hartley kernels for each supported prime, lazily initialised on first use.
+static float _sp_H2[2][2];
+static float _sp_H3[3][3];
+static float _sp_H5[5][5];
+static float _sp_H7[7][7];
+static float _sp_H11[11][11];
+static int   _sp_vht2_initialised = 0;
+
+static void _sp_vht2_init_kernels(void) {
+    if (_sp_vht2_initialised) return;
+    float *kernels[5] = {
+        &_sp_H2[0][0], &_sp_H3[0][0], &_sp_H5[0][0],
+        &_sp_H7[0][0], &_sp_H11[0][0]
+    };
+    for (int pi = 0; pi < _sp_vht2_n_primes; pi++) {
+        int p = _sp_vht2_primes[pi];
+        float *H = kernels[pi];
+        double inv_sqrt_p = 1.0 / sqrt((double)p);
+        for (int k = 0; k < p; k++) {
+            for (int j = 0; j < p; j++) {
+                double angle = 2.0 * M_PI * (double)k * (double)j / (double)p;
+                H[k * p + j] = (float)((cos(angle) + sin(angle)) * inv_sqrt_p);
             }
         }
     }
+    _sp_vht2_initialised = 1;
 }
 
-void sp_wht_inplace_f16(uint16_t *data, int n) {
-    // Reference: convert to f32, WHT, convert back.
-    // Backends should override with SIMD (NEON, CUDA, etc.)
-    float *tmp = (float *)malloc(n * sizeof(float));
+static const float *_sp_hartley_kernel(int p) {
+    switch (p) {
+        case 2:  return &_sp_H2[0][0];
+        case 3:  return &_sp_H3[0][0];
+        case 5:  return &_sp_H5[0][0];
+        case 7:  return &_sp_H7[0][0];
+        case 11: return &_sp_H11[0][0];
+        default: return NULL;
+    }
+}
+
+void sp_vht2_forward_f32(float *data, int n) {
+    if (n <= 0) return;
+    _sp_vht2_init_kernels();
+
+    int stride = 1;
+    int residue = n;
+    for (int pi = 0; pi < _sp_vht2_n_primes; pi++) {
+        int p = _sp_vht2_primes[pi];
+        while (residue % p == 0) {
+            const float *H = _sp_hartley_kernel(p);
+            const int block = p * stride;
+            for (int i = 0; i < n; i += block) {
+                for (int j = 0; j < stride; j++) {
+                    float in[SP_VHT2_MAX_P];
+                    for (int k = 0; k < p; k++) {
+                        in[k] = data[i + k * stride + j];
+                    }
+                    for (int k = 0; k < p; k++) {
+                        float sum = 0.0f;
+                        const float *row = H + k * p;
+                        for (int m = 0; m < p; m++) sum += row[m] * in[m];
+                        data[i + k * stride + j] = sum;
+                    }
+                }
+            }
+            residue /= p;
+            stride  *= p;
+        }
+    }
+    // If residue != 1 here, n had a prime factor > 11 — caller should have
+    // padded via sqfree_pad_dim. Leave data unchanged so the failure is loud.
+}
+
+void sp_vht2_forward_f16(uint16_t *data, int n) {
+    // Reference: float promote, transform, quantise back. Backends with native
+    // fp16 support (CUDA, NEON fp16) should override.
+    float *tmp = (float *)malloc((size_t)n * sizeof(float));
     if (!tmp) return;
-
-    for (int i = 0; i < n; i++) {
-        tmp[i] = sp_f16_to_f32(data[i]);
-    }
-
-    sp_wht_inplace_f32(tmp, n);
-
-    for (int i = 0; i < n; i++) {
-        data[i] = sp_f32_to_f16(tmp[i]);
-    }
-
+    for (int i = 0; i < n; i++) tmp[i] = sp_f16_to_f32(data[i]);
+    sp_vht2_forward_f32(tmp, n);
+    for (int i = 0; i < n; i++) data[i] = sp_f32_to_f16(tmp[i]);
     free(tmp);
 }
+
+// Deprecated aliases — route through VHT2. Both forward and inverse WHT are
+// now the same self-inverse call; the 1/N normalisation the old API required
+// for round-trip is absorbed into the 1/√p per stage.
+void sp_wht_inplace_f32(float *data, int n) { sp_vht2_forward_f32(data, n); }
+void sp_wht_inplace_f16(uint16_t *data, int n) { sp_vht2_forward_f16(data, n); }
 
 // ============================================================================
 // Möbius mask
@@ -665,7 +727,7 @@ void sp_shadow_write_k(sp_shadow_cache_t *sc,
     float *scratch = sc->wht_scratch;
 
     memcpy(scratch, k_vec, hd * sizeof(float));
-    sp_wht_inplace_f32(scratch, hd);
+    sp_vht2_forward_f32(scratch, hd);
 
     if (sc->config.use_mobius_mask) {
         sp_mobius_reorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
@@ -683,7 +745,7 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
     float *scratch = sc->wht_scratch;
 
     memcpy(scratch, v_vec, hd * sizeof(float));
-    sp_wht_inplace_f32(scratch, hd);
+    sp_vht2_forward_f32(scratch, hd);
 
     // No Möbius reorder for V (uniform spectrum — no benefit)
     // V gets flat quantization (1 band), no reordering needed
@@ -712,9 +774,9 @@ void sp_shadow_read_k(const sp_shadow_cache_t *sc,
         sp_mobius_unreorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
-    sp_wht_inplace_f32(scratch, hd);
-    float inv_n = 1.0f / (float)hd;
-    for (int i = 0; i < hd; i++) scratch[i] *= inv_n;
+    // Inverse transform: VHT2 is self-inverse (1/√p per stage absorbs the
+    // 1/N the old unnormalised WHT required).
+    sp_vht2_forward_f32(scratch, hd);
 
     sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(k_out, scratch, hd * sizeof(float));
@@ -731,9 +793,8 @@ void sp_shadow_read_v(const sp_shadow_cache_t *sc,
 
     sp_band_dequantize(src, scratch, &sc->v_bands);
 
-    sp_wht_inplace_f32(scratch, hd);
-    float inv_n = 1.0f / (float)hd;
-    for (int i = 0; i < hd; i++) scratch[i] *= inv_n;
+    // Inverse transform: VHT2 is self-inverse.
+    sp_vht2_forward_f32(scratch, hd);
 
     sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(v_out, scratch, hd * sizeof(float));

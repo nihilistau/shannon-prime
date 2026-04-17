@@ -69,19 +69,33 @@ typedef struct {
 void sp_config_init(sp_config_t *cfg, int head_dim, int n_layers, int n_heads_kv);
 
 // ============================================================================
-// WHT (Walsh-Hadamard Transform) — Z/2Z basis
+// VHT2 (Vilenkin-Hartley Transform) — the single transform
 // ============================================================================
 //
-// The WHT is self-inverse: WHT(WHT(x)) = N*x
-// For vectors of length N (power of 2), in-place butterfly.
-// This is the Z/2Z special case of the Vilenkin-Hartley basis.
+// VHT2 is an orthonormal staged Hartley transform: for a length n that factors
+// into small primes {2,3,5,7,11} it applies one p × p Hartley stage per prime
+// factor, each normalised by 1/√p. The transform is self-inverse
+//   VHT2(VHT2(x)) = x           (within float tolerance, no 1/N needed)
+// so the same function serves as forward and inverse.
+//
+// At n = 2^k the stages collapse to the Walsh-Hadamard butterfly scaled by
+// 1/√2 per stage — the spectral structure is identical to the classical WHT,
+// but band quantisation and Möbius reordering work on coefficients that are
+// already in a unit-norm basis.
 
-// In-place WHT on float vector of length n (must be power of 2).
-// After transform, divide by n for normalized inverse.
+// In-place VHT2 on float vector of length n. n must factor into {2,3,5,7,11};
+// non-supported dimensions should be handled by sqfree_pad first.
+// Self-inverse: call twice to recover the original vector.
+void sp_vht2_forward_f32(float *data, int n);
+
+// In-place VHT2 on fp16 vector (for backends with native fp16).
+// Reference implementation; backends may override with SIMD.
+void sp_vht2_forward_f16(uint16_t *data, int n);
+
+// Deprecated aliases — these now route to sp_vht2_forward_f32 (self-inverse),
+// so callers that used the old unnormalised WHT+div-by-N pattern should drop
+// the division. Kept so existing code compiles through the v1.0 transition.
 void sp_wht_inplace_f32(float *data, int n);
-
-// In-place WHT on fp16 vector (for backends with native fp16).
-// Provided as reference; backends may override with SIMD.
 void sp_wht_inplace_f16(uint16_t *data, int n);
 
 // ============================================================================

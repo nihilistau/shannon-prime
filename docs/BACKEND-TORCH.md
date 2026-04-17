@@ -10,13 +10,17 @@ All in `backends/torch/shannon_prime_torch.py`:
 
 | Class / Function | Purpose |
 |-----------------|---------|
-| `wht_inplace(x)` | Walsh-Hadamard Transform via in-place butterfly on last dimension |
-| `iwht(x)` | Inverse WHT (forward WHT + 1/N scaling) |
-| `MobiusMask(n)` | Squarefree-first coefficient reordering |
-| `BandedQuantizer(n, bits)` | Per-band abs-max quantization to int8 |
-| `VilenkinBasis(n_primes)` | Multi-prime Vilenkin-Hartley transform (research path) |
-| `ShadowCache(...)` | Complete KV cache with write/read pipeline |
-| `correlation(a, b)` | Pearson correlation for validation |
+| `vht2(x)` | **The** transform — staged Hartley on the last dim (any dim factoring into {2,3,5,7,11}), orthonormal, self-inverse (`vht2(vht2(x)) ≈ x` with no 1/N). At p=2 this is the WHT butterfly scaled by 1/√2. |
+| `wht_inplace(x)` / `iwht(x)` | Deprecated aliases that now route to `vht2`. Old callers that did `wht_inplace(x); ...; wht_inplace(x); x.div_(n)` for a round-trip should drop the division. |
+| `sqfree_pad_dim(head_dim)` | Next squarefree multiple of {2,3,5,7,11} ≥ head_dim (64 → 66, 128 → 154, 256 → 330). |
+| `MobiusMask(n)` | Squarefree-first coefficient reordering. |
+| `BandedQuantizer(n, bits)` | Per-band abs-max quantization to int8. |
+| `ShadowCache(...)` | Complete ship-path KV cache with write/read pipeline. |
+| `correlation(a, b)` | Pearson correlation for validation. |
+
+The sqfree + spinor aggressive variant lives alongside in
+`backends/torch/shannon_prime_sqfree.py` (`SqfreeShadowCache`), also using
+`vht2` as the underlying transform.
 
 ## Quick Start
 

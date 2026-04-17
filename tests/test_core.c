@@ -39,10 +39,10 @@ static void rand_vec(float *v, int n) {
 }
 
 // ============================================================================
-// Test 1: WHT is self-inverse (WHT(WHT(x)) = N*x)
+// Test 1: VHT2 is self-inverse (VHT2(VHT2(x)) = x, no 1/N)
 // ============================================================================
 static void test_wht_roundtrip(void) {
-    printf("\n== WHT Round-Trip ==\n");
+    printf("\n== VHT2 Round-Trip ==\n");
 
     for (int hd = 32; hd <= 256; hd *= 2) {
         float *orig = malloc(hd * sizeof(float));
@@ -51,12 +51,10 @@ static void test_wht_roundtrip(void) {
         rand_vec(orig, hd);
         memcpy(work, orig, hd * sizeof(float));
 
-        // Forward
-        sp_wht_inplace_f32(work, hd);
-        // Inverse = forward again, then divide by N
-        sp_wht_inplace_f32(work, hd);
-        float inv_n = 1.0f / (float)hd;
-        for (int i = 0; i < hd; i++) work[i] *= inv_n;
+        // VHT2 with 1/√p per stage is self-inverse: calling it twice returns
+        // the original vector (no division by N required).
+        sp_vht2_forward_f32(work, hd);
+        sp_vht2_forward_f32(work, hd);
 
         float max_err = 0.0f;
         for (int i = 0; i < hd; i++) {
@@ -66,7 +64,7 @@ static void test_wht_roundtrip(void) {
 
         char msg[128];
         snprintf(msg, sizeof(msg),
-                 "WHT round-trip hd=%d: max_err=%.2e (need <1e-5)", hd, max_err);
+                 "VHT2 round-trip hd=%d: max_err=%.2e (need <1e-5)", hd, max_err);
         CHECK(max_err < 1e-5f, msg);
 
         free(orig);
@@ -174,8 +172,8 @@ static void test_banded_quantization(void) {
             rand_vec(orig, hd);
             memcpy(wht, orig, hd * sizeof(float));
 
-            // WHT forward
-            sp_wht_inplace_f32(wht, hd);
+            // VHT2 forward (self-inverse)
+            sp_vht2_forward_f32(wht, hd);
 
             // Quantize
             sp_band_quantize(wht, compressed, &bc);
@@ -183,10 +181,8 @@ static void test_banded_quantization(void) {
             // Dequantize
             sp_band_dequantize(compressed, recon, &bc);
 
-            // Inverse WHT
-            sp_wht_inplace_f32(recon, hd);
-            float inv_n = 1.0f / (float)hd;
-            for (int i = 0; i < hd; i++) recon[i] *= inv_n;
+            // Inverse: second VHT2 call (self-inverse, no 1/N needed)
+            sp_vht2_forward_f32(recon, hd);
 
             total_corr += sp_correlation_f32(orig, recon, hd);
 
@@ -232,9 +228,11 @@ static void test_spectral_asymmetry(void) {
     float *v_vec = malloc(hd * sizeof(float));
     rand_vec(v_vec, hd);
 
-    // WHT both
-    sp_wht_inplace_f32(k_vec, hd);
-    sp_wht_inplace_f32(v_vec, hd);
+    // VHT2 both (coefficient magnitudes differ from the old unnormalised WHT
+    // by a factor of 1/√N, but the per-band ENERGY PROPORTIONS used below are
+    // scale-invariant, so the asymmetry thresholds are unchanged).
+    sp_vht2_forward_f32(k_vec, hd);
+    sp_vht2_forward_f32(v_vec, hd);
 
     // Compute energy per band
     float k_band_energy[4] = {0}, v_band_energy[4] = {0};
@@ -408,22 +406,20 @@ static void test_mobius_quality(void) {
 
         // WITHOUT Möbius
         memcpy(wht, orig, hd * sizeof(float));
-        sp_wht_inplace_f32(wht, hd);
+        sp_vht2_forward_f32(wht, hd);
         sp_band_quantize(wht, buf, &bc);
         sp_band_dequantize(buf, recon, &bc);
-        sp_wht_inplace_f32(recon, hd);
-        for (int i = 0; i < hd; i++) recon[i] /= hd;
+        sp_vht2_forward_f32(recon, hd);
         total_corr_plain += sp_correlation_f32(orig, recon, hd);
 
         // WITH Möbius
         memcpy(wht, orig, hd * sizeof(float));
-        sp_wht_inplace_f32(wht, hd);
+        sp_vht2_forward_f32(wht, hd);
         sp_mobius_reorder(wht, &mask);
         sp_band_quantize(wht, buf, &bc);
         sp_band_dequantize(buf, recon, &bc);
         sp_mobius_unreorder(recon, &mask);
-        sp_wht_inplace_f32(recon, hd);
-        for (int i = 0; i < hd; i++) recon[i] /= hd;
+        sp_vht2_forward_f32(recon, hd);
         total_corr_mobius += sp_correlation_f32(orig, recon, hd);
 
         free(orig); free(wht); free(recon); free(buf);
