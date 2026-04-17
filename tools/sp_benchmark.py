@@ -34,7 +34,7 @@ import torch
 torch.manual_seed(42)
 
 from shannon_prime_torch import (
-    wht_inplace, MobiusMask, BandedQuantizer, ShadowCache, correlation
+    vht2, MobiusMask, BandedQuantizer, ShadowCache, correlation
 )
 
 
@@ -66,10 +66,8 @@ def benchmark_config(head_dim: int, band_bits: list, n_vectors: int = 500,
 
         t0 = time.perf_counter()
 
-        # Write path
-        work = orig.clone().unsqueeze(0)
-        wht_inplace(work)
-        work = work.squeeze(0)
+        # Write path: VHT2 → (Möbius) → band quantize
+        work = vht2(orig.unsqueeze(0)).squeeze(0)
 
         if mask is not None:
             work = mask.reorder(work)
@@ -80,8 +78,8 @@ def benchmark_config(head_dim: int, band_bits: list, n_vectors: int = 500,
         if mask is not None:
             recon = mask.unreorder(recon)
 
-        wht_inplace(recon.unsqueeze(0))
-        recon = recon.squeeze(0) / head_dim
+        # Inverse VHT2 (self-inverse — same call as forward, no 1/N)
+        recon = vht2(recon.unsqueeze(0)).squeeze(0)
 
         total_time += time.perf_counter() - t0
 
@@ -127,9 +125,7 @@ def spectral_analysis(head_dim: int):
         else:
             vec = torch.randn(head_dim)
 
-        work = vec.clone().unsqueeze(0)
-        wht_inplace(work)
-        work = work.squeeze(0)
+        work = vht2(vec.unsqueeze(0)).squeeze(0)
 
         band_energy = []
         total_energy = (work ** 2).sum().item()

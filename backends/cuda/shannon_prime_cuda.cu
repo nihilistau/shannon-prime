@@ -17,10 +17,15 @@
 #include <float.h>
 
 // ============================================================================
-// WHT Butterfly Kernel
+// VHT2 Butterfly Kernel (p=2 stage of the Vilenkin-Hartley transform)
 // ============================================================================
 //
-// In-place Walsh-Hadamard Transform via iterative butterfly.
+// Staged in-place Hartley transform. At p=2 the stage is the classic WHT
+// butterfly scaled by 1/√2 per stage — self-inverse after log2(N) stages.
+// Non-power-of-2 dimensions dispatch to the general staged kernel in
+// shannon_prime_sqfree.cu (kernel_vilenkin_inplace), which handles the
+// sqfree-padded case with primes {2,3,5,7,11}.
+//
 // Each thread block processes one vector of length n.
 // Uses shared memory for the butterfly passes.
 //
@@ -41,7 +46,11 @@ __global__ void kernel_wht_inplace(float *data, int n) {
     }
     __syncthreads();
 
-    // Butterfly passes
+    // Butterfly passes — each stage is a p=2 Hartley kernel normalised by
+    // 1/√2. After log2(N) stages the total scale is 1/√N, making the whole
+    // transform orthonormal and self-inverse (kernel_wht_inplace applied
+    // twice returns the original vector, no /N).
+    const float inv_sqrt2 = 0.70710678118654752440f;
     for (int len = 1; len < n; len <<= 1) {
         if (tid < n) {
             int grp    = tid / (len << 1);   // Which butterfly group
@@ -51,8 +60,8 @@ __global__ void kernel_wht_inplace(float *data, int n) {
             if (pos < len) {
                 float u = smem[base + pos];
                 float v = smem[base + pos + len];
-                smem[base + pos]       = u + v;
-                smem[base + pos + len] = u - v;
+                smem[base + pos]       = (u + v) * inv_sqrt2;
+                smem[base + pos + len] = (u - v) * inv_sqrt2;
             }
         }
         __syncthreads();
@@ -283,19 +292,64 @@ extern "C" {
 
 #include "shannon_prime_cuda.h"
 
-void sp_cuda_wht_inplace(float *d_data, int n, int n_vecs, void *stream) {
+// Forward declaration of the staged Hartley kernel launcher from
+// shannon_prime_sqfree.cu. Used when n has a prime factor > 2.
+extern "C" void sp_cuda_vilenkin_inplace(float *d_data, int pad_dim, int n_vecs,
+                                          int *d_factors, int n_factors,
+                                          cudaStream_t stream);
+
+// Factor n into {2,3,5,7,11}. Returns the number of factors or -1 if n has
+// a prime factor > 11 (in which case the caller should sqfree_pad first).
+static int _sp_cuda_factor_small(int n, int *factors_out, int max_factors) {
+    static const int primes[] = {2, 3, 5, 7, 11};
+    int nf = 0;
+    int d = n;
+    for (int i = 0; i < 5; i++) {
+        while (d % primes[i] == 0 && nf < max_factors) {
+            factors_out[nf++] = primes[i];
+            d /= primes[i];
+        }
+    }
+    return (d == 1) ? nf : -1;
+}
+
+// Public VHT2 forward — self-inverse, dispatches p=2 butterfly when n is a
+// power of 2, otherwise the staged Vilenkin kernel for sqfree-padded dims.
+void sp_cuda_vht2_forward(float *d_data, int n, int n_vecs, void *stream) {
     cudaStream_t s = (cudaStream_t)stream;
-    int smem_bytes = n * sizeof(float);
-    // One block per vector, n threads per block
-    kernel_wht_inplace<<<n_vecs, n, smem_bytes, s>>>(d_data, n);
+    if (n > 0 && (n & (n - 1)) == 0) {
+        // Power of 2: fast butterfly with per-stage 1/√2 normalisation
+        int smem_bytes = n * sizeof(float);
+        kernel_wht_inplace<<<n_vecs, n, smem_bytes, s>>>(d_data, n);
+        return;
+    }
+    // General path via the sqfree staged Hartley kernel
+    int factors[16];
+    int nf = _sp_cuda_factor_small(n, factors, 16);
+    if (nf <= 0) {
+        // Unsupported dim — leave data unchanged so the problem is loud
+        fprintf(stderr, "[sp_cuda_vht2_forward] dim %d doesn't factor into "
+                        "{2,3,5,7,11}; use sqfree_pad_dim first\n", n);
+        return;
+    }
+    int *d_factors = NULL;
+    cudaMalloc(&d_factors, nf * sizeof(int));
+    cudaMemcpyAsync(d_factors, factors, nf * sizeof(int),
+                    cudaMemcpyHostToDevice, s);
+    sp_cuda_vilenkin_inplace(d_data, n, n_vecs, d_factors, nf, s);
+    cudaStreamSynchronize(s);
+    cudaFree(d_factors);
+}
+
+// Deprecated aliases — both now call the self-inverse VHT2. Old callers that
+// did forward-then-inverse-with-1/N will naturally drop the /N scaling as
+// they're updated to use sp_cuda_vht2_forward directly.
+void sp_cuda_wht_inplace(float *d_data, int n, int n_vecs, void *stream) {
+    sp_cuda_vht2_forward(d_data, n, n_vecs, stream);
 }
 
 void sp_cuda_iwht_inplace(float *d_data, int n, int n_vecs, void *stream) {
-    cudaStream_t s = (cudaStream_t)stream;
-    int smem_bytes = n * sizeof(float);
-    kernel_wht_inplace<<<n_vecs, n, smem_bytes, s>>>(d_data, n);
-    float inv_n = 1.0f / (float)n;
-    kernel_iwht_scale<<<n_vecs, n, 0, s>>>(d_data, n, inv_n);
+    sp_cuda_vht2_forward(d_data, n, n_vecs, stream);
 }
 
 void sp_cuda_mobius_reorder(float *d_data, const int *d_order,

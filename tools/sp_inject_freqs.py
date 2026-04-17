@@ -305,11 +305,12 @@ def inject_frequencies(input_path: str, output_path: str,
 
     if verbose:
         print(f"\n  Output written to: {output_path}")
-        print(f"\n  To use with llama.cpp, pass the freq_factors via command line:")
-        print(f"    --rope-freq-base {freq_base}")
-        print(f"\n  Or set environment variable:")
+        print(f"  (byte-identical copy of the input; injection is served via")
+        print(f"   the companion .sp_freq_factors.bin sidecar at inference time)")
+        print(f"\n  To use with the Shannon-Prime llama.cpp integration:")
         print(f"    SHANNON_PRIME_ENABLED=1")
         print(f"    SHANNON_PRIME_ALPHA={alpha}")
+        print(f"    # The hook will read the sidecar next to the loaded GGUF")
         print()
 
     # Write the freq factors as a companion file for the llama.cpp integration

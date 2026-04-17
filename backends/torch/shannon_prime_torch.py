@@ -353,14 +353,67 @@ class ShadowCache:
         k_band_bits: List[int] = [5, 5, 4, 3],
         v_band_bits: List[int] = [3],
         use_mobius: bool = True,
+        # ---- Progressive-enhancement flags (default off = classic ship path) --
+        use_sqfree_pad: bool = False,
+        use_mobius_predict: bool = False,
+        residual_bits: int = 0,
+        use_spinor: bool = False,
+        sk_frac: float = 0.75,
         device: str = 'cpu',
     ):
+        """ShadowCache — the single VHT2 KV compression cache.
+
+        Default flags reproduce the ship-path pipeline exactly
+        (VHT2 → Möbius reorder → banded quantize → store). Enabling any of
+        `use_sqfree_pad` / `use_mobius_predict` / `residual_bits > 0` /
+        `use_spinor` routes internally to the sqfree+spinor aggressive
+        pipeline defined in backends/torch/shannon_prime_sqfree.py —
+        same VHT2 transform underneath, extra stages bolted on for the
+        aggressive path's Knight-mask + Möbius CSR + residual + spinor
+        machinery. Callers see one class; the flags pick the path.
+        """
         self.head_dim = head_dim
         self.n_layers = n_layers
         self.n_heads_kv = n_heads_kv
         self.max_seq_len = max_seq_len
         self.device = device
 
+        # Progressive mode is active iff any sqfree-path flag is on.
+        self._sqfree_mode = bool(
+            use_sqfree_pad or use_mobius_predict or residual_bits > 0 or use_spinor
+        )
+
+        if self._sqfree_mode:
+            # Lazy import: avoids circular when shannon_prime_sqfree itself
+            # imports BandedQuantizer from this module.
+            from shannon_prime_sqfree import SqfreeShadowCache  # type: ignore
+
+            # The sqfree path uses a 5-band torus-aligned default. If the
+            # caller passed a 4-band WHT-style list, promote to the sqfree
+            # preset so the BandedQuantizer has an even split over the
+            # Knight skeleton size.
+            sqfree_bands = list(k_band_bits) if len(k_band_bits) == 5 else [5, 4, 4, 4, 5]
+            self._impl = SqfreeShadowCache(
+                head_dim=head_dim,
+                n_layers=n_layers,
+                n_heads_kv=n_heads_kv,
+                max_seq_len=max_seq_len,
+                band_bits=sqfree_bands,
+                residual_bits=residual_bits if residual_bits > 0 else 3,
+                use_spinor=bool(use_spinor),
+                sk_frac=sk_frac,
+                device=device,
+            )
+            # Expose the internal pad_dim for callers that want it
+            self.pad_dim = getattr(self._impl, 'pad_dim', head_dim)
+            # Quantizer references for compression_ratio() / memory_bytes()
+            self.k_quantizer = self._impl.k_quantizer
+            self.v_quantizer = self._impl.v_quantizer
+            self.mobius = None  # sqfree path has its own mobius state
+            return
+
+        # ---- Classic WHT ship path (behavior identical to v1.0) ----------
+        self._impl = None
         self.k_quantizer = BandedQuantizer(head_dim, k_band_bits)
         self.v_quantizer = BandedQuantizer(head_dim, v_band_bits)
         self.mobius = MobiusMask(head_dim) if use_mobius else None
@@ -379,6 +432,9 @@ class ShadowCache:
     def write_k(self, layer: int, head: int, pos: int,
                 k_vec: torch.Tensor):
         """Compress and store a K vector (head_dim,) already RoPE'd."""
+        if self._sqfree_mode:
+            return self._impl.write_k(layer, head, pos, k_vec)
+
         # VHT2 forward (self-inverse, 1/√p per stage)
         x = vht2(k_vec.unsqueeze(0)).squeeze(0)
 
@@ -398,6 +454,9 @@ class ShadowCache:
     def write_v(self, layer: int, head: int, pos: int,
                 v_vec: torch.Tensor):
         """Compress and store a V vector."""
+        if self._sqfree_mode:
+            return self._impl.write_v(layer, head, pos, v_vec)
+
         # VHT2 forward
         x = vht2(v_vec.unsqueeze(0)).squeeze(0)
 
@@ -412,6 +471,9 @@ class ShadowCache:
 
     def read_k(self, layer: int, head: int, pos: int) -> torch.Tensor:
         """Reconstruct a K vector from compressed storage."""
+        if self._sqfree_mode:
+            return self._impl.read_k(layer, head, pos)
+
         slot = self._slot(layer, head)
         scales = [s.unsqueeze(0) for s in self.k_scales[slot][pos]]
         quants = [q.unsqueeze(0) for q in self.k_quants[slot][pos]]
@@ -432,6 +494,9 @@ class ShadowCache:
 
     def read_v(self, layer: int, head: int, pos: int) -> torch.Tensor:
         """Reconstruct a V vector from compressed storage."""
+        if self._sqfree_mode:
+            return self._impl.read_v(layer, head, pos)
+
         slot = self._slot(layer, head)
         scales = [s.unsqueeze(0) for s in self.v_scales[slot][pos]]
         quants = [q.unsqueeze(0) for q in self.v_quants[slot][pos]]

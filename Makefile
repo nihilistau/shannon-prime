@@ -19,6 +19,27 @@ CUDA_SRC   = backends/cuda/shannon_prime_cuda.cu
 CUDA_SQFREE_SRC = backends/cuda/shannon_prime_sqfree.cu
 LLAMA_SRC  = tools/shannon_prime_llama.c
 
+# ── Vulkan SDK (optional) ────────────────────────────────────────
+# Enable the real GPU path when the SDK is present. Otherwise the
+# backend builds as before with the CPU fallback (which routes through
+# the core staged VHT2, so sqfree dims still work — just on CPU).
+ifneq ($(strip $(VULKAN_SDK)),)
+  VULKAN_ENABLED     = 1
+  VULKAN_INC         = -I"$(VULKAN_SDK)/Include"
+  VULKAN_LIB         = -L"$(VULKAN_SDK)/Lib" -lvulkan-1
+  GLSLC              = "$(VULKAN_SDK)/Bin/glslc"
+  VULKAN_CFLAGS      = -DSHANNON_PRIME_VULKAN_ENABLED=1 $(VULKAN_INC)
+  SHADER_SRC_DIR     = backends/vulkan/shaders
+  SHADER_BUILD_DIR   = build/shaders
+  SHADERS            = vilenkin mobius_reorder band_quantize band_dequantize
+  SHADER_SPVS        = $(patsubst %,$(SHADER_BUILD_DIR)/%.spv,$(SHADERS))
+else
+  VULKAN_ENABLED     =
+  VULKAN_CFLAGS      =
+  VULKAN_LIB         =
+  SHADER_SPVS        =
+endif
+
 .PHONY: all test test-core test-torch test-adreno test-vulkan test-cuda \
         test-integration test-comfyui test-sqfree test-all clean
 
@@ -33,9 +54,14 @@ build/test_adreno: tests/test_adreno.c $(ADRENO_SRC) $(CORE_SRC)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/test_adreno.c $(ADRENO_SRC) $(CORE_SRC) $(LDFLAGS)
 
-build/test_vulkan: tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC)
+# Compile each compute shader to SPIR-V when the Vulkan SDK is available
+$(SHADER_BUILD_DIR)/%.spv: $(SHADER_SRC_DIR)/%.comp
+	@mkdir -p $(SHADER_BUILD_DIR)
+	$(GLSLC) -O $< -o $@
+
+build/test_vulkan: tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(SHADER_SPVS)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS) $(VULKAN_LIB)
 
 build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
 	@mkdir -p build

@@ -1,0 +1,98 @@
+// Shannon-Prime VHT2: Exact Spectral KV Cache Compression
+// Copyright (C) 2026 Ray Daniels. All Rights Reserved.
+//
+// Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
+// Commercial license available — contact raydaniels@gmail.com
+//
+// See LICENSE in the project root for full terms.
+
+// GLSL Compute Shader: VHT2 Banded Dequantization
+//
+// Inverse of band_quantize.comp. Reads the packed bit-streams back out,
+// multiplies by per-band scale, writes float coefficients.
+// One workgroup per vector; thread 0 serialises the bit-unpacking
+// (same shape as the quantiser for correctness — production can parallelise
+// via subgroup ops).
+
+#version 450
+
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer Input {
+    uint input_data[];   // Packed compressed stream
+};
+
+layout(set = 0, binding = 1) writeonly buffer Output {
+    float output_data[]; // Per-band dequantised floats (head_dim per vector)
+};
+
+layout(push_constant) uniform PushConstants {
+    uint n;             // Vector length (head_dim)
+    uint n_bands;       // Number of bands
+    uint band_size;     // n / n_bands
+    uint total_words;   // Input words per vector
+    uint band_bits_0;
+    uint band_bits_1;
+    uint band_bits_2;
+    uint band_bits_3;
+};
+
+uint get_band_bits(uint band) {
+    if (band == 0u) return band_bits_0;
+    if (band == 1u) return band_bits_1;
+    if (band == 2u) return band_bits_2;
+    return band_bits_3;
+}
+
+void main() {
+    uint vec_idx = gl_WorkGroupID.x;
+    uint tid     = gl_LocalInvocationID.x;
+
+    uint in_base  = vec_idx * total_words;
+    uint out_base = vec_idx * n;
+
+    // Sequential decode in thread 0 mirrors the quantizer exactly.
+    if (tid == 0u) {
+        uint in_word_offset = 0u;
+        uint bit_buffer     = 0u;
+        uint bit_pos        = 0u;
+        // Carry bits needed when a value straddles a 32-bit word boundary
+        uint carry_bits     = 0u;
+        uint carry_count    = 0u;
+
+        for (uint b = 0u; b < n_bands; b++) {
+            uint bits = get_band_bits(b);
+            uint max_val = (1u << (bits - 1u)) - 1u;
+
+            // Read per-band scale (first word for this band)
+            float scale = uintBitsToFloat(input_data[in_base + in_word_offset]);
+            in_word_offset++;
+
+            // Reset bit reader at each band boundary (mirrors the quantizer:
+            // quantizer writes scale word, then bit-packs from scratch per band).
+            bit_buffer  = 0u;
+            bit_pos     = 0u;
+            carry_bits  = 0u;
+            carry_count = 0u;
+
+            for (uint i = 0u; i < band_size; i++) {
+                // Ensure we have at least `bits` bits of input available
+                while (bit_pos < bits) {
+                    // Merge the next input word
+                    uint next_word = input_data[in_base + in_word_offset];
+                    in_word_offset++;
+                    bit_buffer |= (next_word << bit_pos);
+                    bit_pos += 32u;
+                }
+
+                uint u = bit_buffer & ((1u << bits) - 1u);
+                bit_buffer >>= bits;
+                bit_pos    -= bits;
+
+                int q = int(u) - int(max_val);
+                output_data[out_base + b * band_size + i] = float(q) * scale;
+            }
+        }
+    }
+    barrier();
+}

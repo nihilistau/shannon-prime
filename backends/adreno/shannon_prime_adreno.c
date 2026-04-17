@@ -254,12 +254,28 @@ int sp_set_thread_affinity(sp_core_affinity_t affinity,
 }
 
 // ============================================================================
-// NEON WHT — Tier 1 (f32, 4 elements/op)
+// NEON VHT2 — Tier 1 (f32, 4 elements/op, p=2 stages orthonormal via 1/√N)
 // ============================================================================
+//
+// At p=2 VHT2 is the classical WHT butterfly with 1/√2 per stage, producing
+// an orthonormal self-inverse transform (no /N on the inverse). The NEON
+// code below runs the unnormalised butterfly for speed, then applies a
+// single 1/√N multiply at the end — numerically equivalent to the per-stage
+// 1/√2 (the end-multiply keeps NEON pipelines saturated in the butterfly
+// loop). Non-power-of-2 dims dispatch to the scalar core sp_vht2_forward_f32
+// which handles the staged Hartley for primes {2,3,5,7,11}.
 
 #if HAS_NEON
 
 void sp_neon_wht_f32(float *data, int n) {
+    // Guard: for non-power-of-2, fall back to the core staged VHT2
+    // (scalar; Adreno's sqfree call sites are rare compared to p=2).
+    if (n <= 0 || (n & (n - 1)) != 0) {
+        sp_vht2_forward_f32(data, n);
+        return;
+    }
+
+    // Unnormalised WHT butterfly
     for (int len = 1; len < n; len <<= 1) {
         for (int i = 0; i < n; i += len << 1) {
             int j = 0;
@@ -279,6 +295,18 @@ void sp_neon_wht_f32(float *data, int n) {
             }
         }
     }
+
+    // Orthonormal normalisation: multiply by 1/√N so the transform is
+    // self-inverse (VHT2 semantics). Two applications reproduce the input
+    // without any further scaling.
+    const float inv_sqrt_n = 1.0f / sqrtf((float)n);
+    const float32x4_t vinv = vdupq_n_f32(inv_sqrt_n);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        float32x4_t v = vld1q_f32(&data[i]);
+        vst1q_f32(&data[i], vmulq_f32(v, vinv));
+    }
+    for (; i < n; i++) data[i] *= inv_sqrt_n;
 }
 
 float sp_neon_absmax_f32(const float *data, int n) {
@@ -300,10 +328,10 @@ float sp_neon_absmax_f32(const float *data, int n) {
     return amax;
 }
 
-#else // Scalar fallback
+#else // Scalar fallback — route through the core staged VHT2
 
 void sp_neon_wht_f32(float *data, int n) {
-    sp_wht_inplace_f32(data, n);
+    sp_vht2_forward_f32(data, n);
 }
 
 float sp_neon_absmax_f32(const float *data, int n) {
@@ -324,7 +352,21 @@ float sp_neon_absmax_f32(const float *data, int n) {
 #if HAS_NEON && HAS_FP16_ARITH
 
 void sp_neon_wht_f16(void *data, int n) {
+    // Non-power-of-2: fall back via the f32 path (which dispatches the
+    // core staged VHT2 for sqfree dims).
+    if (n <= 0 || (n & (n - 1)) != 0) {
+        float *tmp = (float *)malloc(n * sizeof(float));
+        if (!tmp) return;
+        sp_neon_f16_to_f32(data, tmp, n);
+        sp_vht2_forward_f32(tmp, n);
+        sp_neon_f32_to_f16(tmp, data, n);
+        free(tmp);
+        return;
+    }
+
     __fp16 *d = (__fp16 *)data;
+
+    // Unnormalised butterfly in fp16
     for (int len = 1; len < n; len <<= 1) {
         for (int i = 0; i < n; i += len << 1) {
             int j = 0;
@@ -351,19 +393,21 @@ void sp_neon_wht_f16(void *data, int n) {
             }
         }
     }
-}
 
-void sp_neon_iwht_f16(void *data, int n) {
-    sp_neon_wht_f16(data, n);
-    __fp16 *d = (__fp16 *)data;
-    __fp16 inv_n = (__fp16)(1.0f / (float)n);
-    float16x8_t vinv = vdupq_n_f16(inv_n);
+    // VHT2 end-normalisation: 1/√N so the transform is self-inverse.
+    const __fp16 inv_sqrt_n = (__fp16)(1.0f / sqrtf((float)n));
+    float16x8_t vinv = vdupq_n_f16(inv_sqrt_n);
     int i = 0;
     for (; i + 7 < n; i += 8) {
         float16x8_t v = vld1q_f16(&d[i]);
         vst1q_f16(&d[i], vmulq_f16(v, vinv));
     }
-    for (; i < n; i++) d[i] *= inv_n;
+    for (; i < n; i++) d[i] *= inv_sqrt_n;
+}
+
+// Inverse is the forward (VHT2 self-inverse)
+void sp_neon_iwht_f16(void *data, int n) {
+    sp_neon_wht_f16(data, n);
 }
 
 #else // No native fp16 arithmetic — convert through f32
@@ -379,34 +423,23 @@ void sp_neon_wht_f16(void *data, int n) {
 }
 
 void sp_neon_iwht_f16(void *data, int n) {
-    float *tmp = (float *)malloc(n * sizeof(float));
-    if (!tmp) return;
-    sp_neon_f16_to_f32(data, tmp, n);
-    sp_neon_iwht_f32(tmp, n);
-    sp_neon_f32_to_f16(tmp, data, n);
-    free(tmp);
+    // Self-inverse under VHT2 semantics
+    sp_neon_wht_f16(data, n);
 }
 
 #endif // HAS_FP16_ARITH
 
 // ============================================================================
-// Inverse WHT + scaling (always f32)
+// Inverse VHT2 — same as forward (self-inverse with 1/√N end-normalisation)
 // ============================================================================
+//
+// Under VHT2 semantics, calling the forward transform twice reproduces the
+// input (no 1/N factor needed). This entry point is kept for API
+// compatibility with the old WHT code; internally it dispatches to the
+// same forward kernel.
 
 void sp_neon_iwht_f32(float *data, int n) {
     sp_neon_wht_f32(data, n);
-    float inv_n = 1.0f / (float)n;
-#if HAS_NEON
-    float32x4_t vinv = vdupq_n_f32(inv_n);
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        float32x4_t v = vld1q_f32(&data[i]);
-        vst1q_f32(&data[i], vmulq_f32(v, vinv));
-    }
-    for (; i < n; i++) data[i] *= inv_n;
-#else
-    for (int i = 0; i < n; i++) data[i] *= inv_n;
-#endif
 }
 
 // ============================================================================

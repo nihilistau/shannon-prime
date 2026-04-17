@@ -54,7 +54,7 @@ except ImportError:
 
 if HAS_TORCH:
     from shannon_prime_torch import (
-        wht_inplace, MobiusMask, BandedQuantizer, correlation
+        vht2, MobiusMask, BandedQuantizer, correlation
     )
 
 
@@ -104,8 +104,9 @@ def analyze_tensor_spectrum(tensor: 'torch.Tensor', name: str,
     idx = torch.randperm(vectors.shape[0])[:n_sample]
     sample = vectors[idx].clone()
 
-    # WHT transform
-    wht_inplace(sample)
+    # VHT2 transform (self-inverse; the band energies below are scale-invariant
+    # so the 1/√N normalisation doesn't affect the concentration metric).
+    sample = vht2(sample)
 
     # Compute per-band energy
     n_bands = 4
@@ -131,26 +132,20 @@ def analyze_tensor_spectrum(tensor: 'torch.Tensor', name: str,
     for i in range(min(n_sample, 200)):
         orig = vectors[idx[i]].clone()
 
-        # VHT2 path
-        w = orig.clone().unsqueeze(0)
-        wht_inplace(w)
-        w = w.squeeze(0)
+        # VHT2 path (self-inverse: forward = inverse, no 1/N)
+        w = vht2(orig.unsqueeze(0)).squeeze(0)
         w = mask.reorder(w)
         s, q = bq_vht2.quantize(w.unsqueeze(0))
         r = bq_vht2.dequantize(s, q).squeeze(0)
         r = mask.unreorder(r)
-        wht_inplace(r.unsqueeze(0))
-        r = r.squeeze(0) / head_dim
+        r = vht2(r.unsqueeze(0)).squeeze(0)
         vht2_corrs.append(correlation(orig, r))
 
         # Flat path (same total bits, uniform allocation)
-        w2 = orig.clone().unsqueeze(0)
-        wht_inplace(w2)
-        w2 = w2.squeeze(0)
+        w2 = vht2(orig.unsqueeze(0)).squeeze(0)
         s2, q2 = bq_flat.quantize(w2.unsqueeze(0))
         r2 = bq_flat.dequantize(s2, q2).squeeze(0)
-        wht_inplace(r2.unsqueeze(0))
-        r2 = r2.squeeze(0) / head_dim
+        r2 = vht2(r2.unsqueeze(0)).squeeze(0)
         flat_corrs.append(correlation(orig, r2))
 
     vht2_mean = sum(vht2_corrs) / len(vht2_corrs)
@@ -303,9 +298,8 @@ def compress_tensor_vht2(tensor: 'torch.Tensor', head_dim: int,
     mask = MobiusMask(head_dim) if use_mobius else None
     bq = BandedQuantizer(head_dim, band_bits)
 
-    # Process all vectors
-    work = t.clone()
-    wht_inplace(work)
+    # Process all vectors: VHT2 forward on the (n_vectors, head_dim) batch
+    work = vht2(t)
 
     if mask is not None:
         work = mask.reorder(work)
@@ -344,8 +338,8 @@ def decompress_tensor_vht2(compressed: dict) -> 'torch.Tensor':
     if mask is not None:
         work = mask.unreorder(work)
 
-    wht_inplace(work)
-    work.div_(head_dim)
+    # Inverse VHT2 (self-inverse, no 1/N)
+    work = vht2(work)
 
     return work.reshape(orig_shape)
 

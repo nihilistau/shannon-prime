@@ -235,19 +235,161 @@ class WanSqfreeVHT2Wrapper:
         }
 
 
-class WanSqfreeCrossAttnCachingLinear(torch.nn.Module):
+def _input_fingerprint(x: torch.Tensor):
+    """Content hash for cache-invalidation — identical semantics to the WHT
+    wrapper's `_input_fingerprint` in `shannon_prime_comfyui.py`. Three flat
+    anchors + shape + dtype distinguish "same context across timesteps" from
+    "fresh context for a new generation" without scanning the full tensor."""
+    flat = x.view(-1) if x.is_contiguous() else x.reshape(-1)
+    n = flat.numel()
+    i_mid = n // 2 if n > 1 else 0
+    i_end = n - 1 if n > 0 else 0
+    return (
+        tuple(x.shape),
+        x.dtype,
+        float(flat[0].item()),
+        float(flat[i_mid].item()),
+        float(flat[i_end].item()),
+    )
+
+
+class VHT2SqfreeCrossAttentionCache:
+    """Sqfree + spinor VHT2 cache for Wan cross-attention K/V tensors.
+
+    Mirrors the put/get contract of `VHT2CrossAttentionCache` in
+    `shannon_prime_comfyui.py` but compresses each `(N, head_dim)` row
+    through the sqfree pipeline (squarefree pad → VHT2 → Knight skeleton
+    → banded quantize → Möbius CSR predict → 3-bit residual → spinor sheet
+    bit). Entries are stored in a plain Python dict keyed by
+    `(expert, block_id)` so arbitrary cross-attn shapes are supported
+    without pre-sizing the internal slot count.
     """
-    Drop-in replacement for cross_attn_k / cross_attn_v linear layers.
 
-    Wraps an existing nn.Linear with sqfree VHT2 caching. On first call,
-    computes normally and caches. On subsequent calls, reconstructs from
-    cache without running the linear layer.
+    def __init__(
+        self,
+        head_dim: int = 128,
+        use_spinor: bool = True,
+        residual_bits: int = 3,
+        band_bits: Optional[List[int]] = None,
+        # `max_blocks` kept for backwards compat with the older API; it is
+        # unused now because storage is a dict, not a fixed slot array.
+        max_blocks: Optional[int] = None,
+    ):
+        if band_bits is None:
+            band_bits = [3, 3, 3, 3, 3]
+        del max_blocks  # intentionally unused
 
-    Usage:
-        cache = VHT2SqfreeCrossAttentionCache(head_dim=128)
-        block.cross_attn_k = WanSqfreeCrossAttnCachingLinear(
-            block.cross_attn_k, cache, "block_0_k"
+        # A SqfreeShadowCache instance is used only for its mask / primes /
+        # quantizers / per-vector compress+reconstruct methods. Storage
+        # inside it is a 1×1×1 scratch area that's never indexed — actual
+        # cache entries live in `self._entries`.
+        self._compressor = SqfreeShadowCache(
+            head_dim=head_dim,
+            n_layers=1,
+            n_heads_kv=1,
+            max_seq_len=1,
+            band_bits=band_bits,
+            residual_bits=residual_bits,
+            use_spinor=use_spinor,
         )
+        self._head_dim = head_dim
+        # {cache_key: (orig_shape, orig_dtype, orig_device,
+        #              [k_compressed_per_row], [v_compressed_per_row])}
+        self._entries: dict = {}
+        self._expert = 'default'
+        self._hits = 0
+        self._misses = 0
+
+    # ----- WHT-compatible API surface --------------------------------------
+
+    def _cache_key(self, block_id: str) -> str:
+        return f"{self._expert}:{block_id}"
+
+    def has(self, block_id: str) -> bool:
+        return self._cache_key(block_id) in self._entries
+
+    def put(self, block_id: str, k: torch.Tensor, v: torch.Tensor):
+        """Store the FULL K and V tensors. Reshapes to `(N, head_dim)` and
+        compresses each row via the sqfree pipeline."""
+        key = self._cache_key(block_id)
+        hd = self._head_dim
+        orig_shape = k.shape
+        orig_dtype = k.dtype
+        orig_device = k.device
+
+        k_flat = k.reshape(-1, hd).float().contiguous()
+        v_flat = v.reshape(-1, hd).float().contiguous()
+
+        k_rows = [
+            self._compressor._compress_vec(k_flat[i], self._compressor.k_quantizer)
+            for i in range(k_flat.shape[0])
+        ]
+        v_rows = [
+            self._compressor._compress_vec(v_flat[i], self._compressor.v_quantizer)
+            for i in range(v_flat.shape[0])
+        ]
+        self._entries[key] = (orig_shape, orig_dtype, orig_device, k_rows, v_rows)
+        self._misses += 1
+
+    def get(self, block_id: str):
+        """Reconstruct the FULL K and V tensors at their original shape/dtype."""
+        key = self._cache_key(block_id)
+        orig_shape, orig_dtype, orig_device, k_rows, v_rows = self._entries[key]
+        self._hits += 1
+
+        k_recon = torch.stack([
+            self._compressor._reconstruct_vec(c, self._compressor.k_quantizer)
+            for c in k_rows
+        ], dim=0)
+        v_recon = torch.stack([
+            self._compressor._reconstruct_vec(c, self._compressor.v_quantizer)
+            for c in v_rows
+        ], dim=0)
+
+        # NaN / overflow guard (same as WHT ship path)
+        k_recon = torch.nan_to_num(torch.clamp(k_recon, -65504.0, 65504.0), nan=0.0)
+        v_recon = torch.nan_to_num(torch.clamp(v_recon, -65504.0, 65504.0), nan=0.0)
+
+        k = k_recon.reshape(orig_shape).to(dtype=orig_dtype, device=orig_device)
+        v = v_recon.reshape(orig_shape).to(dtype=orig_dtype, device=orig_device)
+        return k, v
+
+    def set_expert(self, expert_name: str):
+        self._expert = expert_name
+
+    def reset(self):
+        self._entries.clear()
+        self._hits = 0
+        self._misses = 0
+
+    def clear_expert(self, expert_name: str):
+        prefix = f"{expert_name}:"
+        for k in list(self._entries.keys()):
+            if k.startswith(prefix):
+                del self._entries[k]
+
+    def stats(self) -> dict:
+        total = self._hits + self._misses
+        return {
+            'hits': self._hits,
+            'misses': self._misses,
+            'total': total,
+            'hit_rate': self._hits / max(total, 1),
+            'n_entries_cached': len(self._entries),
+            'compression_ratio': (
+                self._compressor.compression_ratio()
+                if hasattr(self._compressor, 'compression_ratio') else 0.0
+            ),
+        }
+
+
+class WanSqfreeCrossAttnCachingLinear(torch.nn.Module):
+    """Drop-in replacement for Wan cross_attn.k / .v (and .k_img / .v_img).
+
+    Uses content fingerprinting (not pointer identity) to decide whether
+    the upstream T5/UMT5 context matches the last seen input: ComfyUI's
+    sampler re-allocates the conditioning tensor each diffusion timestep,
+    so a data_ptr() check would invalidate every step.
     """
 
     def __init__(self, linear: torch.nn.Linear,
@@ -257,76 +399,49 @@ class WanSqfreeCrossAttnCachingLinear(torch.nn.Module):
         self.linear = linear
         self.cache = cache
         self.cache_key = cache_key
+        self._last_fp = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.cache.get_or_compute(
-            self.cache_key,
-            lambda: self.linear(x),
-        )
+        fp = _input_fingerprint(x)
+
+        # Cache hit — return the sqfree-reconstructed tensor (K slot;
+        # the current wrapper caches a single linear per (block, k/v) key,
+        # so the K-slot content is the correct output for that linear).
+        if fp == self._last_fp and self.cache.has(self.cache_key):
+            k_recon, _ = self.cache.get(self.cache_key)
+            return k_recon
+
+        # Miss — compute, cache, remember fingerprint.
+        result = self.linear(x)
+        self.cache.put(self.cache_key, result, result)
+        self._last_fp = fp
+        return result
 
 
-class VHT2SqfreeCrossAttentionCache:
+def probe_wan_cache_shape(model) -> dict:
+    """Walk a Wan ModelPatcher, introspect the first cross-attn block,
+    and report the per-call K/V tensor shape expected by the cross-attn
+    cache. Useful for sizing budget estimates ahead of time — the cache
+    grows on demand so this is informational, not required.
     """
-    Standalone sqfree VHT2 cache for cross-attention linear layers.
-
-    Manages a SqfreeShadowCache internally and provides get_or_compute
-    for individual linear layer outputs.
-    """
-
-    def __init__(
-        self,
-        head_dim: int = 128,
-        max_blocks: int = 40,
-        use_spinor: bool = True,
-        residual_bits: int = 3,
-        band_bits: Optional[List[int]] = None,
-    ):
-        if band_bits is None:
-            band_bits = [3, 3, 3, 3, 3]
-
-        self._cache = SqfreeShadowCache(
-            head_dim=head_dim,
-            n_layers=1,
-            n_heads_kv=max_blocks * 2,  # K and V slots
-            max_seq_len=2,
-            band_bits=band_bits,
-            residual_bits=residual_bits,
-            use_spinor=use_spinor,
-        )
-        self._head_dim = head_dim
-        self._computed = set()
-        self._slot_map = {}
-        self._next_slot = 0
-        self._expert = 'default'
-
-    def _get_slot(self, key: str) -> int:
-        full_key = f"{self._expert}:{key}"
-        if full_key not in self._slot_map:
-            self._slot_map[full_key] = self._next_slot
-            self._next_slot += 1
-        return self._slot_map[full_key]
-
-    def set_expert(self, expert_name: str):
-        self._expert = expert_name
-
-    def get_or_compute(self, key: str,
-                       compute_fn: Callable[[], torch.Tensor]) -> torch.Tensor:
-        full_key = f"{self._expert}:{key}"
-        slot = self._get_slot(key)
-
-        if full_key in self._computed:
-            return self._cache.read_k(layer=0, head=slot, pos=0).unsqueeze(0)
-        else:
-            result = compute_fn()
-            flat = result.reshape(-1, self._head_dim)[0]
-            self._cache.write_k(layer=0, head=slot, pos=0, k_vec=flat)
-            self._computed.add(full_key)
-            return result
-
-    def reset(self):
-        self._computed.clear()
-
-    def clear_expert(self, expert_name: str):
-        keys_to_remove = [k for k in self._computed if k.startswith(f"{expert_name}:")]
-        for k in keys_to_remove:
-            self._computed.discard(k)
+    inner = getattr(model, 'model', model)
+    diff = getattr(inner, 'diffusion_model', None) or getattr(inner, 'model', None)
+    if diff is None or not hasattr(diff, 'blocks'):
+        return {'n_blocks': 0, 'head_dim': None, 'per_block_linears': 0}
+    blocks = list(diff.blocks)
+    if not blocks:
+        return {'n_blocks': 0, 'head_dim': None, 'per_block_linears': 0}
+    blk0 = blocks[0]
+    head_dim = getattr(getattr(blk0, 'self_attn', None), 'head_dim', None)
+    cross = getattr(blk0, 'cross_attn', None)
+    per_block = 0
+    if cross is not None:
+        for attr in ('k', 'v', 'k_img', 'v_img'):
+            if getattr(cross, attr, None) is not None:
+                per_block += 1
+    return {
+        'n_blocks': len(blocks),
+        'head_dim': head_dim,
+        'per_block_linears': per_block,
+        'estimated_entries': len(blocks) * per_block,
+    }
