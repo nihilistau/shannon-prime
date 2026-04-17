@@ -33,10 +33,11 @@ llama.cpp Inference Pipeline
   │  │     Shannon-Prime Hook Point        │     │
   │  │                                     │     │
   │  │  WRITE: K,V → shadow_cache          │     │
-  │  │  (WHT → Möbius → quant → store)     │     │
+  │  │  (VHT2 → Möbius → quant → store)    │     │
   │  │                                     │     │
   │  │  READ: shadow_cache → K,V           │     │
-  │  │  (load → dequant → unreorder → iWHT)│     │
+  │  │  (load → dequant → unreorder → VHT2)│     │
+  │  │  (VHT2 is self-inverse — no 1/N)    │     │
   │  └────┬────────────────────────────────┘     │
   │       │                                      │
   │  Attention = softmax(Q · K^T / √d) · V       │

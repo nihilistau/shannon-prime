@@ -21,7 +21,8 @@ extern "C" {
 // Constants
 // ============================================================================
 
-// Maximum supported head dimensions (must be power of 2 for WHT)
+// Maximum supported head dimensions (typically power of 2; VHT2 also accepts
+// any dim that factors into {2,3,5,7,11}, e.g. sqfree-padded 66/154/330)
 #define SP_MAX_HEAD_DIM     256
 #define SP_MAX_BANDS        8
 #define SP_MAX_LAYERS       128
@@ -56,11 +57,11 @@ typedef struct {
 
     // Möbius partition mask
     bool     use_mobius_mask;    // Reorder coefficients squarefree-first
-    int      skeleton_k;         // WHT skeleton size for K (must == head_dim)
-    int      skeleton_v;         // WHT skeleton size for V (must == head_dim)
+    int      skeleton_k;         // VHT2 skeleton size for K (must == head_dim)
+    int      skeleton_v;         // VHT2 skeleton size for V (must == head_dim)
 
     // Vilenkin successive decomposition (research path)
-    bool     use_vilenkin;       // Enable Vilenkin instead of pure WHT
+    bool     use_vilenkin;       // Legacy flag — VHT2 is always Vilenkin-Hartley
     int      vilenkin_primes;    // Number of primes (2=6, 3=30, 4=210)
     float    energy_threshold;   // Energy retention (0.95 = 95%)
 } sp_config_t;
@@ -78,10 +79,10 @@ void sp_config_init(sp_config_t *cfg, int head_dim, int n_layers, int n_heads_kv
 //   VHT2(VHT2(x)) = x           (within float tolerance, no 1/N needed)
 // so the same function serves as forward and inverse.
 //
-// At n = 2^k the stages collapse to the Walsh-Hadamard butterfly scaled by
-// 1/√2 per stage — the spectral structure is identical to the classical WHT,
-// but band quantisation and Möbius reordering work on coefficients that are
-// already in a unit-norm basis.
+// At n = 2^k the stages collapse to the p=2 Hartley butterfly scaled by 1/√2
+// per stage — unit-norm basis, self-inverse, no 1/N division on the inverse.
+// Band quantisation and Möbius reordering act on coefficients already in a
+// unit-norm basis.
 
 // In-place VHT2 on float vector of length n. n must factor into {2,3,5,7,11};
 // non-supported dimensions should be handled by sqfree_pad first.
@@ -92,12 +93,6 @@ void sp_vht2_forward_f32(float *data, int n);
 // Reference implementation; backends may override with SIMD.
 void sp_vht2_forward_f16(uint16_t *data, int n);
 
-// Deprecated aliases — these now route to sp_vht2_forward_f32 (self-inverse),
-// so callers that used the old unnormalised WHT+div-by-N pattern should drop
-// the division. Kept so existing code compiles through the v1.0 transition.
-void sp_wht_inplace_f32(float *data, int n);
-void sp_wht_inplace_f16(uint16_t *data, int n);
-
 // ============================================================================
 // Möbius mask — squarefree-first coefficient ordering
 // ============================================================================
@@ -107,7 +102,7 @@ void sp_wht_inplace_f16(uint16_t *data, int n);
 // Prioritizing squarefree indices during coefficient extraction
 // improves quality by 0.14 PPL at identical coefficient budget.
 //
-// The mask is a property of the WHT spectrum, not the model.
+// The mask is a property of the VHT2 spectrum, not the model.
 // Cross-platform invariant: K correlation 0.997 on both hd=128 and hd=64.
 
 typedef struct {
@@ -122,28 +117,28 @@ typedef struct {
 int sp_mobius_mask_init(sp_mobius_mask_t *mask, int n);
 void sp_mobius_mask_free(sp_mobius_mask_t *mask);
 
-// Apply Möbius reordering to WHT coefficients (in-place).
+// Apply Möbius reordering to VHT2 coefficients (in-place).
 // Squarefree coefficients move to front; non-squarefree to back.
-void sp_mobius_reorder(float *wht_coeffs, const sp_mobius_mask_t *mask);
+void sp_mobius_reorder(float *vht2_coeffs, const sp_mobius_mask_t *mask);
 
 // Inverse reorder (restore original index order after dequantization).
-void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask);
+void sp_mobius_unreorder(float *vht2_coeffs, const sp_mobius_mask_t *mask);
 
 // Caller-owned-scratch variants. `scratch` must be at least mask->n floats
 // and is writable. Used on the hot path to avoid malloc per KV vector.
-void sp_mobius_reorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+void sp_mobius_reorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
                           float *scratch);
-void sp_mobius_unreorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+void sp_mobius_unreorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
                             float *scratch);
 
 // ============================================================================
 // VHT2 banded quantization
 // ============================================================================
 //
-// After WHT + optional Möbius reorder:
+// After VHT2 + optional Möbius reorder:
 //   1. Split N coefficients into k equal bands
 //   2. Each band gets its own fp16 scale + packed integer values
-//   3. Band allocation mirrors WHT energy decay:
+//   3. Band allocation mirrors VHT2 energy decay:
 //      high-energy bands get more bits, low-energy tail gets fewer
 //
 // Key findings from paper:
@@ -163,23 +158,25 @@ typedef struct {
 void sp_band_config_init(sp_band_config_t *bc, int head_dim,
                          int n_bands, const int *band_bits);
 
-// Quantize WHT coefficients into banded format.
-// wht_coeffs: input (head_dim floats, already WHT'd and optionally reordered)
+// Quantize VHT2 coefficients into banded format.
+// vht2_coeffs: input (head_dim floats, already VHT2'd and optionally reordered)
 // out:        output buffer (bc->total_bytes)
-void sp_band_quantize(const float *wht_coeffs, uint8_t *out,
+void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
                       const sp_band_config_t *bc);
 
-// Dequantize banded format back to WHT coefficients.
+// Dequantize banded format back to VHT2 coefficients.
 // in:         compressed buffer (bc->total_bytes)
-// wht_coeffs: output (head_dim floats)
-void sp_band_dequantize(const uint8_t *in, float *wht_coeffs,
+// vht2_coeffs: output (head_dim floats)
+void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                         const sp_band_config_t *bc);
 
 // ============================================================================
 // Vilenkin-Hartley Transform — multi-prime basis (research path)
 // ============================================================================
 //
-// Generalizes WHT from Z/2Z to Z/p1Z × Z/p2Z × ... × Z/pkZ.
+// VHT2 is the Vilenkin-Hartley Transform over Z/p1Z × Z/p2Z × ... × Z/pkZ;
+// at p=2 it reduces to the classical Hadamard butterfly (hence the prior
+// "WHT" naming that has been retired).
 // Hartley kernel: cas(x) = cos(x) + sin(x)
 // Self-inverse for ALL primes: V·V = N·I
 // Round-trip error = 0.0000
@@ -230,7 +227,7 @@ int sp_vilenkin_extract_pass(const sp_vilenkin_basis_t *vb,
 void sp_vilenkin_pass_free(sp_vilenkin_pass_t *pass);
 
 // ============================================================================
-// Sqfree + spinor aggressive path (additive to WHT ship path)
+// Sqfree + spinor aggressive path (additive to the ship path)
 // ============================================================================
 //
 //   1. Squarefree basis padding (pad head_dim to clean Vilenkin dimension)
@@ -238,7 +235,7 @@ void sp_vilenkin_pass_free(sp_vilenkin_pass_t *pass);
 //   3. N-bit residual quantization + spinor sheet bit
 //
 // Implementation: core/shannon_prime_sqfree.c
-// WHT ship path (core/shannon_prime.c) is untouched.
+// Ship path (core/shannon_prime.c) is untouched.
 
 // ============================================================================
 // Squarefree basis helpers
@@ -403,8 +400,8 @@ float sp_min_k_corr_for_budget(float params_b, int bits, float budget);
 // and reconstructs on read. This is the interface backends implement.
 //
 // Architecture:
-//   Write path: raw KV → WHT → Möbius reorder → band quantize → store
-//   Read path:  load → band dequantize → Möbius unreorder → inverse WHT → KV
+//   Write path: raw KV → VHT2 → Möbius reorder → band quantize → store
+//   Read path:  load → band dequantize → Möbius unreorder → VHT2 (self-inverse) → KV
 
 typedef struct {
     sp_config_t         config;
@@ -418,10 +415,10 @@ typedef struct {
     int                *seq_len;     // per-layer current sequence length
 
     // Scratch buffers (callee-owned; callers must serialize across threads).
-    // wht_scratch      primary WHT working buffer for write path
+    // vht2_scratch     primary VHT2 working buffer for write path
     // mobius_scratch   scratch for Möbius reorder tmp (hot path, avoids malloc)
-    // read_scratch     WHT buffer for read path (avoids malloc per read)
-    float              *wht_scratch;    // head_dim floats
+    // read_scratch     VHT2 buffer for read path (avoids malloc per read)
+    float              *vht2_scratch;   // head_dim floats
     float              *mobius_scratch; // head_dim floats
     float              *read_scratch;   // head_dim floats
 } sp_shadow_cache_t;
@@ -475,16 +472,6 @@ void sp_shadow_read_v_batch (const sp_shadow_cache_t *sc,
                              int layer, int head,
                              int start_pos, int n_pos,
                              float *v_out);
-
-// ============================================================================
-// NaN guard — clamp reconstructed values to safe range
-// ============================================================================
-//
-// Aggressive compression can produce values at FP boundary after
-// softmax over long context. Ship config (5/4/4) is NaN-safe,
-// but the guard is defense-in-depth.
-
-void sp_nan_guard_f32(float *data, int n, float max_magnitude);
 
 // ============================================================================
 // Diagnostics

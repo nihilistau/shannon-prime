@@ -9,7 +9,7 @@
 //
 // CUDA kernels for the sqfree + spinor aggressive compression path.
 //
-// Additive to backends/cuda/shannon_prime_cuda.cu — the existing WHT
+// Additive to backends/cuda/shannon_prime_cuda.cu — the existing VHT2-at-p=2
 // butterfly kernels are untouched. These new kernels handle:
 //
 //   1. Prime-Hartley (Vilenkin) transform — successive stages per prime factor
@@ -18,7 +18,7 @@
 //   4. Sqfree pad/unpad — mean-fill padding for non-power-of-2 dimensions
 //
 // All kernels operate on device memory. No host↔device transfers needed
-// when the shadow cache lives on GPU (same as the WHT CUDA path).
+// when the shadow cache lives on GPU (same as the ship CUDA path).
 
 #include <cuda_runtime.h>
 #include <math.h>

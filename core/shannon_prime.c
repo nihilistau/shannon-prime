@@ -106,7 +106,7 @@ void sp_config_init(sp_config_t *cfg, int head_dim, int n_layers, int n_heads_kv
 // orthonormal, so the whole transform is self-inverse: VHT2(VHT2(x)) = x.
 //
 // At n = 2^k this collapses to the Walsh-Hadamard butterfly scaled by 1/√2
-// per stage — the spectral structure is the same as the classical WHT but
+// per stage — the spectral structure is that of the p=2 Hartley butterfly but
 // there is no 1/N to undo on the inverse.
 
 #define SP_VHT2_MAX_P 11
@@ -197,11 +197,6 @@ void sp_vht2_forward_f16(uint16_t *data, int n) {
     free(tmp);
 }
 
-// Deprecated aliases — route through VHT2. Both forward and inverse WHT are
-// now the same self-inverse call; the 1/N normalisation the old API required
-// for round-trip is absorbed into the 1/√p per stage.
-void sp_wht_inplace_f32(float *data, int n) { sp_vht2_forward_f32(data, n); }
-void sp_wht_inplace_f16(uint16_t *data, int n) { sp_vht2_forward_f16(data, n); }
 
 // ============================================================================
 // Möbius mask
@@ -293,38 +288,38 @@ void sp_mobius_mask_free(sp_mobius_mask_t *mask) {
 
 // Caller-owned-scratch variants. Used on the hot path (shadow cache,
 // Adreno backend) to avoid malloc per KV vector.
-void sp_mobius_reorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+void sp_mobius_reorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
                           float *scratch) {
     int n = mask->n;
     for (int i = 0; i < n; i++) {
-        scratch[i] = wht_coeffs[mask->order[i]];
+        scratch[i] = vht2_coeffs[mask->order[i]];
     }
-    memcpy(wht_coeffs, scratch, n * sizeof(float));
+    memcpy(vht2_coeffs, scratch, n * sizeof(float));
 }
 
-void sp_mobius_unreorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+void sp_mobius_unreorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
                             float *scratch) {
     int n = mask->n;
     for (int i = 0; i < n; i++) {
-        scratch[mask->order[i]] = wht_coeffs[i];
+        scratch[mask->order[i]] = vht2_coeffs[i];
     }
-    memcpy(wht_coeffs, scratch, n * sizeof(float));
+    memcpy(vht2_coeffs, scratch, n * sizeof(float));
 }
 
 // Malloc-owning variants retained for existing callers (tests, research code).
-void sp_mobius_reorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
+void sp_mobius_reorder(float *vht2_coeffs, const sp_mobius_mask_t *mask) {
     int n = mask->n;
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
-    sp_mobius_reorder_ex(wht_coeffs, mask, tmp);
+    sp_mobius_reorder_ex(vht2_coeffs, mask, tmp);
     free(tmp);
 }
 
-void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
+void sp_mobius_unreorder(float *vht2_coeffs, const sp_mobius_mask_t *mask) {
     int n = mask->n;
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
-    sp_mobius_unreorder_ex(wht_coeffs, mask, tmp);
+    sp_mobius_unreorder_ex(vht2_coeffs, mask, tmp);
     free(tmp);
 }
 
@@ -334,7 +329,7 @@ void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
 //
 // Each band stores: 1 fp16 scale + packed integer values.
 // The scale is max(abs(band)) / (2^(bits-1) - 1).
-// This mirrors WHT energy decay: band 0 (highest energy) gets most bits,
+// This mirrors VHT2 energy decay: band 0 (highest energy) gets most bits,
 // band 3 (lowest energy / noise tail) gets fewest.
 //
 // Critical results from paper:
@@ -358,12 +353,12 @@ void sp_band_config_init(sp_band_config_t *bc, int head_dim,
     bc->total_bytes = total;
 }
 
-void sp_band_quantize(const float *wht_coeffs, uint8_t *out,
+void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
                       const sp_band_config_t *bc) {
     int offset = 0;
 
     for (int b = 0; b < bc->n_bands; b++) {
-        const float *band = wht_coeffs + b * bc->band_size;
+        const float *band = vht2_coeffs + b * bc->band_size;
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1; // e.g. 5-bit → 15
 
@@ -417,19 +412,25 @@ void sp_band_quantize(const float *wht_coeffs, uint8_t *out,
     }
 }
 
-void sp_band_dequantize(const uint8_t *in, float *wht_coeffs,
+void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                         const sp_band_config_t *bc) {
     int offset = 0;
 
     for (int b = 0; b < bc->n_bands; b++) {
-        float *band = wht_coeffs + b * bc->band_size;
+        float *band = vht2_coeffs + b * bc->band_size;
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
         uint32_t mask = (1u << bits) - 1;
 
-        // Read scale
+        // Read scale. Sanitise: fp16 round-trip can produce +Inf (amax overflowed
+        // the fp16 range on encode) or NaN (corrupted bytes). An Inf or NaN scale
+        // would poison every value in this band and then cascade through the
+        // inverse VHT2, so we clamp to 0 here — the band decodes as all zeros,
+        // which is the same outcome the old blanket NaN guard used to produce,
+        // but applied at the root cause rather than the output tail.
         uint16_t scale_f16 = (uint16_t)in[offset] | ((uint16_t)in[offset + 1] << 8);
         float scale = sp_f16_to_f32(scale_f16);
+        if (!isfinite(scale)) scale = 0.0f;
         offset += 2;
 
         // Unpack quantized values
@@ -687,13 +688,13 @@ int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
     }
 
     // Allocate persistent scratch buffers so the hot path never mallocs.
-    // wht_scratch     : write-path WHT buffer
+    // vht2_scratch    : write-path VHT2 buffer
     // mobius_scratch  : Möbius reorder/unreorder tmp (shared between write+read)
-    // read_scratch    : read-path WHT buffer (independent of write path)
-    sc->wht_scratch    = (float *)malloc(cfg->head_dim * sizeof(float));
+    // read_scratch    : read-path VHT2 buffer (independent of write path)
+    sc->vht2_scratch    = (float *)malloc(cfg->head_dim * sizeof(float));
     sc->mobius_scratch = (float *)malloc(cfg->head_dim * sizeof(float));
     sc->read_scratch   = (float *)malloc(cfg->head_dim * sizeof(float));
-    if (!sc->wht_scratch || !sc->mobius_scratch || !sc->read_scratch) return -1;
+    if (!sc->vht2_scratch || !sc->mobius_scratch || !sc->read_scratch) return -1;
 
     // Cache storage will be allocated by backend (depends on max_seq_len)
     sc->k_cache = NULL;
@@ -707,24 +708,24 @@ void sp_shadow_cache_free(sp_shadow_cache_t *sc) {
     if (sc->config.use_mobius_mask) {
         sp_mobius_mask_free(&sc->mobius_mask);
     }
-    free(sc->wht_scratch);
+    free(sc->vht2_scratch);
     free(sc->mobius_scratch);
     free(sc->read_scratch);
     free(sc->seq_len);
     // k_cache and v_cache freed by backend
-    sc->wht_scratch    = NULL;
+    sc->vht2_scratch    = NULL;
     sc->mobius_scratch = NULL;
     sc->read_scratch   = NULL;
     sc->seq_len        = NULL;
 }
 
-// Write path: raw KV → WHT → Möbius reorder → band quantize → store
-// Hot path: uses persistent sc->wht_scratch + sc->mobius_scratch. No malloc.
+// Write path: raw KV → VHT2 → Möbius reorder → band quantize → store
+// Hot path: uses persistent sc->vht2_scratch + sc->mobius_scratch. No malloc.
 void sp_shadow_write_k(sp_shadow_cache_t *sc,
                        int layer, int head, int pos,
                        const float *k_vec) {
     int hd = sc->config.head_dim;
-    float *scratch = sc->wht_scratch;
+    float *scratch = sc->vht2_scratch;
 
     memcpy(scratch, k_vec, hd * sizeof(float));
     sp_vht2_forward_f32(scratch, hd);
@@ -742,7 +743,7 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
                        int layer, int head, int pos,
                        const float *v_vec) {
     int hd = sc->config.head_dim;
-    float *scratch = sc->wht_scratch;
+    float *scratch = sc->vht2_scratch;
 
     memcpy(scratch, v_vec, hd * sizeof(float));
     sp_vht2_forward_f32(scratch, hd);
@@ -755,7 +756,7 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
     sp_band_quantize(scratch, dest, &sc->v_bands);
 }
 
-// Read path: load → band dequantize → Möbius unreorder → inverse WHT → KV
+// Read path: load → band dequantize → Möbius unreorder → VHT2 (self-inverse) → KV
 // Hot path: uses persistent sc->read_scratch + sc->mobius_scratch. No malloc.
 // The `const` on sc is a contract for thread-call-safety, not true immutability
 // — we write into sc->read_scratch / sc->mobius_scratch. Callers must serialize.
@@ -775,10 +776,9 @@ void sp_shadow_read_k(const sp_shadow_cache_t *sc,
     }
 
     // Inverse transform: VHT2 is self-inverse (1/√p per stage absorbs the
-    // 1/N the old unnormalised WHT required).
+    // 1/N the old unnormalised p=2 butterfly required).
     sp_vht2_forward_f32(scratch, hd);
 
-    sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(k_out, scratch, hd * sizeof(float));
 }
 
@@ -796,7 +796,6 @@ void sp_shadow_read_v(const sp_shadow_cache_t *sc,
     // Inverse transform: VHT2 is self-inverse.
     sp_vht2_forward_f32(scratch, hd);
 
-    sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(v_out, scratch, hd * sizeof(float));
 }
 
@@ -840,22 +839,6 @@ void sp_shadow_read_v_batch(const sp_shadow_cache_t *sc,
     int hd = sc->config.head_dim;
     for (int i = 0; i < n_pos; i++) {
         sp_shadow_read_v(sc, layer, head, start_pos + i, v_out + (size_t)i * hd);
-    }
-}
-
-// ============================================================================
-// NaN guard
-// ============================================================================
-
-void sp_nan_guard_f32(float *data, int n, float max_magnitude) {
-    for (int i = 0; i < n; i++) {
-        if (!isfinite(data[i])) {
-            data[i] = 0.0f;
-        } else if (data[i] > max_magnitude) {
-            data[i] = max_magnitude;
-        } else if (data[i] < -max_magnitude) {
-            data[i] = -max_magnitude;
-        }
     }
 }
 

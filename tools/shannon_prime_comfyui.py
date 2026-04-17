@@ -40,7 +40,7 @@ VHT2 Caching Strategy:
 =======================
 
 Cross-attention K/V do NOT carry RoPE. They are vanilla linear projections
-of T5 features. The WHT spectral concentration is weaker than self-attention
+of T5 features. The VHT2 spectral concentration is weaker than self-attention
 K (which has RoPE periodicity). VHT2 still provides VRAM compression, but
 the quality advantage is from general transform coding, not lattice structure.
 
@@ -74,7 +74,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'backends', 'to
 import torch
 from typing import Optional, Tuple, Dict, Callable, Any
 from shannon_prime_torch import (
-    wht_inplace, MobiusMask, BandedQuantizer, correlation
+    vht2, MobiusMask, BandedQuantizer, correlation
 )
 
 
@@ -96,7 +96,7 @@ class VHT2CrossAttentionCache:
         V = cross_attn_v(context)
 
     Since there's no RoPE periodicity, K and V have similar spectral profiles
-    in WHT space. We still apply Möbius-ordered banded quantization for VRAM
+    in VHT2 space. We still apply Möbius-ordered banded quantization for VRAM
     compression, but use the SAME bit allocation for both K and V (unlike
     self-attention where K gets 5/5/4/3 and V gets flat 3-bit).
     """
@@ -169,9 +169,9 @@ class VHT2CrossAttentionCache:
         k_flat = k.reshape(-1, self.head_dim).float().clone()
         v_flat = v.reshape(-1, self.head_dim).float().clone()
 
-        # WHT forward
-        wht_inplace(k_flat)
-        wht_inplace(v_flat)
+        # VHT2 forward
+        k_flat = vht2(k_flat)
+        v_flat = vht2(v_flat)
 
         # Möbius reorder both K and V (cross-attn K has no RoPE,
         # so K and V have similar spectral profiles — reorder both)
@@ -213,17 +213,9 @@ class VHT2CrossAttentionCache:
             k_flat = self.mobius.unreorder(k_flat)
             v_flat = self.mobius.unreorder(v_flat)
 
-        # Inverse WHT
-        wht_inplace(k_flat)
-        k_flat.div_(self.head_dim)
-        wht_inplace(v_flat)
-        v_flat.div_(self.head_dim)
-
-        # NaN guard
-        k_flat = torch.clamp(k_flat, -65504.0, 65504.0)
-        v_flat = torch.clamp(v_flat, -65504.0, 65504.0)
-        k_flat = torch.nan_to_num(k_flat, nan=0.0)
-        v_flat = torch.nan_to_num(v_flat, nan=0.0)
+        # Inverse VHT2 (self-inverse — same call as forward, no 1/N)
+        k_flat = vht2(k_flat)
+        v_flat = vht2(v_flat)
 
         # Reshape and cast back to original dtype
         k = k_flat.reshape(orig_shape).to(orig_dtype)

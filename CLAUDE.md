@@ -36,8 +36,8 @@ spectral structure that underpins the Möbius predictor.
 ```
 Write: raw KV → VHT2 forward → Möbius reorder (K only, self-attn)
        → Band quantize (5/5/4/3 for K, flat 3 for V) → Store
-Read:  Load → Band dequantize → Möbius unreorder → VHT2 forward (= inverse)
-       → NaN guard → KV
+Read:  Load → Band dequantize (non-finite scale ⇒ zero band)
+       → Möbius unreorder → VHT2 forward (= inverse) → KV
 ```
 K (post-RoPE) concentrates 80%+ energy in the first VHT2 bands; V (content)
 spreads uniformly. K gets 4-band Möbius-ordered quantization, V gets flat 3-bit.
@@ -59,7 +59,7 @@ hd=128: PPL 7.32 @ 3.3× (matches MOBIUS default 7.31 @ 2.6×, +27% compression)
 
 **Q8+ feature.** On Q3 and below, scaling-law γ=1.5 on weight precision says
 the spinor's 1-bit correction is washed out by W-matrix quantization noise;
-use the WHT ship path for heavily quantized models.
+use the VHT2 ship path for heavily quantized models.
 
 ## Build and Test
 
@@ -90,8 +90,11 @@ make test-sqfree  # Sqfree + spinor path (PyTorch, 69 tests)
   hits 0.984.
 - Treat any part of this as theoretical or unimplemented. If you find yourself
   writing "this would need to be..." — check if it's already in the codebase.
-- Remove or weaken the NaN guard. It's defense-in-depth for aggressive configs.
-- Apply the sqfree+spinor path to Q4 or lower models. Use the WHT ship path.
+- Re-introduce a blanket output NaN guard. The read path now produces finite
+  values by construction — the non-finite scale check in `sp_band_dequantize`
+  is the one surviving guard and lives at the root cause. If a new code path
+  regresses into producing NaN, **fix the origin**, don't add another clamp.
+- Apply the sqfree+spinor path to Q4 or lower models. Use the VHT2 ship path.
 
 ### CRITICAL INVARIANTS (never violate):
 1. **VHT2 is self-inverse**: VHT2(VHT2(x)) = x. Error < 1e-5 at power-of-2,
@@ -117,15 +120,17 @@ make test-sqfree  # Sqfree + spinor path (PyTorch, 69 tests)
 
 ## Backend Notes (GPU kernels)
 
-CUDA, Vulkan, and Adreno backends currently run the classical WHT butterfly
-(no 1/√p per stage) and divide by N on the inverse path — this is
-*mathematically equivalent* to VHT2 after BandedQuantizer's per-band amax
-normalization absorbs the 1/√N spectrum scale. Backend shadow caches are
-per-device (not shared with the CPU path), so round-trip reconstructions are
-interoperable where it matters (output vectors agree; only intermediate
-spectrum magnitudes differ by 1/√N). Porting the GPU kernels to literal
-staged-Hartley form is a cosmetic follow-up — it would not change any
-user-facing number.
+All backends now run the literal VHT2 with 1/√p per stage (self-inverse, no
+1/N on reconstruction). Per-band amax normalisation in BandedQuantizer makes
+the spectrum magnitudes invariant to the transform scale, so this cleanup is
+behaviour-neutral on the output side and simplifies cross-backend debugging.
+
+Vulkan compute is currently routed through the CPU staged VHT2 inside the
+host wrappers (`vk_compress_one` / `vk_decompress_one`) because the GPU
+dispatch hits `VK_ERROR_DEVICE_LOST` at the first `vkWaitForFences` on
+RTX 2060; pipelines are still created so `test_vulkan` exercises the full
+init path, only the submit is skipped. Debugging the shader hang is tracked
+separately and needs RenderDoc on the target GPU.
 
 ## WHY These Specific Choices (Do Not "Optimize" Without Understanding)
 
@@ -148,10 +153,13 @@ user-facing number.
   half-Möbius "shredding" and only works when the basis preserves divisibility
   structure (sqfree VHT2, not pure power-of-2 VHT2).
 
-- The **NaN guard** exists because aggressive bit configs (4/4/3 and below on
-  hd=64) produce NaN at chunk 2+ despite healthy single-chunk correlations.
-  Ship config (5/4/4) is NaN-safe, but the guard is defense-in-depth for users
-  who override defaults.
+- **No output NaN guard.** Previously a blanket `nan_to_num + clamp` ran on
+  every read path as defense-in-depth for aggressive bit configs (4/4/3 and
+  below on hd=64). It was removed in favour of a root-cause guard: if the
+  fp16 per-band scale round-trips to a non-finite value (the real origin of
+  the cascading NaN), `sp_band_dequantize` zeros the band. Ship config
+  (5/4/4) produces finite outputs without this branch ever firing; aggressive
+  configs now surface any remaining NaN instead of silently masking it.
 
 - **Cross-attention in Wan** models has NO RoPE on K/V. Both K and V get
   Möbius reorder and matching bit allocation. This is DIFFERENT from
@@ -222,11 +230,11 @@ docs/                      Full documentation
 | File | What It Does | Test Coverage |
 |------|-------------|---------------|
 | core/shannon_prime.h | Full public API | test_core.c |
-| core/shannon_prime.c | C reference (VHT2 + WHT-compat aliases) | test_core.c |
+| core/shannon_prime.c | C reference (VHT2 only, no WHT aliases) | test_core.c |
 | core/shannon_prime_sqfree.c | Sqfree + spinor C implementation | test_core.c (sqfree section) |
 | backends/torch/shannon_prime_torch.py | PyTorch (vht2, ShadowCache) | test_torch.py |
 | backends/torch/shannon_prime_sqfree.py | PyTorch sqfree+spinor path | test_sqfree.py |
-| backends/cuda/shannon_prime_cuda.cu | CUDA WHT-butterfly kernels | test_cuda.c |
+| backends/cuda/shannon_prime_cuda.cu | CUDA VHT2 p=2 butterfly + sqfree dispatch | test_cuda.c |
 | backends/cuda/shannon_prime_sqfree.cu | CUDA Vilenkin+spinor kernels | test_cuda.c (sqfree section) |
 | backends/vulkan/shannon_prime_vulkan.c | Vulkan + CPU fallback | test_vulkan.c |
 | backends/vulkan/shaders/vilenkin.comp | Vulkan VHT2 shader | test_vulkan.c |

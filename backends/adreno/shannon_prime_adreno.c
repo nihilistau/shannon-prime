@@ -257,7 +257,7 @@ int sp_set_thread_affinity(sp_core_affinity_t affinity,
 // NEON VHT2 — Tier 1 (f32, 4 elements/op, p=2 stages orthonormal via 1/√N)
 // ============================================================================
 //
-// At p=2 VHT2 is the classical WHT butterfly with 1/√2 per stage, producing
+// At p=2 VHT2 is the Hadamard butterfly with 1/√2 per stage, producing
 // an orthonormal self-inverse transform (no /N on the inverse). The NEON
 // code below runs the unnormalised butterfly for speed, then applies a
 // single 1/√N multiply at the end — numerically equivalent to the per-stage
@@ -267,7 +267,7 @@ int sp_set_thread_affinity(sp_core_affinity_t affinity,
 
 #if HAS_NEON
 
-void sp_neon_wht_f32(float *data, int n) {
+void sp_neon_vht2_f32(float *data, int n) {
     // Guard: for non-power-of-2, fall back to the core staged VHT2
     // (scalar; Adreno's sqfree call sites are rare compared to p=2).
     if (n <= 0 || (n & (n - 1)) != 0) {
@@ -275,7 +275,7 @@ void sp_neon_wht_f32(float *data, int n) {
         return;
     }
 
-    // Unnormalised WHT butterfly
+    // Unnormalised p=2 Hartley butterfly
     for (int len = 1; len < n; len <<= 1) {
         for (int i = 0; i < n; i += len << 1) {
             int j = 0;
@@ -330,7 +330,7 @@ float sp_neon_absmax_f32(const float *data, int n) {
 
 #else // Scalar fallback — route through the core staged VHT2
 
-void sp_neon_wht_f32(float *data, int n) {
+void sp_neon_vht2_f32(float *data, int n) {
     sp_vht2_forward_f32(data, n);
 }
 
@@ -346,12 +346,12 @@ float sp_neon_absmax_f32(const float *data, int n) {
 #endif // HAS_NEON
 
 // ============================================================================
-// NEON WHT — Tier 2 (f16, 8 elements/op, requires FEAT_FP16)
+// NEON VHT2 — Tier 2 (f16, 8 elements/op, requires FEAT_FP16)
 // ============================================================================
 
 #if HAS_NEON && HAS_FP16_ARITH
 
-void sp_neon_wht_f16(void *data, int n) {
+void sp_neon_vht2_f16(void *data, int n) {
     // Non-power-of-2: fall back via the f32 path (which dispatches the
     // core staged VHT2 for sqfree dims).
     if (n <= 0 || (n & (n - 1)) != 0) {
@@ -405,42 +405,19 @@ void sp_neon_wht_f16(void *data, int n) {
     for (; i < n; i++) d[i] *= inv_sqrt_n;
 }
 
-// Inverse is the forward (VHT2 self-inverse)
-void sp_neon_iwht_f16(void *data, int n) {
-    sp_neon_wht_f16(data, n);
-}
-
 #else // No native fp16 arithmetic — convert through f32
 
-void sp_neon_wht_f16(void *data, int n) {
-    // Convert fp16 → f32, WHT in f32, convert back
+void sp_neon_vht2_f16(void *data, int n) {
+    // Convert fp16 → f32, VHT2 in f32, convert back
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
     sp_neon_f16_to_f32(data, tmp, n);
-    sp_neon_wht_f32(tmp, n);
+    sp_neon_vht2_f32(tmp, n);
     sp_neon_f32_to_f16(tmp, data, n);
     free(tmp);
 }
 
-void sp_neon_iwht_f16(void *data, int n) {
-    // Self-inverse under VHT2 semantics
-    sp_neon_wht_f16(data, n);
-}
-
 #endif // HAS_FP16_ARITH
-
-// ============================================================================
-// Inverse VHT2 — same as forward (self-inverse with 1/√N end-normalisation)
-// ============================================================================
-//
-// Under VHT2 semantics, calling the forward transform twice reproduces the
-// input (no 1/N factor needed). This entry point is kept for API
-// compatibility with the old WHT code; internally it dispatches to the
-// same forward kernel.
-
-void sp_neon_iwht_f32(float *data, int n) {
-    sp_neon_wht_f32(data, n);
-}
 
 // ============================================================================
 // fp16 ↔ fp32 conversion
@@ -526,17 +503,17 @@ void sp_neon_f32_to_f16(const float *src, void *dst, int n) {
 // Banded quantization — dispatches to core (NEON acceleration in absmax)
 // ============================================================================
 
-void sp_neon_band_quantize(const float *wht_coeffs, uint8_t *out,
+void sp_neon_band_quantize(const float *vht2_coeffs, uint8_t *out,
                            const sp_band_config_t *bc) {
     // The core quantization is bit-packing which is inherently sequential.
     // NEON helps with the absmax reduction (above) but the packing loop
     // is the same. Use the validated core implementation.
-    sp_band_quantize(wht_coeffs, out, bc);
+    sp_band_quantize(vht2_coeffs, out, bc);
 }
 
-void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
+void sp_neon_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                              const sp_band_config_t *bc) {
-    sp_band_dequantize(in, wht_coeffs, bc);
+    sp_band_dequantize(in, vht2_coeffs, bc);
 }
 
 // ============================================================================
@@ -546,7 +523,7 @@ void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
 // These are the function signatures that would be implemented using
 // Hexagon SDK intrinsics (hexagon_protos.h, HVX_Vector types).
 //
-// The WHT butterfly on HVX is particularly elegant:
+// The VHT2 p=2 butterfly on HVX is particularly elegant:
 //   HVX register = 1024 bits = 128 bytes = 32 × float32
 //   head_dim=128 = 4 HVX registers of f32
 //   head_dim=128 = 2 HVX registers of f16
@@ -554,7 +531,7 @@ void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
 //
 // For Snapdragon 8 Gen 1 (V69): HVX only, no HMX.
 // For 8 Gen 2+ (V73+): HVX + HMX. HMX can do fp16 matrix ops
-// which could accelerate the entire WHT as a single matrix multiply.
+// which could accelerate the entire VHT2 as a single matrix multiply.
 
 #ifdef SP_HEXAGON_ENABLED
 
@@ -562,7 +539,7 @@ void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
 // #include <hexagon_protos.h>
 // #include <hvx_hexagon_protos.h>
 
-void sp_hvx_wht_f32(float *data, int n) {
+void sp_hvx_vht2_f32(float *data, int n) {
     // HVX implementation:
     // - Load 32 floats per HVX_Vector
     // - Butterfly with Q6_V_vadd_VV, Q6_V_vsub_VV
@@ -577,33 +554,26 @@ void sp_hvx_wht_f32(float *data, int n) {
     //     v[hi] = Q6_V_vsub_VV(p.v0, p.v1);
     //
     // Falls back to NEON for now:
-    sp_neon_wht_f32(data, n);
+    sp_neon_vht2_f32(data, n);
 }
 
-void sp_hvx_wht_f16(void *data, int n) {
+void sp_hvx_vht2_f16(void *data, int n) {
     // HVX fp16: 64 elements per HVX_Vector
     // head_dim=128 = 2 HVX registers
     // Even more efficient than f32 path
-    sp_neon_wht_f16(data, n);
+    sp_neon_vht2_f16(data, n);
 }
 
-void sp_hvx_iwht_f32(float *data, int n) {
-    sp_hvx_wht_f32(data, n);
-    float inv_n = 1.0f / (float)n;
-    // HVX: Q6_V_vmpy_VfVf (vector float multiply)
-    for (int i = 0; i < n; i++) data[i] *= inv_n;
-}
-
-void sp_hvx_band_quantize(const float *wht_coeffs, uint8_t *out,
+void sp_hvx_band_quantize(const float *vht2_coeffs, uint8_t *out,
                           const sp_band_config_t *bc) {
     // HVX can accelerate the absmax reduction via Q6_V_vmax_VV
     // and the quantize-and-pack via vector shift/mask operations.
-    sp_band_quantize(wht_coeffs, out, bc);
+    sp_band_quantize(vht2_coeffs, out, bc);
 }
 
-void sp_hvx_band_dequantize(const uint8_t *in, float *wht_coeffs,
+void sp_hvx_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                             const sp_band_config_t *bc) {
-    sp_band_dequantize(in, wht_coeffs, bc);
+    sp_band_dequantize(in, vht2_coeffs, bc);
 }
 
 #endif // SP_HEXAGON_ENABLED
@@ -705,38 +675,22 @@ void sp_adreno_cache_free(sp_adreno_cache_t *ac) {
 }
 
 // ============================================================================
-// Write path — dispatches WHT to best available compute unit
+// Write path — dispatches VHT2 to best available compute unit
 // ============================================================================
 
-static inline void do_wht_f32(float *data, int n, sp_compute_target_t target) {
+static inline void do_vht2_f32(float *data, int n, sp_compute_target_t target) {
     switch (target) {
 #ifdef SP_HEXAGON_ENABLED
     case SP_COMPUTE_HEXAGON:
-        sp_hvx_wht_f32(data, n);
+        sp_hvx_vht2_f32(data, n);
         return;
 #endif
     case SP_COMPUTE_CPU_FP16:
     case SP_COMPUTE_CPU_NEON:
     default:
-        sp_neon_wht_f32(data, n);
+        sp_neon_vht2_f32(data, n);
         return;
     }
-}
-
-static inline void do_iwht_f32(float *data, int n, sp_compute_target_t target) {
-    do_wht_f32(data, n, target); // WHT is self-inverse
-    float inv_n = 1.0f / (float)n;
-#if HAS_NEON
-    float32x4_t vinv = vdupq_n_f32(inv_n);
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        float32x4_t v = vld1q_f32(&data[i]);
-        vst1q_f32(&data[i], vmulq_f32(v, vinv));
-    }
-    for (; i < n; i++) data[i] *= inv_n;
-#else
-    for (int i = 0; i < n; i++) data[i] *= inv_n;
-#endif
 }
 
 void sp_adreno_write_k(sp_adreno_cache_t *ac,
@@ -747,8 +701,8 @@ void sp_adreno_write_k(sp_adreno_cache_t *ac,
 
     memcpy(scratch, k_vec, hd * sizeof(float));
 
-    // WHT forward
-    do_wht_f32(scratch, hd, ac->decode_target);
+    // VHT2 forward
+    do_vht2_f32(scratch, hd, ac->decode_target);
 
     // Möbius reorder — use ac->scratch_b as tmp (no malloc)
     if (ac->config.use_mobius_mask) {
@@ -770,7 +724,7 @@ void sp_adreno_write_v(sp_adreno_cache_t *ac,
     float *scratch = ac->scratch_a;
 
     memcpy(scratch, v_vec, hd * sizeof(float));
-    do_wht_f32(scratch, hd, ac->decode_target);
+    do_vht2_f32(scratch, hd, ac->decode_target);
 
     int slot = layer * ac->config.n_heads_kv + head;
     size_t offset = ((size_t)slot * ac->max_seq_len + pos) * ac->v_bands.total_bytes;
@@ -789,15 +743,15 @@ void sp_adreno_write_k_f16(sp_adreno_cache_t *ac,
     int hd = ac->config.head_dim;
 
 #if HAS_FP16_ARITH
-    // Tier 2: WHT directly in fp16, then convert for quantization
+    // Tier 2: VHT2 directly in fp16, then convert for quantization
     memcpy(ac->scratch_f16, k_vec_f16, hd * sizeof(uint16_t));
-    sp_neon_wht_f16(ac->scratch_f16, hd);
+    sp_neon_vht2_f16(ac->scratch_f16, hd);
     // Convert to f32 for banded quantization
     sp_neon_f16_to_f32(ac->scratch_f16, ac->scratch_a, hd);
 #else
-    // Tier 1: convert fp16→f32 first, then WHT in f32
+    // Tier 1: convert fp16→f32 first, then VHT2 in f32
     sp_neon_f16_to_f32(k_vec_f16, ac->scratch_a, hd);
-    do_wht_f32(ac->scratch_a, hd, ac->decode_target);
+    do_vht2_f32(ac->scratch_a, hd, ac->decode_target);
 #endif
 
     if (ac->config.use_mobius_mask) {
@@ -818,11 +772,11 @@ void sp_adreno_write_v_f16(sp_adreno_cache_t *ac,
 
 #if HAS_FP16_ARITH
     memcpy(ac->scratch_f16, v_vec_f16, hd * sizeof(uint16_t));
-    sp_neon_wht_f16(ac->scratch_f16, hd);
+    sp_neon_vht2_f16(ac->scratch_f16, hd);
     sp_neon_f16_to_f32(ac->scratch_f16, ac->scratch_a, hd);
 #else
     sp_neon_f16_to_f32(v_vec_f16, ac->scratch_a, hd);
-    do_wht_f32(ac->scratch_a, hd, ac->decode_target);
+    do_vht2_f32(ac->scratch_a, hd, ac->decode_target);
 #endif
 
     int slot = layer * ac->config.n_heads_kv + head;
@@ -851,8 +805,7 @@ void sp_adreno_read_k(const sp_adreno_cache_t *ac,
                                ((sp_adreno_cache_t *)ac)->scratch_b);
     }
 
-    do_iwht_f32(k_out, hd, ac->decode_target);
-    sp_nan_guard_f32(k_out, hd, 65504.0f);
+    do_vht2_f32(k_out, hd, ac->decode_target);  // self-inverse
 
     ((sp_adreno_cache_t *)ac)->n_reads++;
 }
@@ -866,8 +819,7 @@ void sp_adreno_read_v(const sp_adreno_cache_t *ac,
     size_t offset = ((size_t)slot * ac->max_seq_len + pos) * ac->v_bands.total_bytes;
 
     sp_neon_band_dequantize(ac->v_cache + offset, v_out, &ac->v_bands);
-    do_iwht_f32(v_out, hd, ac->decode_target);
-    sp_nan_guard_f32(v_out, hd, 65504.0f);
+    do_vht2_f32(v_out, hd, ac->decode_target);  // self-inverse
 
     ((sp_adreno_cache_t *)ac)->n_reads++;
 }
@@ -875,7 +827,7 @@ void sp_adreno_read_v(const sp_adreno_cache_t *ac,
 // ============================================================================
 // Batch variants — tight loop over singletons, reusing ac->scratch_{a,b}.
 // Amortizes one level of function-call / dispatch overhead across n_pos
-// vectors. The NEON inner loops (WHT, Möbius gather, band quantize) stay
+// vectors. The NEON inner loops (VHT2, Möbius gather, band quantize) stay
 // warm in icache across iterations.
 // ============================================================================
 

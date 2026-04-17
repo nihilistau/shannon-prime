@@ -31,7 +31,7 @@ from typing import Optional, Tuple, List
 #
 # VHT2 is the squarefree-prime-factor generalization of the Walsh-Hadamard
 # Transform. Each stage applies a p x p Hartley kernel — cas(θ) = cos(θ)+sin(θ)
-# — normalized by 1/√p. At p=2 the stage is exactly the WHT butterfly divided
+# — normalized by 1/√p. At p=2 the stage is exactly the Hadamard butterfly divided
 # by √2, and log2(N) stacked stages give an orthonormal transform with
 # VHT2(VHT2(x)) = x (no division by N on the inverse).
 #
@@ -108,30 +108,6 @@ def vht2(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# ----- Backwards-compatibility shims (deprecated, thin wrappers over vht2) ---
-# Kept so callers and existing tests that import `wht_inplace` / `iwht` keep
-# working through the transition. Both now route to the single self-inverse
-# VHT2 — meaning code that was doing `wht(x); wht(x); x.div_(n)` for a
-# round-trip should drop the division: one vht2() is the inverse of another.
-
-def wht_inplace(x: torch.Tensor) -> torch.Tensor:
-    """Deprecated alias — VHT2 on the last dim, result copied back into x.
-
-    VHT2 is self-inverse with 1/√p per stage, so applying this twice is the
-    identity (no division by N required).
-    """
-    result = vht2(x)
-    if result is not x and result.shape == x.shape:
-        x.copy_(result)
-        return x
-    return result
-
-
-def iwht(x: torch.Tensor) -> torch.Tensor:
-    """Deprecated alias — inverse VHT2 is VHT2 itself (self-inverse)."""
-    return wht_inplace(x)
-
-
 # ----- Sqfree pad helper (used when head_dim needs padding for VHT2) --------
 
 _SMALL_PRIMES_SQFREE = (2, 3, 5, 7, 11)
@@ -170,7 +146,7 @@ def sqfree_pad_dim(head_dim: int) -> int:
 
 class MobiusMask:
     """
-    Squarefree-first coefficient ordering for WHT coefficients.
+    Squarefree-first coefficient ordering for VHT2 coefficients.
     
     The Möbius function μ(n) is non-zero iff n is squarefree.
     Prioritizing squarefree indices during banded quantization
@@ -245,7 +221,7 @@ class MobiusMask:
 
 class BandedQuantizer:
     """
-    VHT2 banded quantization of WHT coefficients.
+    VHT2 banded quantization of spectral coefficients.
     
     Splits n coefficients into k equal bands. Each band gets:
       - 1 fp16 scale (max(abs(band)) / (2^(bits-1) - 1))
@@ -268,7 +244,7 @@ class BandedQuantizer:
 
     def quantize(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
-        Quantize WHT coefficients into banded format.
+        Quantize VHT2 coefficients into banded format.
         
         x: (..., n) float tensor
         Returns: (scales, quant_vals) per band
@@ -300,13 +276,18 @@ class BandedQuantizer:
     def dequantize(self, scales: List[torch.Tensor],
                    quant_vals: List[torch.Tensor]) -> torch.Tensor:
         """
-        Dequantize banded format back to float WHT coefficients.
+        Dequantize banded format back to float VHT2 coefficients.
         
         Returns: (..., n) float tensor
         """
         bands = []
         for b in range(self.n_bands):
             scale = scales[b].float().unsqueeze(-1)
+            # Mirror the C core guard: an fp16 scale that round-trips to
+            # +/-Inf or NaN (amax overflowed fp16 on encode) must not
+            # propagate into the inverse VHT2. Zero the scale; the band
+            # then decodes as all zeros, matching CPU semantics.
+            scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
             q     = quant_vals[b].float()
             bands.append(q * scale)
 
@@ -389,7 +370,7 @@ class ShadowCache:
             from shannon_prime_sqfree import SqfreeShadowCache  # type: ignore
 
             # The sqfree path uses a 5-band torus-aligned default. If the
-            # caller passed a 4-band WHT-style list, promote to the sqfree
+            # caller passed a 4-band ship-style list, promote to the sqfree
             # preset so the BandedQuantizer has an even split over the
             # Knight skeleton size.
             sqfree_bands = list(k_band_bits) if len(k_band_bits) == 5 else [5, 4, 4, 4, 5]
@@ -412,7 +393,7 @@ class ShadowCache:
             self.mobius = None  # sqfree path has its own mobius state
             return
 
-        # ---- Classic WHT ship path (behavior identical to v1.0) ----------
+        # ---- Classic VHT2 ship path (behavior identical to v1.0) ---------
         self._impl = None
         self.k_quantizer = BandedQuantizer(head_dim, k_band_bits)
         self.v_quantizer = BandedQuantizer(head_dim, v_band_bits)
@@ -486,10 +467,6 @@ class ShadowCache:
         # Inverse == forward for the self-inverse VHT2 (no div by N).
         x = vht2(x.unsqueeze(0)).squeeze(0)
 
-        # NaN / overflow guard for aggressive bit configs
-        x = torch.clamp(x, -65504.0, 65504.0)
-        x = torch.nan_to_num(x, nan=0.0)
-
         return x
 
     def read_v(self, layer: int, head: int, pos: int) -> torch.Tensor:
@@ -505,9 +482,6 @@ class ShadowCache:
 
         # Inverse == forward VHT2 (no div by N — self-inverse).
         x = vht2(x.unsqueeze(0)).squeeze(0)
-
-        x = torch.clamp(x, -65504.0, 65504.0)
-        x = torch.nan_to_num(x, nan=0.0)
 
         return x
 

@@ -8,7 +8,7 @@
 
 //
 // Sqfree prime-Hartley + Knight mask + Möbius CSR + spinor sheet bit.
-// Additive to core/shannon_prime.c — does NOT modify the WHT ship path.
+// Additive to core/shannon_prime.c — does NOT modify the VHT2 ship path.
 //
 // Include this file alongside shannon_prime.c in your build.
 // Requires: <math.h>, <stdlib.h>, <string.h>, <stdbool.h>, <stdint.h>
@@ -613,9 +613,8 @@ static void sp_sqfree_reconstruct_one(const sp_sqfree_cache_t *sc,
     // 3. Vilenkin inverse
     sp_vilenkin_inverse_f32(coeffs, pd);
 
-    // 4. Unpad + NaN guard
+    // 4. Unpad
     sp_sqfree_unpad_f32(coeffs, vec_out, hd);
-    sp_nan_guard_f32(vec_out, hd, 65504.0f);
 }
 
 void sp_sqfree_write_k(sp_sqfree_cache_t *sc,

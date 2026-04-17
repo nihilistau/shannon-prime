@@ -4,15 +4,21 @@
 
 The Vulkan backend runs VHT2 compression via compute shaders, targeting cross-platform GPU acceleration. It works on NVIDIA, AMD, Intel, and Qualcomm Adreno GPUs — any device with Vulkan 1.1+ compute support. When no Vulkan device is available, it falls back to the C core implementation transparently.
 
+**Current runtime note:** Vulkan compute is currently routed through the CPU staged VHT2 inside the host wrappers (`vk_compress_one` / `vk_decompress_one`) because the GPU dispatch hits `VK_ERROR_DEVICE_LOST` at the first `vkWaitForFences` on RTX 2060. Pipelines are still created so `test_vulkan` exercises the full init path; only the GPU submit is skipped. Debugging the shader hang is tracked separately and needs RenderDoc on the target GPU. The wording below describes the shader pipeline as it is wired up and as it will execute once the hang is resolved.
+
 ## Compute Shaders
 
-Three GLSL compute shaders in `backends/vulkan/shaders/`:
+The following GLSL compute shaders live in `backends/vulkan/shaders/`:
 
-**`wht.comp`:** In-place Walsh-Hadamard butterfly. One workgroup per vector, shared memory for butterfly passes. The workgroup size is a specialization constant matching head_dim (64, 128, or 256). For hd=128: 7 barrier-synchronized passes in shared memory, then writeback.
+**`vilenkin.comp`:** In-place VHT2 butterfly (self-inverse, 1/√p per stage, no 1/N on reconstruction). One workgroup per vector, shared memory for butterfly passes. The workgroup size is a specialization constant matching head_dim (64, 128, or 256). For hd=128 at p=2: 7 barrier-synchronized passes in shared memory, then writeback. The legacy `wht.comp` shader has been removed; `vilenkin.comp` is the single transform.
 
 **`mobius_reorder.comp`:** Gather-based Möbius permutation. Each thread reads from `order[tid]` and writes to position `tid`. The permutation table is a storage buffer bound at descriptor set 0, binding 2.
 
 **`band_quantize.comp`:** Per-band abs-max reduction in shared memory, then sequential bit packing by thread 0. Push constants carry the band configuration (n_bands, bits per band, band_size, total output words).
+
+**`band_dequantize.comp`:** Inverse of `band_quantize.comp`. Reads the packed payload + per-band fp16 scale, unpacks to signed integers, and scales back to fp32. Mirrors the CPU core's non-finite-scale guard: if an fp16 scale round-trips to Inf/NaN the whole band decodes as zero instead of poisoning the inverse VHT2.
+
+**`knight_predict.comp`:** Sqfree+spinor Knight CSR predict shader used by the aggressive path (also currently CPU-staged until the `VK_ERROR_DEVICE_LOST` issue is resolved).
 
 ## Pipeline
 
@@ -23,8 +29,8 @@ Vulkan Compute Pipeline
   Input Buffer (raw K/V, fp32)
        │
        ▼
-  ┌─────────────┐    Dispatch 1: wht.comp
-  │   WHT       │    workgroup = (head_dim,), groups = n_vectors
+  ┌─────────────┐    Dispatch 1: vilenkin.comp
+  │   VHT2      │    workgroup = (head_dim,), groups = n_vectors
   └──────┬──────┘
          │
          ▼
@@ -41,16 +47,18 @@ Vulkan Compute Pipeline
   Compressed Cache Buffer
 ```
 
-Read path reverses: dequantize → unreorder → WHT (reusing the same shader since WHT is self-inverse, plus a scaling dispatch).
+Read path reverses: dequantize → unreorder → VHT2 (reusing the same `vilenkin.comp` shader since VHT2 is self-inverse; no separate inverse shader, no 1/N on reconstruction).
 
 ## Building
 
 Compile shaders to SPIR-V:
 
 ```bash
-glslangValidator -V backends/vulkan/shaders/wht.comp -o backends/vulkan/shaders/wht.spv
+glslangValidator -V backends/vulkan/shaders/vilenkin.comp -o backends/vulkan/shaders/vilenkin.spv
 glslangValidator -V backends/vulkan/shaders/mobius_reorder.comp -o backends/vulkan/shaders/mobius_reorder.spv
 glslangValidator -V backends/vulkan/shaders/band_quantize.comp -o backends/vulkan/shaders/band_quantize.spv
+glslangValidator -V backends/vulkan/shaders/band_dequantize.comp -o backends/vulkan/shaders/band_dequantize.spv
+glslangValidator -V backends/vulkan/shaders/knight_predict.comp -o backends/vulkan/shaders/knight_predict.spv
 ```
 
 Compile the host code (requires Vulkan SDK for full GPU path):

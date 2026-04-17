@@ -1,0 +1,27 @@
+{
+  "device": "Samsung SM-S908E (Galaxy S22 Ultra, arm64-v8a)",
+  "adb_address": "192.168.8.110:42747",
+  "adb_client": "Android Debug Bridge 1.0.41 (36.0.2-14143358) from D:/Files/Android/pt-latest/platform-tools",
+  "gpu": "Adreno (TM) 730 (11460 MiB free)",
+  "vulkan_dispatch_status": "crash — VK_ERROR_DEVICE_LOST on vk::Queue::submit during llama_decode (same signature as the desktop RTX 2060 hang, tracked separately).",
+  "runs": [
+    {
+      "name": "test_adreno on-device",
+      "binary": "/data/local/tmp/sp/test_adreno (built 2026-04-16)",
+      "result": "14/14 passed",
+      "note": "Validates the adreno NEON path's math (VHT2 butterfly, band quant, Möbius, fp16 write path) on real S22 Ultra hardware. K corr = 0.9914 @ hd=64, fp16 = 0.9868."
+    },
+    {
+      "name": "Dolphin-1B-Q8 perplexity (CPU backend, llama.cpp)",
+      "binary": "/data/local/tmp/vht2/cpuonly/llama-perplexity (from legacy Shannon-Prime-Private build)",
+      "ctx": 2048,
+      "chunks": 8,
+      "seconds_per_pass": 89.18,
+      "total_seconds": 723.29,
+      "baseline_ppl": 10.7116,
+      "ship_ppl_same_binary": 10.7116,
+      "note": "On this legacy on-device binary SHANNON_PRIME_ENABLED=1 + SHANNON_PRIME_VERBOSE=1 prints no banner and yields an identical PPL — the llama.cpp-integrated hook isn't active in this build. To get a real SP-enabled on-device PPL delta the user needs to push a fresh android build from D:/F/shannon-prime-repos/shannon-prime-llama/android_build that links the current post-decode hook and the renamed symbols. The code is validated by test_adreno; the llama.cpp wiring on Android is a follow-up (same task category as the Vulkan GPU dispatch)."
+    }
+  ],
+  "date": "2026-04-18T05:30:00Z"
+}

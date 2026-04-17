@@ -58,7 +58,7 @@ def make_rope_like(n: int, head_dim: int, seed: int = 42) -> torch.Tensor:
     decay = idx ** -1.5
     signs = torch.randint(0, 2, (n, head_dim), dtype=torch.float32) * 2 - 1
     spectrum = signs * decay.unsqueeze(0) + torch.randn(n, head_dim) * 1e-3
-    return spectrum  # Already in spectral domain; iWHT would give time-domain
+    return spectrum  # Already in spectral domain; VHT2 would give time-domain
 
 
 # ============================================================================

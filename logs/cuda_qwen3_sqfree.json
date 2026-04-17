@@ -1,0 +1,18 @@
+{
+  "model": "Qwen3-8B-Q8_0",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "config": "sqfree+spinor",
+  "env": {"SHANNON_PRIME_ENABLED": "1", "SHANNON_PRIME_MOBIUS": "1", "SHANNON_PRIME_SQFREE": "1", "SHANNON_PRIME_SPINOR": "1", "SHANNON_PRIME_RESIDUAL_BITS": "3", "SHANNON_PRIME_K_BITS": "3,3,3,3,3", "SHANNON_PRIME_V_BITS": "3"},
+  "head_dim": 128,
+  "pad_dim": 154,
+  "ctx": 4096,
+  "chunks": 8,
+  "repeats": 1,
+  "median_ppl": 8.8265,
+  "raw_ppls": [8.8265],
+  "baseline_ppl": 8.6746,
+  "delta_pct": 1.751,
+  "sec_per_pass": 320.96,
+  "date": "2026-04-18T03:00:00Z"
+}

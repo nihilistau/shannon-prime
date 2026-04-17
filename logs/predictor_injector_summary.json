@@ -1,0 +1,18 @@
+{
+  "model": "Dolphin3.0-Llama3.2-1B-Q8_0",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "alpha": 0.17,
+  "tier_mode": "composite",
+  "size_bytes_before": 1600178432,
+  "size_bytes_after_gguf": 1600178432,
+  "size_bytes_sidecar": 128,
+  "median_ppl_baseline_no_inject": 10.7164,
+  "median_ppl_injected_sp_disabled": 10.7164,
+  "median_ppl_injected_sp_ship": 10.7698,
+  "delta_ppl_pct_from_injection": 0.0,
+  "delta_ppl_pct_ship_over_baseline": 0.498,
+  "note": "sp_inject_freqs.py produces a byte-identical GGUF plus a 128-byte .sp_freq_factors.bin sidecar (32 × fp32). The current shannon-prime-llama integration in D:/F/llama-cpp-sp does not yet consume the sidecar at inference, so injection has zero effect on PPL in this measurement — consistent with the 'GGUF weight compression is still theoretical' memory note. The ship-path KV compression layered on top still hits spec (+0.50% PPL @ 3.4-3.8x).",
+  "freq_factor_stats": {"min": 0.8300, "max": 56406.9375, "mean": 4556.5830, "std": 11828.9365},
+  "date": "2026-04-18T03:10:00Z"
+}

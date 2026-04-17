@@ -283,7 +283,8 @@ static void vk_update_ds(VkDevice dev, VkDescriptorSet ds, uint32_t binding,
     vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
 }
 
-// Factor n into {2,3,5,7,11} (mirror of core). Returns count or -1.
+// Factor n into {2,3,5,7,11}. Up to 8 factors (hd=256 = 2^8 is max).
+// Returns count or -1 if n has prime factor > 11.
 static int vk_factor_small(int n, uint32_t *factors_out) {
     static const int primes[] = {2, 3, 5, 7, 11};
     int nf = 0;
@@ -383,7 +384,8 @@ static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
     if (vk_create_dsl(vk->device, 2, &vk->dsl_2) != 0) return -1;
 
     // Pipeline layouts (push-constant sizes sized to each shader's push block)
-    if (vk_create_pipeline_layout(vk->device, vk->dsl_1, 48, &vk->pl_1) != 0) return -1; // vilenkin push block
+    // vilenkin push: 3 uints + 8 uints = 44 bytes (round up to 48 for alignment)
+    if (vk_create_pipeline_layout(vk->device, vk->dsl_1, 48, &vk->pl_1) != 0) return -1;
     if (vk_create_pipeline_layout(vk->device, vk->dsl_3, 8,  &vk->pl_3) != 0) return -1; // mobius push: n, n_vecs
     if (vk_create_pipeline_layout(vk->device, vk->dsl_2, 32, &vk->pl_2) != 0) return -1; // band_quantize/dequantize push block
 
@@ -464,8 +466,8 @@ static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
 }
 
 // Vilenkin push constants — match shader layout
-// layout(push_constant) uniform PC { uint n, n_vecs, n_factors; uint factors[6]; };
-struct vil_pc { uint32_t n, n_vecs, n_factors; uint32_t factors[6]; };
+// layout(push_constant) uniform PC { uint n, n_vecs, n_factors; uint factors[8]; };
+struct vil_pc { uint32_t n, n_vecs, n_factors; uint32_t factors[8]; };
 
 // Mobius push — layout(push_constant) uniform PC { uint n, n_vecs; };
 struct mob_pc { uint32_t n, n_vecs; };
@@ -547,40 +549,37 @@ static int vk_vht2_forward_gpu(sp_vulkan_cache_t *cc, float *inout, int hd) {
     return 0;
 }
 
-// Run the full VHT2 -> mobius -> quantize pipeline on a single vector.
-// Input: `in` (float[hd]). Output: `out_bytes` (bc->total_bytes).
-//
-// v1.01 strategy: GPU does the VHT2 transform (the biggest compute and the
-// op that benefits most from parallelism). Möbius reorder + bit-packing
-// run on CPU — they're small integer ops that don't parallelise as well
-// and the existing sp_mobius_reorder / sp_band_quantize are well-tested.
-// All four shaders still exist on disk and build as SPIR-V; exercising
-// them end-to-end from host is a focused follow-up once we have a
-// gpu-only test that doesn't go through the shadow cache.
+// Forward declarations — full 4-shader GPU pipelines defined below.
+static int vk_dispatch_all_four_gpu(sp_vulkan_cache_t *cc, const float *in,
+                                    const sp_band_config_t *bc, int apply_mobius,
+                                    uint8_t *out_bytes);
+static int vk_decompress_one_gpu(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
+                                 const sp_band_config_t *bc, int apply_mobius,
+                                 float *out);
+
+// Write path: route through CPU staged VHT2 + Möbius + band quantize on the
+// Vulkan-owned host-visible scratch buffers. The GPU pipeline (vilenkin.comp,
+// mobius_reorder.comp, band_quantize.comp, band_dequantize.comp) is
+// constructed and stays alive — see vk_dispatch_all_four_gpu below — but
+// the shadow-cache path goes through CPU until the vilenkin.comp shader
+// hang on RTX 2060 (VK_ERROR_DEVICE_LOST at first vkWaitForFences) is
+// isolated with RenderDoc. The CPU staged VHT2 is the canonical,
+// fully-tested implementation; results are bit-equivalent within float
+// tolerance to what the shaders were going to emit.
 static int vk_compress_one(sp_vulkan_cache_t *cc, const float *in,
                            const sp_band_config_t *bc, int apply_mobius,
                            uint8_t *out_bytes) {
     const int hd = cc->config.head_dim;
-    float scratch[SP_MAX_HEAD_DIM];
-    memcpy(scratch, in, (size_t)hd * sizeof(float));
+    sp_vk_impl_t *vk = &cc->vk;
+    float *scratch = (float *)vk->map_a;
 
-    // v1.01 pragmatic: Vulkan infrastructure is live (all 4 SPIR-V shaders
-    // loaded, pipelines + descriptor sets + buffers allocated), but the
-    // first shader dispatch hits a driver-side hang on this system
-    // (VK_ERROR_DEVICE_LOST during vkWaitForFences, no validation
-    // warnings before the hang — points at vilenkin.comp runtime behaviour
-    // that needs dedicated GPU-tooling investigation). The CPU VHT2 in
-    // core is bit-semantic-equivalent to what vilenkin.comp was going to
-    // produce (same 1/√p per stage), so we route through it for now. The
-    // dispatch debug is tracked as a focused follow-up.
+    memcpy(scratch, in, (size_t)hd * sizeof(float));
     sp_vht2_forward_f32(scratch, hd);
 
     if (apply_mobius && cc->config.use_mobius_mask) {
-        float tmp[SP_MAX_HEAD_DIM];
-        sp_mobius_reorder_ex(scratch, &cc->mobius_mask, tmp);
+        sp_mobius_reorder_ex(scratch, &cc->mobius_mask, (float *)vk->map_b);
     }
     sp_band_quantize(scratch, out_bytes, bc);
-    (void)vk_vht2_forward_gpu; // kept; ready for re-enable post-debug
     return 0;
 }
 
@@ -658,21 +657,23 @@ static int vk_dispatch_all_four_gpu(sp_vulkan_cache_t *cc, const float *in,
     return 0;
 }
 
-// Inverse (v1.01): CPU dequant + unreorder + VHT2 (same fallback rationale
-// as vk_compress_one — Vulkan infrastructure alive, dispatch deferred).
+// Inverse: CPU band dequantize → Möbius unreorder → VHT2 (self-inverse) on the
+// Vulkan-owned host-visible scratch buffers. Same routing posture as
+// vk_compress_one — the GPU pipeline stays built but the compute path is
+// CPU until vilenkin.comp is cleared.
 static int vk_decompress_one(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
                              const sp_band_config_t *bc, int apply_mobius,
                              float *out) {
     const int hd = cc->config.head_dim;
-    float scratch[SP_MAX_HEAD_DIM];
+    sp_vk_impl_t *vk = &cc->vk;
+    float *scratch = (float *)vk->map_a;
+
     sp_band_dequantize(in_bytes, scratch, bc);
     if (apply_mobius && cc->config.use_mobius_mask) {
-        float tmp[SP_MAX_HEAD_DIM];
-        sp_mobius_unreorder_ex(scratch, &cc->mobius_mask, tmp);
+        sp_mobius_unreorder_ex(scratch, &cc->mobius_mask, (float *)vk->map_b);
     }
     sp_vht2_forward_f32(scratch, hd);
     memcpy(out, scratch, (size_t)hd * sizeof(float));
-    sp_nan_guard_f32(out, hd, 65504.0f);
     return 0;
 }
 
@@ -750,8 +751,6 @@ static int vk_decompress_one_gpu(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
         memcpy(out, vk->map_a, (size_t)hd * sizeof(float));
     }
 
-    // NaN guard (cheap, keeps aggressive bit configs stable)
-    sp_nan_guard_f32(out, hd, 65504.0f);
     return 0;
 }
 

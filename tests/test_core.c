@@ -41,7 +41,7 @@ static void rand_vec(float *v, int n) {
 // ============================================================================
 // Test 1: VHT2 is self-inverse (VHT2(VHT2(x)) = x, no 1/N)
 // ============================================================================
-static void test_wht_roundtrip(void) {
+static void test_vht2_roundtrip(void) {
     printf("\n== VHT2 Round-Trip ==\n");
 
     for (int hd = 32; hd <= 256; hd *= 2) {
@@ -165,18 +165,18 @@ static void test_banded_quantization(void) {
 
         for (int t = 0; t < n_trials; t++) {
             float *orig = malloc(hd * sizeof(float));
-            float *wht  = malloc(hd * sizeof(float));
+            float *vht2 = malloc(hd * sizeof(float));
             float *recon = malloc(hd * sizeof(float));
             uint8_t *compressed = malloc(bc.total_bytes);
 
             rand_vec(orig, hd);
-            memcpy(wht, orig, hd * sizeof(float));
+            memcpy(vht2, orig, hd * sizeof(float));
 
             // VHT2 forward (self-inverse)
-            sp_vht2_forward_f32(wht, hd);
+            sp_vht2_forward_f32(vht2, hd);
 
             // Quantize
-            sp_band_quantize(wht, compressed, &bc);
+            sp_band_quantize(vht2, compressed, &bc);
 
             // Dequantize
             sp_band_dequantize(compressed, recon, &bc);
@@ -187,7 +187,7 @@ static void test_banded_quantization(void) {
             total_corr += sp_correlation_f32(orig, recon, hd);
 
             free(orig);
-            free(wht);
+            free(vht2);
             free(recon);
             free(compressed);
         }
@@ -204,12 +204,12 @@ static void test_banded_quantization(void) {
 }
 
 // ============================================================================
-// Test 5: K vectors have WHT spectral concentration, V vectors do not
+// Test 5: K vectors have VHT2 spectral concentration, V vectors do not
 // ============================================================================
 static void test_spectral_asymmetry(void) {
     printf("\n== K/V Spectral Asymmetry ==\n");
     // K vectors (simulated with structured/periodic content) should
-    // concentrate energy in first WHT bands.
+    // concentrate energy in first VHT2 bands.
     // V vectors (simulated with random content) should have uniform energy.
 
     int hd = 128;
@@ -228,9 +228,8 @@ static void test_spectral_asymmetry(void) {
     float *v_vec = malloc(hd * sizeof(float));
     rand_vec(v_vec, hd);
 
-    // VHT2 both (coefficient magnitudes differ from the old unnormalised WHT
-    // by a factor of 1/√N, but the per-band ENERGY PROPORTIONS used below are
-    // scale-invariant, so the asymmetry thresholds are unchanged).
+    // VHT2 both (per-band ENERGY PROPORTIONS used below are scale-invariant,
+    // so the asymmetry thresholds are transform-normalisation-independent).
     sp_vht2_forward_f32(k_vec, hd);
     sp_vht2_forward_f32(v_vec, hd);
 
@@ -312,7 +311,7 @@ static void test_vilenkin_roundtrip(void) {
 }
 
 // ============================================================================
-// Test 7: Full pipeline (WHT → Möbius → quantize → dequantize → unreorder → iWHT)
+// Test 7: Full pipeline (VHT2 → Möbius → quantize → dequantize → unreorder → VHT2)
 // ============================================================================
 static void test_full_pipeline(void) {
     printf("\n== Full VHT2 Pipeline ==\n");
@@ -394,7 +393,7 @@ static void test_mobius_quality(void) {
 
     for (int t = 0; t < n_trials; t++) {
         float *orig = malloc(hd * sizeof(float));
-        float *wht  = malloc(hd * sizeof(float));
+        float *vht2 = malloc(hd * sizeof(float));
         float *recon = malloc(hd * sizeof(float));
         uint8_t *buf = malloc(bc.total_bytes);
 
@@ -405,24 +404,24 @@ static void test_mobius_quality(void) {
         }
 
         // WITHOUT Möbius
-        memcpy(wht, orig, hd * sizeof(float));
-        sp_vht2_forward_f32(wht, hd);
-        sp_band_quantize(wht, buf, &bc);
+        memcpy(vht2, orig, hd * sizeof(float));
+        sp_vht2_forward_f32(vht2, hd);
+        sp_band_quantize(vht2, buf, &bc);
         sp_band_dequantize(buf, recon, &bc);
         sp_vht2_forward_f32(recon, hd);
         total_corr_plain += sp_correlation_f32(orig, recon, hd);
 
         // WITH Möbius
-        memcpy(wht, orig, hd * sizeof(float));
-        sp_vht2_forward_f32(wht, hd);
-        sp_mobius_reorder(wht, &mask);
-        sp_band_quantize(wht, buf, &bc);
+        memcpy(vht2, orig, hd * sizeof(float));
+        sp_vht2_forward_f32(vht2, hd);
+        sp_mobius_reorder(vht2, &mask);
+        sp_band_quantize(vht2, buf, &bc);
         sp_band_dequantize(buf, recon, &bc);
         sp_mobius_unreorder(recon, &mask);
         sp_vht2_forward_f32(recon, hd);
         total_corr_mobius += sp_correlation_f32(orig, recon, hd);
 
-        free(orig); free(wht); free(recon); free(buf);
+        free(orig); free(vht2); free(recon); free(buf);
     }
 
     float avg_plain  = total_corr_plain / n_trials;
@@ -511,7 +510,7 @@ int main(void) {
     printf("Shannon-Prime Core Math Validation\n");
     printf("==================================\n");
 
-    test_wht_roundtrip();
+    test_vht2_roundtrip();
     test_mobius_values();
     test_mobius_roundtrip();
     test_banded_quantization();

@@ -36,23 +36,23 @@ int main(void) {
     sp_mobile_print_caps(&caps);
     CHECK(1, "Feature detection runs without crash");
 
-    // Test 1: NEON WHT matches core
-    printf("\n== NEON WHT vs Core ==\n");
+    // Test 1: NEON VHT2 matches core
+    printf("\n== NEON VHT2 vs Core ==\n");
     for (int hd = 32; hd <= 128; hd *= 2) {
         float *a = (float *)malloc(hd * sizeof(float));
         float *b = (float *)malloc(hd * sizeof(float));
         for (int i = 0; i < hd; i++) {
             a[i] = b[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
         }
-        sp_wht_inplace_f32(a, hd);
-        sp_neon_wht_f32(b, hd);
+        sp_vht2_forward_f32(a, hd);
+        sp_neon_vht2_f32(b, hd);
         float max_err = 0;
         for (int i = 0; i < hd; i++) {
             float e = fabsf(a[i] - b[i]);
             if (e > max_err) max_err = e;
         }
         char msg[128];
-        snprintf(msg, sizeof(msg), "NEON WHT hd=%d: max_err=%.2e", hd, max_err);
+        snprintf(msg, sizeof(msg), "NEON VHT2 hd=%d: max_err=%.2e", hd, max_err);
         CHECK(max_err < 1e-6f, msg);
         free(a); free(b);
     }

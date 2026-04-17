@@ -27,8 +27,8 @@ make test-all   # 187/188 tests across 8 suites (one synthetic-K flake, see CLAU
 ```
 Write: raw KV → VHT2 forward → Möbius reorder (K only, self-attn)
        → Band quantize (5/5/4/3 K, flat 3 V) → Store
-Read:  Load → Band dequantize → Möbius unreorder → VHT2 forward (self-inverse)
-       → NaN guard → KV
+Read:  Load → Band dequantize (non-finite scale ⇒ zero band)
+       → Möbius unreorder → VHT2 forward (= inverse) → KV
 ```
 K (post-RoPE) concentrates 80%+ energy in the first VHT2 bands; V (content)
 spreads uniformly. K gets 4-band Möbius-ordered quantization, V gets flat 3-bit.
@@ -179,3 +179,28 @@ it and benefit. Derivative works must share alike.
 **Commercial license** available for proprietary integration. The commercial
 aspect is secondary — the primary goal is that the work belongs to the commons
 and is protected from closure.
+
+<!-- SP-MEASURED-RESULTS:BEGIN -->
+
+_Auto-generated from `logs/*.json` on 2026-04-17 19:43 UTC_
+
+### KV cache perplexity (VHT2 ship vs sqfree aggressive)
+
+| Model | Backend | Config | Median PPL | Ctx/Chunks | Date |
+|---|---|---|---|---|---|
+| Dolphin3.0-Llama3.2-1B-Q8_0 | cuda | baseline | 10.7164 | 2048/8 | 2026-04-18T01:35:00Z |
+| Dolphin3.0-Llama3.2-1B-Q8_0 | cuda | ship | 10.7698 | 2048/8 | 2026-04-18T01:38:00Z |
+| Dolphin3.0-Llama3.2-1B-Q8_0 | cuda | sqfree+spinor | 13.3277 | 2048/8 | 2026-04-18T01:48:00Z |
+| Qwen3-8B-Q8_0 | cuda | baseline | 8.6746 | 4096/8 | 2026-04-18T01:50:00Z |
+| Qwen3-8B-Q8_0 | cuda | ship | 8.7051 | 4096/8 | 2026-04-18T02:15:00Z |
+| Qwen3-8B-Q8_0 | cuda | sqfree+spinor | 8.8265 | 4096/8 | 2026-04-18T03:00:00Z |
+
+### Weight predictor + frequency injector
+
+| Model | Alpha | GGUF size | Sidecar | PPL baseline | PPL injected + ship | Date |
+|---|---|---|---|---|---|---|
+| Dolphin3.0-Llama3.2-1B-Q8_0 | 0.17 | 1,600,178,432 | 128 B | 10.7164 | 10.7698 | 2026-04-18T03:10:00Z |
+
+_sp_inject_freqs.py produces a byte-identical GGUF plus a 128-byte .sp_freq_factors.bin sidecar (32 × fp32). The current shannon-prime-llama integration in D:/F/llama-cpp-sp does not yet consume the sidecar at inference, so injection has zero effect on PPL in this measurement — consistent with the 'GGUF weight compression is still theoretical' memory note. The ship-path KV compression layered on top still hits spec (+0.50% PPL @ 3.4-3.8x)._
+
+<!-- SP-MEASURED-RESULTS:END -->

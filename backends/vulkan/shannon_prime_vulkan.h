@@ -23,11 +23,11 @@ extern "C" {
 // Integration target: llama.cpp Vulkan backend, mobile inference (Adreno, Mali).
 //
 // Pipeline stages (each is a compute shader dispatch):
-//   1. WHT butterfly (log2(n) passes, shared memory per workgroup)
+//   1. VHT2 staged Hartley (log_p(n) passes at p=2; Vilenkin for sqfree dims)
 //   2. Möbius permutation (scatter/gather)
 //   3. Band quantize (per-band abs-max reduction + pack)
 //   4. Band dequantize (unpack + scale)
-//   5. Inverse WHT + NaN guard
+//   5. VHT2 (self-inverse — same kernel, no 1/N scale)
 
 // Opaque handle — hides Vulkan implementation details
 typedef struct sp_vulkan_cache_s sp_vulkan_cache_t;

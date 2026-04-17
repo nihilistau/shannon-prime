@@ -2,7 +2,7 @@
 
 ## Overview
 
-The CUDA backend runs the entire VHT2 pipeline on NVIDIA GPUs: WHT butterfly, Möbius permutation, banded quantization, and shadow cache storage all operate in GPU memory. The compressed KV cache never leaves the GPU — no PCIe transfers needed.
+The CUDA backend runs the entire VHT2 pipeline on NVIDIA GPUs: VHT2 at p=2 butterfly (self-inverse, 1/√2 per stage), Möbius permutation, banded quantization, and shadow cache storage all operate in GPU memory. The compressed KV cache never leaves the GPU — no PCIe transfers needed.
 
 ## Architecture
 
@@ -30,15 +30,13 @@ GPU Memory Layout
 
 ## Kernels
 
-**`kernel_wht_inplace`:** One thread block per vector, shared memory butterfly. For hd=128: 7 passes with `__syncthreads()` between each. Bandwidth-bound, not compute-bound — appropriate for single-token decode where latency matters more than throughput.
+**`kernel_vht2_p2`:** One thread block per vector, shared-memory VHT2 at p=2 butterfly. For hd=128: 7 passes with `__syncthreads()` between each, each stage scaled by 1/√2 so the kernel is self-inverse (no separate inverse kernel, no 1/N on reconstruction). The host entry point is `sp_cuda_vht2_forward`; there is no `sp_cuda_iwht_inplace` anymore. Bandwidth-bound, not compute-bound — appropriate for single-token decode where latency matters more than throughput.
 
 **`kernel_mobius_reorder` / `kernel_mobius_unreorder`:** Gather/scatter permutation. One thread per coefficient, one block per vector. The Möbius permutation tables are uploaded once at init and remain constant.
 
 **`kernel_band_quantize_simple`:** One thread per vector processes all bands sequentially. Suitable for decode (1 vector at a time). For prefill, launch with more threads per vector.
 
-**`kernel_band_dequantize_simple`:** Inverse of quantize. Unpacks bit-packed integers, scales by fp16 scale factor.
-
-**`kernel_nan_guard`:** Clamps values and replaces NaN with 0. Defense-in-depth — the ship configuration (5/5/4/3) doesn't produce NaN, but aggressive configurations can accumulate errors in softmax over long context.
+**`kernel_band_dequantize_simple`:** Inverse of quantize. Unpacks bit-packed integers, scales by fp16 scale factor. If a band's fp16 scale round-trips to a non-finite value (the real origin of the cascading NaN previously handled by the blanket output guard), the kernel zeros that band — the only surviving guard, and it lives at the root cause.
 
 ## Building
 

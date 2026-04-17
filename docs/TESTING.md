@@ -31,7 +31,7 @@ The foundation. If these fail, nothing else works.
 make test-core
 ```
 
-**WHT Round-Trip (4 tests):** Verifies `WHT(WHT(x)) = N·x` for hd=32, 64, 128, 256. Maximum error should be <1e-5 (typically ~1e-7). If this fails, the butterfly implementation has a bug — check indexing in the inner loop.
+**VHT2 Round-Trip (4 tests):** Verifies `VHT2(VHT2(x)) = x` (self-inverse, no 1/N) for hd=32, 64, 128, 256. Maximum error should be <1e-5 (typically ~1e-7). If this fails, the VHT2 at p=2 butterfly has a bug — check indexing in the inner loop or the 1/√2 per-stage normalisation.
 
 **Möbius Function (9 tests):** Checks known values: μ(1)=1, μ(2)=−1, μ(4)=0, μ(6)=1, μ(30)=−1, etc. Also verifies squarefree count matches. If μ(4)≠0, the squared-prime detection in the sieve is broken.
 
@@ -49,7 +49,7 @@ make test-core
 
 If correlation is high but compression is wrong, the byte counting in `sp_band_config_init` is off. If compression is right but correlation is low, the bit packing/unpacking has a bug.
 
-**K/V Spectral Asymmetry (2 tests):** K (periodic/structured) should concentrate >60% energy in the first half of WHT bands. V (random) should be roughly uniform (~50%). This is the foundational property — if K doesn't concentrate, the banded allocation is pointless.
+**K/V Spectral Asymmetry (2 tests):** K (periodic/structured) should concentrate >60% energy in the first half of VHT2 bands. V (random) should be roughly uniform (~50%). This is the foundational property — if K doesn't concentrate, the banded allocation is pointless.
 
 **Vilenkin Round-Trip (3 tests):** Tests 2, 3, and 4-prime bases. Max error should be <1e-4. The key fix was normalization: V·V=I (not N·I). If round-trip error is ~0.5, the inverse is still dividing by N.
 
@@ -71,7 +71,7 @@ On x86 this uses scalar fallbacks. On ARM it uses real NEON.
 
 **Hardware Detection (1 test):** Just verifies `sp_mobile_detect_caps()` doesn't crash. Check the printed output — on x86 it should show NEON=no and detect CPU cores via sysfs.
 
-**NEON WHT vs Core (3 tests):** The NEON WHT must produce identical results to the C core WHT. Max error should be 0.00 on scalar fallback, <1e-6 on actual NEON. Any difference means the NEON butterfly has an indexing bug.
+**NEON VHT2 vs Core (3 tests):** The NEON VHT2 at p=2 must produce identical results to the C core `sp_vht2_forward_*`. Max error should be 0.00 on scalar fallback, <1e-6 on actual NEON. Any difference means the NEON butterfly has an indexing bug.
 
 **fp16 Conversion (1 test):** f32→f16→f32 round-trip. Max error should be <0.01 (fp16 precision is ~1e-3). If error is large, check the sign/exponent/mantissa bit manipulation.
 
@@ -119,7 +119,7 @@ so the test harness stages host↔device with `cudaMemcpy`.
 **Init (1 test):** `sp_cuda_cache_init()` with the default stream succeeds after
 confirming at least one CUDA device is present.
 **K Pipeline (1 test):** Write + read K through the full GPU chain
-(WHT → Möbius reorder → band quantize → dequantize → Möbius unreorder → iWHT),
+(VHT2 → Möbius reorder → band quantize → dequantize → Möbius unreorder → VHT2 (self-inverse)),
 correlation >0.990.
 **V Pipeline (1 test):** Same shape, no Möbius, V config (flat 3-bit),
 correlation >0.950.
@@ -187,7 +187,7 @@ python3 tests/test_comfyui.py
 
 **Correlation below threshold on random data:** Random vectors occasionally produce lower correlation than structured (RoPE-like) vectors. If the test shows 0.984 against a 0.985 threshold, this is noise — not a bug. Real K vectors with RoPE structure achieve 0.997+. Thresholds are set to catch real bugs while tolerating statistical variation.
 
-**NaN in output:** If you see NaN in reconstructed vectors, check: (1) the bit allocation — any band at 2-bit is catastrophic, (2) the WHT normalization — inverse WHT must divide by N, (3) the Möbius reorder/unreorder — if these are swapped, the quantization hits wrong coefficients.
+**NaN in output:** If you see NaN in reconstructed vectors, check: (1) the bit allocation — any band at 2-bit is catastrophic, (2) the VHT2 normalisation — each p-stage is already scaled by 1/√p, so a forward-then-forward round-trip must NOT divide by N (VHT2 is self-inverse), (3) the Möbius reorder/unreorder — if these are swapped, the quantization hits wrong coefficients. The only surviving guard is the non-finite fp16-scale check inside `sp_band_dequantize`, which zeros the band on overflow.
 
 **Compression ratio doesn't match paper:** The paper reports 3.4–3.8× total (K+V combined). Our ratio calculation counts both K and V bytes. If you see 3.4× for K alone, that's the K-specific ratio, not the total.
 

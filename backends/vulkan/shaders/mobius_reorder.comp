@@ -8,10 +8,10 @@
 
 // GLSL Compute Shader: Möbius squarefree-first permutation
 //
-// Reorders WHT coefficients so squarefree indices come first.
+// Reorders VHT2 coefficients so squarefree indices come first.
 // This is a gather operation: output[i] = input[order[i]]
 //
-// The Möbius mask is a property of the WHT spectrum, not the model.
+// The Möbius mask is a property of the VHT2 spectrum, not the model.
 // Cross-platform invariant: K correlation 0.997 on both hd=128 and hd=64.
 
 #version 450

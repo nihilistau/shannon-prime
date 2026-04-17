@@ -24,7 +24,7 @@ No model required. No GPU required. Runs in seconds.
 # Full benchmark across all standard configs
 python tools/sp_benchmark.py
 
-# Spectral energy analysis — see WHT concentration
+# Spectral energy analysis — see VHT2 concentration
 python tools/sp_benchmark.py --spectral
 
 # Mobile head dimension
@@ -59,7 +59,7 @@ python tools/sp_benchmark.py --n-vectors 2000
   First half: 63.6% (uniform → flat quant OK)
 ```
 
-This is the foundational observation. K vectors (with RoPE periodicity) concentrate 80%+ of their WHT energy in the first two bands. V vectors (random content) spread energy uniformly. This asymmetry is why K gets banded quantization (more bits where energy is) and V gets flat quantization (all bands equally important).
+This is the foundational observation. K vectors (with RoPE periodicity) concentrate 80%+ of their VHT2 energy in the first two bands. V vectors (random content) spread energy uniformly. This asymmetry is why K gets banded quantization (more bits where energy is) and V gets flat quantization (all bands equally important).
 
 **Compression Table**:
 
@@ -171,7 +171,7 @@ Analyzes and optionally compresses transformer model weights using VHT2 spectral
 
 ### The Hypothesis
 
-W_K and W_Q weight matrices are trained with RoPE applied. The learned weights implicitly encode the frequency patterns they were optimized for. If the rows of W_K show WHT spectral concentration similar to K vectors at inference time, VHT2 weight quantization will outperform generic quantization on those specific tensors.
+W_K and W_Q weight matrices are trained with RoPE applied. The learned weights implicitly encode the frequency patterns they were optimized for. If the rows of W_K show VHT2 spectral concentration similar to K vectors at inference time, VHT2 weight quantization will outperform generic quantization on those specific tensors.
 
 W_V, W_O, and FFN weights were NOT trained with RoPE — they shouldn't show this structure, and they shouldn't benefit from VHT2.
 
@@ -201,8 +201,8 @@ Tensor                                        Shape                Conc%  VHT2  
 
 For each attention weight tensor, the tool reports:
 
-- **Conc%**: WHT spectral concentration (first half energy). >60% indicates structure VHT2 can exploit.
-- **VHT2**: Correlation after VHT2 compression (WHT → Möbius → 5/5/4/3 banded quant → reconstruct).
+- **Conc%**: VHT2 spectral concentration (first half energy). >60% indicates structure VHT2 can exploit.
+- **VHT2**: Correlation after VHT2 compression (VHT2 → Möbius → 5/5/4/3 banded quant → reconstruct).
 - **Flat**: Correlation after flat quantization (same total bits, uniform 4/4/4/4 allocation).
 - **Δ**: VHT2 advantage. Positive = VHT2 is better. Marked with ◀ when significant.
 

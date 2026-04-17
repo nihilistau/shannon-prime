@@ -23,7 +23,7 @@ Snapdragon 8 Gen 1 (Samsung S22 Ultra)
   │  8 SPs, 900 MHz               │          │ HVX 1024-bit   │
   │  Vulkan 1.1                   │          │ (no HMX)       │
   │                               │          │                │
-  │  Batch WHT on prefill         │          │ WHT butterfly  │
+  │  Batch VHT2 on prefill        │          │ VHT2 butterfly │
   │  (via Vulkan compute shaders) │          │ (future path)  │
   └───────────────────────────────┘          └────────────────┘
 ```
@@ -36,7 +36,7 @@ The backend auto-detects ARM features at runtime and uses the highest available 
 
 4 float32 elements per NEON operation. Works on every ARMv8 device ever made.
 
-WHT butterfly: `vaddq_f32` / `vsubq_f32` with 4 elements per cycle. For hd=128: 32 iterations per butterfly pass, 7 passes = 224 NEON operations total.
+VHT2 at p=2 butterfly (via `sp_neon_vht2_*`): `vaddq_f32` / `vsubq_f32` with 4 elements per cycle, each pass scaled by 1/√2 for self-inverse orthonormality. For hd=128: 32 iterations per butterfly pass, 7 passes = 224 NEON operations total.
 
 Absmax reduction: `vabsq_f32` + `vmaxq_f32` with pairwise horizontal reduction via `vpmax_f32`.
 
@@ -44,9 +44,9 @@ Absmax reduction: `vabsq_f32` + `vmaxq_f32` with pairwise horizontal reduction v
 
 8 float16 elements per NEON operation. Available on Cortex-A76 and all newer cores — including your S22 Ultra's X2 and A710 cores.
 
-WHT butterfly directly on `__fp16` arrays: `vaddq_f16` / `vsubq_f16`. **Halves memory bandwidth** and **doubles elements per cycle** compared to Tier 1. For hd=128 in fp16: 256 bytes total = two 128-bit NEON loads for the entire vector.
+VHT2 at p=2 butterfly directly on `__fp16` arrays: `vaddq_f16` / `vsubq_f16`. **Halves memory bandwidth** and **doubles elements per cycle** compared to Tier 1. For hd=128 in fp16: 256 bytes total = two 128-bit NEON loads for the entire vector.
 
-The `sp_adreno_write_k_f16()` path runs WHT entirely in fp16, converting to f32 only for the banded quantization step. When the model already runs in fp16 (common on mobile), this avoids any fp16→f32 conversion for the WHT.
+The `sp_adreno_write_k_f16()` path runs VHT2 entirely in fp16, converting to f32 only for the banded quantization step. When the model already runs in fp16 (common on mobile), this avoids any fp16→f32 conversion for the VHT2.
 
 ### Tier 3: dotprod / i8mm (ARMv8.2+ / ARMv8.6)
 
@@ -99,19 +99,19 @@ Uses `sched_setaffinity()` on Linux/Android. Returns -1 on non-Linux platforms (
 
 | SoC | Hexagon | HVX | HMX | Shannon-Prime Path |
 |-----|---------|-----|-----|-------------------|
-| 8 Gen 1 (your S22) | V69 | 1024-bit | No | HVX WHT butterfly |
-| 8 Gen 2 | V73 | 1024-bit | FP16 | HVX WHT + HMX matrix ops |
+| 8 Gen 1 (your S22) | V69 | 1024-bit | No | HVX VHT2 butterfly (stub `sp_hvx_vht2_*`) |
+| 8 Gen 2 | V73 | 1024-bit | FP16 | HVX VHT2 + HMX matrix ops |
 | 8 Gen 3 | V75 | 1024-bit | Improved | Full HVX/HMX acceleration |
 | 8 Elite | V79 | 1024-bit | Enhanced | Best performance |
 
-### Why HVX is a Perfect Fit for WHT
+### Why HVX is a Perfect Fit for VHT2 at p=2
 
 HVX registers are 1024 bits = 128 bytes. Consider head_dim=128:
 
 - 128 × 4 bytes (f32) = 512 bytes = **half an HVX register**
 - 128 × 2 bytes (f16) = 256 bytes = **quarter HVX register**
 
-Two complete head vectors fit in one HVX register. The WHT butterfly (add/sub on vector halves) maps directly to `Q6_V_vadd_VV` / `Q6_V_vsub_VV`, with `Q6_W_vshuff_VVR` for stride permutation between passes.
+Two complete head vectors fit in one HVX register. The VHT2 at p=2 butterfly (add/sub on vector halves, then 1/√2 scale) maps directly to `Q6_V_vadd_VV` / `Q6_V_vsub_VV`, with `Q6_W_vshuff_VVR` for stride permutation between passes.
 
 ### Current Status
 
@@ -167,8 +167,8 @@ On Samsung S22 Ultra (Snapdragon 8 Gen 1):
 
 | Operation | Estimated (NEON Tier 2) | Paper (measured) |
 |-----------|------------------------|------------------|
-| WHT forward (hd=128, fp16) | ~2 μs | — |
-| WHT forward (hd=128, f32) | ~4 μs | — |
+| VHT2 forward (hd=128, fp16) | ~2 μs | — |
+| VHT2 forward (hd=128, f32) | ~4 μs | — |
 | Full writeback (16L × 4H) | ~1 ms | 37-42 ms* |
 | K correlation | 0.9972 | 0.9972 |
 

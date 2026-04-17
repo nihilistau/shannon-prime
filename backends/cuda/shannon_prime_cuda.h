@@ -19,8 +19,8 @@ extern "C" {
 // CUDA Shadow Cache
 // ============================================================================
 //
-// GPU-resident compressed KV cache. The write path (WHT → Möbius → quantize)
-// runs entirely on GPU. The read path (dequantize → unreorder → iWHT) runs
+// GPU-resident compressed KV cache. The write path (VHT2 → Möbius → quantize)
+// runs entirely on GPU. The read path (dequantize → unreorder → VHT2) runs
 // on GPU and produces fp16 K/V vectors ready for attention.
 //
 // Integration point for llama.cpp:
@@ -52,7 +52,7 @@ int sp_cuda_cache_init(sp_cuda_cache_t *cc, const sp_config_t *cfg,
 void sp_cuda_cache_free(sp_cuda_cache_t *cc);
 
 // ============================================================================
-// Write path: raw KV → GPU WHT → Möbius reorder → band quantize → store
+// Write path: raw KV → GPU VHT2 → Möbius reorder → band quantize → store
 // ============================================================================
 //
 // d_k_vec: device pointer to raw K vector (head_dim floats, already RoPE'd)
@@ -67,7 +67,7 @@ void sp_cuda_write_v(sp_cuda_cache_t *cc,
                      const float *d_v_vec);
 
 // ============================================================================
-// Read path: load → band dequantize → Möbius unreorder → iWHT → KV
+// Read path: load → band dequantize → Möbius unreorder → VHT2 (self-inverse) → KV
 // ============================================================================
 //
 // d_k_out: device pointer for reconstructed K vector (head_dim floats)
@@ -113,12 +113,11 @@ void sp_cuda_read_v_batch(const sp_cuda_cache_t *cc,
 // CUDA kernel launchers (exposed for testing)
 // ============================================================================
 
-// In-place WHT butterfly on GPU. n must be power of 2.
-// Processes n_vecs independent vectors of length n.
-void sp_cuda_wht_inplace(float *d_data, int n, int n_vecs, void *stream);
-
-// Inverse WHT (same kernel + 1/N scaling)
-void sp_cuda_iwht_inplace(float *d_data, int n, int n_vecs, void *stream);
+// In-place VHT2 on GPU. Self-inverse — call twice to recover the input.
+// Processes n_vecs independent vectors of length n. At p=2 (power-of-2 n)
+// this is the 1/√2-per-stage Hartley butterfly; non-power-of-2 dims
+// dispatch the staged Vilenkin kernel from shannon_prime_sqfree.cu.
+void sp_cuda_vht2_forward(float *d_data, int n, int n_vecs, void *stream);
 
 // Apply Möbius permutation on GPU
 void sp_cuda_mobius_reorder(float *d_data, const int *d_order,
@@ -133,10 +132,6 @@ void sp_cuda_band_quantize(const float *d_input, void *d_output,
 void sp_cuda_band_dequantize(const void *d_input, float *d_output,
                              const sp_band_config_t *bc,
                              int n_vecs, void *stream);
-
-// NaN guard on GPU
-void sp_cuda_nan_guard(float *d_data, int n, int n_vecs,
-                       float max_mag, void *stream);
 
 // ============================================================================
 // Diagnostics

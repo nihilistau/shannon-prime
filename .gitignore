@@ -35,5 +35,11 @@ Thumbs.db
 *.tmp
 *.bak
 
+# Bench artefacts too large to version (logs/ keeps JSON summaries only)
+logs/*.gguf
+logs/*.sp_freq_factors.bin
+logs/*.log
+
 # Don't ignore these
 !.gitkeep
+!logs/.gitkeep

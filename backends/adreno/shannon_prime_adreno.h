@@ -28,7 +28,7 @@ extern "C" {
 // │ Cortex-A710 (gold)   │ Parallel layers  │ NEON + thread affinity   │
 // │ Cortex-A510 (silver) │ Background work  │ NEON + low-power         │
 // │ Adreno 730 GPU       │ Prefill batch    │ Vulkan compute shaders   │
-// │ Hexagon V69 DSP      │ WHT butterfly    │ HVX intrinsics (V73+)   │
+// │ Hexagon V69 DSP      │ VHT2 butterfly   │ HVX intrinsics (V73+)   │
 // └─────────────────────────────────────────────────────────────────────┘
 //
 // Primary target: Samsung S22 Ultra (SM-S908U)
@@ -39,10 +39,10 @@ extern "C" {
 //   RAM: 12 GB LPDDR5 @ 3200 MHz (51.2 GB/s)
 //
 // Pipeline:
-//   Prefill (batch):  Adreno 730 Vulkan compute → batch WHT + quant
-//   Decode (single):  CPU NEON on prime core → single-vector WHT + quant
+//   Prefill (batch):  Adreno 730 Vulkan compute → batch VHT2 + quant
+//   Decode (single):  CPU NEON on prime core → single-vector VHT2 + quant
 //   Background:       silver cores → async cache maintenance
-//   Future (8G2+):    Hexagon HVX for WHT butterfly
+//   Future (8G2+):    Hexagon HVX for VHT2 butterfly
 //
 // Production results (Dolphin 1B Q8_0):
 //   PPL:      14.24 → 13.20 (Möbius 5/4/4)
@@ -91,27 +91,25 @@ void sp_mobile_print_caps(const sp_mobile_caps_t *caps);
 //
 // Tier 1 (baseline): float32x4_t — 4 f32 per op
 //   Works on ALL ARMv8+ devices. 128-bit NEON registers.
-//   WHT butterfly: 4 elements per add/sub cycle.
+//   VHT2 butterfly: 4 elements per add/sub cycle.
 //
 // Tier 2 (fp16 arith): float16x8_t — 8 f16 per op
 //   Requires FEAT_FP16 (ARMv8.2+, all Cortex-A76 and newer).
 //   Snapdragon 8 Gen 1 X2/A710 cores have this.
-//   WHT butterfly on fp16: HALVES memory bandwidth, 8 elements/op.
+//   VHT2 butterfly on fp16: HALVES memory bandwidth, 8 elements/op.
 //   head_dim=128 × 2 bytes = 256 bytes = two 128-bit loads.
 //
 // Tier 3 (dotprod/i8mm): for banded quant inner loops
 //   Quantized coefficient operations with sdot/smmla.
 //   Available on Cortex-X2 (8 Gen 1) and newer.
 
-// WHT on f32 (Tier 1 — universal)
-void sp_neon_wht_f32(float *data, int n);
-void sp_neon_iwht_f32(float *data, int n);
+// VHT2 on f32 (Tier 1 — universal). Self-inverse; call twice to invert.
+void sp_neon_vht2_f32(float *data, int n);
 
-// WHT on f16 (Tier 2 — requires FEAT_FP16)
+// VHT2 on f16 (Tier 2 — requires FEAT_FP16)
 // Operates directly on __fp16 / _Float16 arrays.
-// Avoids fp16↔fp32 conversion overhead entirely.
-void sp_neon_wht_f16(void *data, int n);
-void sp_neon_iwht_f16(void *data, int n);
+// Avoids fp16↔fp32 conversion overhead entirely. Self-inverse.
+void sp_neon_vht2_f16(void *data, int n);
 
 // Absmax reduction
 float sp_neon_absmax_f32(const float *data, int n);
@@ -121,9 +119,9 @@ void sp_neon_f16_to_f32(const void *src, float *dst, int n);
 void sp_neon_f32_to_f16(const float *src, void *dst, int n);
 
 // Banded quantize/dequantize (dispatches to best available tier)
-void sp_neon_band_quantize(const float *wht_coeffs, uint8_t *out,
+void sp_neon_band_quantize(const float *vht2_coeffs, uint8_t *out,
                            const sp_band_config_t *bc);
-void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
+void sp_neon_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                              const sp_band_config_t *bc);
 
 // ============================================================================
@@ -135,11 +133,11 @@ void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
 // head_dim=128 × 2 bytes (f16) = 256 bytes = quarter HVX register.
 // head_dim=64  × 4 bytes (f32) = 256 bytes = quarter HVX register.
 //
-// The WHT butterfly is a perfect fit: each pass does add/sub on
+// The VHT2 p=2 butterfly is a perfect fit: each pass does add/sub on
 // vector halves, mapping directly to HVX vadd/vsub.
 //
 // Availability:
-//   V69 (8 Gen 1):  HVX only, no HMX. Good for WHT butterfly.
+//   V69 (8 Gen 1):  HVX only, no HMX. Good for VHT2 butterfly.
 //   V73 (8 Gen 2):  HVX + HMX fp16. Full acceleration.
 //   V75 (8 Gen 3+): HVX + HMX improved. Best performance.
 //
@@ -148,12 +146,13 @@ void sp_neon_band_dequantize(const uint8_t *in, float *wht_coeffs,
 
 #ifdef SP_HEXAGON_ENABLED
 
-void sp_hvx_wht_f32(float *data, int n);
-void sp_hvx_wht_f16(void *data, int n);
-void sp_hvx_iwht_f32(float *data, int n);
-void sp_hvx_band_quantize(const float *wht_coeffs, uint8_t *out,
+// Hexagon HVX entry points — currently stubs; implementation lives
+// behind the same SP_HEXAGON_ENABLED guard and a signed FastRPC skel.
+void sp_hvx_vht2_f32(float *data, int n);
+void sp_hvx_vht2_f16(void *data, int n);
+void sp_hvx_band_quantize(const float *vht2_coeffs, uint8_t *out,
                           const sp_band_config_t *bc);
-void sp_hvx_band_dequantize(const uint8_t *in, float *wht_coeffs,
+void sp_hvx_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                             const sp_band_config_t *bc);
 
 #endif // SP_HEXAGON_ENABLED
