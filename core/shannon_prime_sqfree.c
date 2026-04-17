@@ -385,10 +385,20 @@ int sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
     sc->mask.residual_bits = residual_bits;
     sc->mask.use_spinor = use_spinor;
 
-    // Init banded quantizers for skeleton size
-    int default_k_bits[] = {5, 4, 4, 4, 5};
-    sp_band_config_init(&sc->k_bands, sc->mask.sk_k, 5, default_k_bits);
-    sp_band_config_init(&sc->v_bands, sc->mask.sk_k, 5, default_k_bits);
+    // Init banded quantizers for skeleton size. Honor caller's cfg.k_n_bands /
+    // k_band_bits when provided (the llama+sqfree hook parses SHANNON_PRIME_K_BITS
+    // into these); fall back to the torus-aligned 5-band default otherwise.
+    int default_k_bits[5] = {5, 4, 4, 4, 5};
+    int k_nb = (cfg->k_n_bands > 0 && cfg->k_n_bands <= SP_MAX_BANDS)
+               ? cfg->k_n_bands : 5;
+    const int *k_bits = (cfg->k_n_bands > 0 && cfg->k_n_bands <= SP_MAX_BANDS)
+                        ? cfg->k_band_bits : default_k_bits;
+    int v_nb = (cfg->v_n_bands > 0 && cfg->v_n_bands <= SP_MAX_BANDS)
+               ? cfg->v_n_bands : k_nb;
+    const int *v_bits = (cfg->v_n_bands > 0 && cfg->v_n_bands <= SP_MAX_BANDS)
+                        ? cfg->v_band_bits : k_bits;
+    sp_band_config_init(&sc->k_bands, sc->mask.sk_k, k_nb, k_bits);
+    sp_band_config_init(&sc->v_bands, sc->mask.sk_k, v_nb, v_bits);
 
     // Allocate compressed storage
     int n_slots = cfg->n_layers * cfg->n_heads_kv;

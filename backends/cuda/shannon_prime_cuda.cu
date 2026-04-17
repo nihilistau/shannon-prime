@@ -146,13 +146,15 @@ __global__ void kernel_band_quantize_simple(
     int offset = 0;
 
     for (int b = 0; b < n_bands; b++) {
-        const float *band = vec + b * band_size;
+        int band_off = b * band_size;
+        int band_sz  = (b == n_bands - 1) ? (n - band_off) : band_size;
+        const float *band = vec + band_off;
         int bits = band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
 
         // Find max absolute value
         float amax = 0.0f;
-        for (int i = 0; i < band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             float a = fabsf(band[i]);
             if (a > amax) amax = a;
         }
@@ -172,7 +174,7 @@ __global__ void kernel_band_quantize_simple(
         unsigned long long bit_buffer = 0;
         int bit_pos = 0;
 
-        for (int i = 0; i < band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             int q = __float2int_rn(band[i] * inv_scale);
             if (q > max_val)  q = max_val;
             if (q < -max_val) q = -max_val;
@@ -216,7 +218,9 @@ __global__ void kernel_band_dequantize_simple(
     int offset = 0;
 
     for (int b = 0; b < n_bands; b++) {
-        float *band = vec + b * band_size;
+        int band_off = b * band_size;
+        int band_sz  = (b == n_bands - 1) ? (n - band_off) : band_size;
+        float *band = vec + band_off;
         int bits = band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
         unsigned int mask = (1u << bits) - 1;
@@ -238,7 +242,7 @@ __global__ void kernel_band_dequantize_simple(
         int bit_pos = 0;
         int byte_idx = offset;
 
-        for (int i = 0; i < band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             while (bit_pos < bits) {
                 bit_buffer |= ((unsigned long long)in[byte_idx++] << bit_pos);
                 bit_pos += 8;
@@ -252,7 +256,7 @@ __global__ void kernel_band_dequantize_simple(
             band[i] = (float)q * scale;
         }
 
-        int data_bits = band_size * bits;
+        int data_bits = band_sz * bits;
         offset += (data_bits + 7) / 8;
     }
 }

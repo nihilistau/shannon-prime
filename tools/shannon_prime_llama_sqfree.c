@@ -108,6 +108,14 @@ typedef struct {
     sp_sqfree_cache_t  cache;
     sp_llama_sqfree_config_t env_cfg;
     bool               initialized;
+    // SHANNON_PRIME_DUMP_K=<path> appends raw K vectors (head_dim × fp32) to
+    // <path> so tools/sp_auto_bands.py can compute per-band VHT2 energy and
+    // emit a fitted K_BITS allocation. Write-only, append mode. When unset,
+    // dump_fp is NULL and the dump path is a no-op.
+    FILE              *dump_fp;
+    int                dump_head_dim;
+    long long          dump_count;   // number of K vectors written so far
+    long long          dump_limit;   // stop after N vectors (0 = unlimited)
 } sp_llama_sqfree_ctx_t;
 
 // Initialize sqfree context. Call after model params are known.
@@ -143,6 +151,22 @@ sp_llama_sqfree_ctx_t *sp_llama_sqfree_init(int head_dim, int n_layers,
 
     ctx->initialized = true;
 
+    // Optional: open K-dump file for offline auto-bands analysis.
+    const char *dump_path = getenv("SHANNON_PRIME_DUMP_K");
+    if (dump_path && *dump_path) {
+        ctx->dump_fp = fopen(dump_path, "wb");
+        if (ctx->dump_fp) {
+            ctx->dump_head_dim = head_dim;
+            const char *limit_s = getenv("SHANNON_PRIME_DUMP_K_LIMIT");
+            ctx->dump_limit = limit_s ? atoll(limit_s) : 8192;
+            fprintf(stderr, "[Shannon-Prime] K dump → %s (limit=%lld vectors)\n",
+                    dump_path, ctx->dump_limit);
+        } else {
+            fprintf(stderr, "[Shannon-Prime] warning: failed to open K dump '%s'\n",
+                    dump_path);
+        }
+    }
+
     if (getenv("SHANNON_PRIME_VERBOSE")) {
         int pd = ctx->cache.pad_dim;
         fprintf(stderr, "[Shannon-Prime SQFREE] head_dim=%d → pad_dim=%d\n",
@@ -169,6 +193,11 @@ sp_llama_sqfree_ctx_t *sp_llama_sqfree_init(int head_dim, int n_layers,
 
 void sp_llama_sqfree_free(sp_llama_sqfree_ctx_t *ctx) {
     if (!ctx) return;
+    if (ctx->dump_fp) {
+        fprintf(stderr, "[Shannon-Prime] K dump closed (%lld vectors written)\n",
+                ctx->dump_count);
+        fclose(ctx->dump_fp);
+    }
     if (ctx->initialized) {
         sp_sqfree_cache_free(&ctx->cache);
     }
@@ -179,6 +208,11 @@ void sp_llama_sqfree_free(sp_llama_sqfree_ctx_t *ctx) {
 void sp_llama_sqfree_write_kv(sp_llama_sqfree_ctx_t *ctx,
                                int layer, int head, int pos,
                                const float *k_vec, const float *v_vec) {
+    if (ctx->dump_fp &&
+        (ctx->dump_limit == 0 || ctx->dump_count < ctx->dump_limit)) {
+        fwrite(k_vec, sizeof(float), ctx->dump_head_dim, ctx->dump_fp);
+        ctx->dump_count++;
+    }
     sp_sqfree_write_k(&ctx->cache, layer, head, pos, k_vec);
     sp_sqfree_write_v(&ctx->cache, layer, head, pos, v_vec);
 }

@@ -24,7 +24,7 @@ extern "C" {
 // Maximum supported head dimensions (typically power of 2; VHT2 also accepts
 // any dim that factors into {2,3,5,7,11}, e.g. sqfree-padded 66/154/330)
 #define SP_MAX_HEAD_DIM     256
-#define SP_MAX_BANDS        8
+#define SP_MAX_BANDS        16
 #define SP_MAX_LAYERS       128
 #define SP_MAX_HEADS        128
 
@@ -150,9 +150,26 @@ void sp_mobius_unreorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
 typedef struct {
     int      n_bands;
     int      band_bits[SP_MAX_BANDS];
-    int      band_size;          // coefficients per band (= head_dim / n_bands)
+    int      head_dim;           // total coefficients per vector
+    int      band_size;          // typical coefficients per band (= head_dim / n_bands)
     int      total_bytes;        // compressed size per vector
+    // When head_dim is not evenly divisible by n_bands, the last band absorbs
+    // the remainder: bands 0..n_bands-2 have `band_size` coefficients, band
+    // n_bands-1 has `head_dim - band_size * (n_bands - 1)` coefficients.
+    // Callers iterate through sp_band_span(bc, b, &off, &sz) rather than
+    // computing `b * band_size` directly.
 } sp_band_config_t;
+
+// Resolve the [offset, size) span of band `b` in the coefficient vector.
+// Inline-safe: `bc->band_size` for all bands except the last, which absorbs
+// any head_dim % n_bands remainder.
+static inline void sp_band_span(const sp_band_config_t *bc, int b,
+                                int *offset_out, int *size_out) {
+    int off = b * bc->band_size;
+    int sz  = (b == bc->n_bands - 1) ? (bc->head_dim - off) : bc->band_size;
+    *offset_out = off;
+    *size_out   = sz;
+}
 
 // Compute band configuration from config.
 void sp_band_config_init(sp_band_config_t *bc, int head_dim,

@@ -151,7 +151,7 @@ For commercial licensing, research collaboration, or questions about integration
 
 <!-- SP-MEASURED-RESULTS:BEGIN -->
 
-_Auto-generated from `logs/*.json` on 2026-04-17 19:43 UTC_
+_Auto-generated from `logs/*.json` on 2026-04-17 22:04 UTC_
 
 ### KV cache perplexity (VHT2 ship vs sqfree aggressive)
 
@@ -163,6 +163,9 @@ _Auto-generated from `logs/*.json` on 2026-04-17 19:43 UTC_
 | Qwen3-8B-Q8_0 | cuda | baseline | 8.6746 | 4096/8 | 2026-04-18T01:50:00Z |
 | Qwen3-8B-Q8_0 | cuda | ship | 8.7051 | 4096/8 | 2026-04-18T02:15:00Z |
 | Qwen3-8B-Q8_0 | cuda | sqfree+spinor | 8.8265 | 4096/8 | 2026-04-18T03:00:00Z |
+| Qwen3-8B-Q8_0 | cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build) | sqfree+spinor 10×2 (catastrophic — below 3-bit floor) | 428.7779 | 2048/4 | 2026-04-18T07:55:00Z |
+| Qwen3-8B-Q8_0 | cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build) | sqfree+spinor 10×3 | 11.8324 | 2048/4 | 2026-04-18T07:40:00Z |
+| Qwen3-8B-Q8_0 | cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build) | sqfree+spinor 10×auto (tools/sp_auto_bands.py → 4,4,4,4,4,3,3,3,3,3 @ total=35) | 10.0768 | 2048/4 | 2026-04-18T08:05:00Z |
 
 ### Weight predictor + frequency injector
 

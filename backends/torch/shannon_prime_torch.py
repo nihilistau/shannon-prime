@@ -239,24 +239,31 @@ class BandedQuantizer:
         self.n_bands = len(band_bits)
         self.band_bits = band_bits
         self.band_size = n // self.n_bands
-        assert n % self.n_bands == 0, \
-            f"head_dim {n} must be divisible by n_bands {self.n_bands}"
+        # If n is not evenly divisible by n_bands, the last band absorbs the
+        # remainder (matches the C core's sp_band_span helper). For 10 bands
+        # at pad_dim=154 this means bands 0..8 have size 15, band 9 has size 19.
+        self._last_band_size = n - self.band_size * (self.n_bands - 1)
+
+    def _band_span(self, b: int) -> Tuple[int, int]:
+        start = b * self.band_size
+        size  = self._last_band_size if b == self.n_bands - 1 else self.band_size
+        return start, size
 
     def quantize(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         Quantize VHT2 coefficients into banded format.
-        
+
         x: (..., n) float tensor
         Returns: (scales, quant_vals) per band
           scales[b]: (...,) fp16 scale
-          quant_vals[b]: (..., band_size) int8/int16 quantized values
+          quant_vals[b]: (..., band_size_b) int8/int16 quantized values
         """
         scales = []
         quant_vals = []
 
         for b in range(self.n_bands):
-            start = b * self.band_size
-            end   = start + self.band_size
+            start, size = self._band_span(b)
+            end   = start + size
             band  = x[..., start:end]
             bits  = self.band_bits[b]
             max_val = (1 << (bits - 1)) - 1
@@ -296,9 +303,10 @@ class BandedQuantizer:
     def compressed_bytes_per_vec(self) -> int:
         """Bytes per compressed vector."""
         total = 0
-        for bits in self.band_bits:
+        for b, bits in enumerate(self.band_bits):
+            _, size = self._band_span(b)
             total += 2  # fp16 scale
-            total += (self.band_size * bits + 7) // 8  # packed data
+            total += (size * bits + 7) // 8  # packed data
         return total
 
 

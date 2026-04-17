@@ -501,6 +501,59 @@ static void test_vilenkin_successive(void) {
 }
 
 // ============================================================================
+// Test: Banded quantization round-trip with non-divisible head_dim / n_bands
+// ============================================================================
+// Sanity that sp_band_span + the v1.03 "last band absorbs the remainder" path
+// doesn't lose data at pad_dim=154 with 10 bands (154/10 = 15 remainder 4 →
+// bands 0..8 have 15 coeffs, band 9 has 19 coeffs). Previously the loop
+// would have simply walked past 150 and orphaned the tail 4.
+static void test_banded_quant_non_divisible(void) {
+    printf("\n== Banded Quant Non-Divisible (10 bands @ pad_dim=154) ==\n");
+
+    int pad_dim = 154;
+    int n_bands = 10;
+    int bits[10] = {3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
+
+    sp_band_config_t bc;
+    sp_band_config_init(&bc, pad_dim, n_bands, bits);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg), "head_dim stored: %d (expect 154)", bc.head_dim);
+    CHECK(bc.head_dim == 154, msg);
+
+    snprintf(msg, sizeof(msg), "band_size (typical): %d (expect 15)", bc.band_size);
+    CHECK(bc.band_size == 15, msg);
+
+    // Resolve last band via the helper
+    int off, sz;
+    sp_band_span(&bc, 9, &off, &sz);
+    snprintf(msg, sizeof(msg), "last band offset=%d size=%d (expect 135/19)", off, sz);
+    CHECK(off == 135 && sz == 19, msg);
+
+    float *orig  = malloc(pad_dim * sizeof(float));
+    float *recon = malloc(pad_dim * sizeof(float));
+    uint8_t *buf = malloc(bc.total_bytes);
+    rand_vec(orig, pad_dim);
+
+    sp_band_quantize(orig, buf, &bc);
+    sp_band_dequantize(buf, recon, &bc);
+
+    float corr = sp_correlation_f32(orig, recon, pad_dim);
+    snprintf(msg, sizeof(msg), "Round-trip corr: %.4f (need >0.900 for 3-bit × 10)", corr);
+    CHECK(corr > 0.900f, msg);
+
+    // Assert that the last 4 coeffs (pad_dim - 150) actually moved — the bug
+    // we're guarding against would leave them at 0 after decode.
+    float tail_mean_abs = 0.0f;
+    for (int i = 150; i < 154; i++) tail_mean_abs += fabsf(recon[i]);
+    tail_mean_abs /= 4.0f;
+    snprintf(msg, sizeof(msg), "Tail coeffs recovered (|mean|=%.4f, must be > 0)", tail_mean_abs);
+    CHECK(tail_mean_abs > 1e-6f, msg);
+
+    free(orig); free(recon); free(buf);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -520,6 +573,7 @@ int main(void) {
     test_mobius_quality();
     test_compression_ratios();
     test_vilenkin_successive();
+    test_banded_quant_non_divisible();
 
     printf("\n==================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);

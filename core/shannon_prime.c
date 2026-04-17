@@ -340,13 +340,16 @@ void sp_mobius_unreorder(float *vht2_coeffs, const sp_mobius_mask_t *mask) {
 void sp_band_config_init(sp_band_config_t *bc, int head_dim,
                          int n_bands, const int *band_bits) {
     bc->n_bands   = n_bands;
+    bc->head_dim  = head_dim;
     bc->band_size = head_dim / n_bands;
 
     int total = 0;
     for (int b = 0; b < n_bands; b++) {
         bc->band_bits[b] = band_bits[b];
-        // Per band: 2 bytes (fp16 scale) + ceil(band_size * bits / 8) bytes
-        int data_bits = bc->band_size * band_bits[b];
+        int off, sz;
+        sp_band_span(bc, b, &off, &sz);
+        // Per band: 2 bytes (fp16 scale) + ceil(sz * bits / 8) bytes
+        int data_bits = sz * band_bits[b];
         int data_bytes = (data_bits + 7) / 8;
         total += 2 + data_bytes; // fp16 scale + packed data
     }
@@ -358,13 +361,15 @@ void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
     int offset = 0;
 
     for (int b = 0; b < bc->n_bands; b++) {
-        const float *band = vht2_coeffs + b * bc->band_size;
+        int band_off, band_sz;
+        sp_band_span(bc, b, &band_off, &band_sz);
+        const float *band = vht2_coeffs + band_off;
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1; // e.g. 5-bit → 15
 
         // Find max absolute value in band
         float amax = 0.0f;
-        for (int i = 0; i < bc->band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             float a = fabsf(band[i]);
             if (a > amax) amax = a;
         }
@@ -384,7 +389,7 @@ void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
         uint64_t bit_buffer = 0;
         int      bit_pos = 0;
 
-        for (int i = 0; i < bc->band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             // Quantize to signed integer
             int q = (int)roundf(band[i] * inv_scale);
             if (q > max_val)  q = max_val;
@@ -417,7 +422,9 @@ void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
     int offset = 0;
 
     for (int b = 0; b < bc->n_bands; b++) {
-        float *band = vht2_coeffs + b * bc->band_size;
+        int band_off, band_sz;
+        sp_band_span(bc, b, &band_off, &band_sz);
+        float *band = vht2_coeffs + band_off;
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
         uint32_t mask = (1u << bits) - 1;
@@ -438,7 +445,7 @@ void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
         int      bit_pos = 0;
         int      byte_idx = offset;
 
-        for (int i = 0; i < bc->band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             // Load bytes as needed
             while (bit_pos < bits) {
                 bit_buffer |= ((uint64_t)in[byte_idx++] << bit_pos);
@@ -455,7 +462,7 @@ void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
         }
 
         // Advance offset past the packed data
-        int data_bits = bc->band_size * bits;
+        int data_bits = band_sz * bits;
         offset += (data_bits + 7) / 8;
     }
 }

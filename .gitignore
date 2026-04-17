@@ -39,6 +39,8 @@ Thumbs.db
 logs/*.gguf
 logs/*.sp_freq_factors.bin
 logs/*.log
+logs/*.bin
+logs/*.txt
 
 # Don't ignore these
 !.gitkeep

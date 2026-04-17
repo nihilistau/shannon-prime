@@ -569,6 +569,19 @@ static int vk_decompress_one_gpu(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
 static int vk_compress_one(sp_vulkan_cache_t *cc, const float *in,
                            const sp_band_config_t *bc, int apply_mobius,
                            uint8_t *out_bytes) {
+    // SHANNON_PRIME_VULKAN_FORCE_GPU=1 opts in to the GPU dispatch path that
+    // currently hangs on RTX 2060 — use only when diagnosing the hang with
+    // SHANNON_PRIME_VULKAN_VALIDATE=1 so the layer callback can log the bad
+    // call. Default stays on the CPU staged VHT2.
+    static int force_gpu = -1;
+    if (force_gpu < 0) {
+        const char *e = getenv("SHANNON_PRIME_VULKAN_FORCE_GPU");
+        force_gpu = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (force_gpu) {
+        return vk_dispatch_all_four_gpu(cc, in, bc, apply_mobius, out_bytes);
+    }
+
     const int hd = cc->config.head_dim;
     sp_vk_impl_t *vk = &cc->vk;
     float *scratch = (float *)vk->map_a;
@@ -664,6 +677,15 @@ static int vk_dispatch_all_four_gpu(sp_vulkan_cache_t *cc, const float *in,
 static int vk_decompress_one(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
                              const sp_band_config_t *bc, int apply_mobius,
                              float *out) {
+    static int force_gpu = -1;
+    if (force_gpu < 0) {
+        const char *e = getenv("SHANNON_PRIME_VULKAN_FORCE_GPU");
+        force_gpu = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (force_gpu) {
+        return vk_decompress_one_gpu(cc, in_bytes, bc, apply_mobius, out);
+    }
+
     const int hd = cc->config.head_dim;
     sp_vk_impl_t *vk = &cc->vk;
     float *scratch = (float *)vk->map_a;
