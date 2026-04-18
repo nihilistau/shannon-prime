@@ -2,7 +2,9 @@
 
 ## Overview
 
-Command-line tools for working with Shannon-Prime outside of the runtime integration:
+Command-line tools for working with Shannon-Prime outside of the runtime integration.
+
+**Production / deployment:**
 
 | Tool | Purpose | Requires Model? |
 |------|---------|-----------------|
@@ -11,6 +13,17 @@ Command-line tools for working with Shannon-Prime outside of the runtime integra
 | `sp_compress_model.py` | Analyze/compress model weights via VHT2 | Yes (safetensors) |
 | `sp_scaling_law.py` | K_corr → PPL design rule (pre-bench filter) | No |
 | `sp_auto_bands.py` | Fit `SHANNON_PRIME_K_BITS` from a live K-dump | Needs a dump file |
+
+**Research / diagnostic** (behind v1.14/v1.15 findings; used to produce the adaptive-calibration and hierarchical-predictor results):
+
+| Tool | Purpose | Requires Model? |
+|------|---------|-----------------|
+| `extract_kv.py` | Capture post-RoPE K vectors from a live model run → `.npz` | Yes (GGUF or HF) |
+| `sp_chord_diagnostic.py` | Prime-chord analysis per head and per layer on a K dump | Needs `.npz` dump |
+| `sp_regime_analysis.py` | Two-regime (early/late) reconstruction quality per skeleton strategy | Needs `.npz` dump |
+| `sp_hierarchical_skeleton.py` | Validate the hierarchical Vilenkin predictor (`sp_hier_cache_t`) | Yes (GGUF) |
+| `sp_compress.py` | End-to-end KV compression round-trip: extract, compress, inject, compare | Yes (HF transformers) |
+| `benchmark_ab.sh` | A/B compare ship vs sqfree/hierarchical via `sp-engine` binary | Optional (synthetic + real) |
 
 ---
 
@@ -311,3 +324,210 @@ Per-band VHT2 energy → log-weight allocation, clipped to `[min_bits, max_bits]
 ### Known limitation
 
 For the sqfree+spinor aggressive path, the runtime operates on a **sqfree-padded** Vilenkin basis (pad_dim=154 for hd=128) while the dump captures the **unpadded** raw K. The analyser's Walsh-at-hd transform is a monotonic-decay proxy; the ordering of the allocation holds but the absolute magnitudes aren't comparable. Dumping the post-pad Vilenkin coefficients is a deferred v1.05 item — see `logs/vulkan_diagnostic_v1.03.json` for context.
+
+---
+
+# Research / diagnostic tools
+
+These produced the findings behind v1.14 (adaptive calibration +
+L/2 skeleton default) and v1.15 (hierarchical Vilenkin predictor).
+Not on the hot path for deployment, but load-bearing for the paper
+and for validating any change to the C-core compression code.
+
+The common data format is an `.npz` file with a `k_vectors` array
+of shape `(n_layers, n_heads, n_positions, head_dim)` — produced
+by `extract_kv.py`, consumed by every analyser below.
+
+---
+
+## extract_kv.py — Capture K vectors from a model
+
+Runs a prompt through a model, captures the post-RoPE K projections
+at every (layer, head, position), writes them to `.npz` for the
+analyses below. Supports GGUF models (via llama-cpp-python) and
+HuggingFace models (via transformers + PyTorch).
+
+```bash
+# GGUF (auto-detected by .gguf extension)
+python tools/extract_kv.py --model path/to/model.gguf --output kv.npz
+
+# GGUF with GPU offload
+python tools/extract_kv.py --model path/to/model.gguf --n-gpu-layers 99 \
+    --output kv.npz
+
+# HuggingFace (local or hub id)
+python tools/extract_kv.py --model microsoft/Phi-3-mini-4k-instruct \
+    --output kv_phi3.npz --prompt-file long_prompt.txt
+
+# Longer prompts → more positions → tighter per-layer / per-head statistics
+python tools/extract_kv.py --model model.gguf --prompt-file wiki.test.raw \
+    --max-positions 4096 --output kv_wiki4k.npz
+```
+
+Output is consumed verbatim by `sp_chord_diagnostic.py`,
+`sp_regime_analysis.py`, and `sp_compress.py`. The `.npz` carries
+metadata (`model_name`, `n_layers`, `n_heads`, `head_dim`) so
+downstream tools don't need to re-infer them.
+
+---
+
+## sp_chord_diagnostic.py — Prime chord analysis
+
+Tests the Prime Chord hypothesis: attention heads in a trained
+transformer activate small subsets of primes (Z/pZ harmonic
+components) from the sqfree-aligned Vilenkin basis, and those
+subsets form "chords" that evolve with layer depth.
+
+Produces:
+
+* **Per-head prime histograms** — which primes each head uses.
+* **Chord entropy curve** across layers — mid-layers diversify,
+  late layers collapse toward a small stable set.
+* **Jaccard adjacency** per layer — heads that share primes.
+* **Cross-layer persistence** — which chords survive depth.
+* **Ghost Head classification** — heads that live off the
+  arithmetic manifold, probed at extended primes (p=13, 17, 19).
+
+```bash
+python tools/sp_chord_diagnostic.py --input kv.npz --output chord.json
+python tools/sp_chord_diagnostic.py --input kv.npz --plot chord.png
+```
+
+This tool produced the observation that late-layer chord collapse
+is the signal the hierarchical predictor exploits — a small
+low-prime sub-projection determines the high-prime refinement.
+
+---
+
+## sp_regime_analysis.py — Two-regime reconstruction
+
+Empirical finding (published in `docs/Shannon-Prime.md` and the
+paper): transformers have two spectral regimes.
+
+* **Early layers (0 → ~L/2):** clean T² manifold. p=2 dominates
+  ~30%, p=3 dominates ~22%, rest is tail. Compressible by
+  algebraic (divisibility) skeletons.
+* **Late layers (~L/2 → L):** diffuse spectrum. p=3 drops toward
+  p=5 / p=7, approaching uniform. Algebraic skeletons fail,
+  adaptive (variance-ranked) skeletons win.
+
+This tool runs three competing skeleton selection strategies at
+matched compression and reports relative L2 reconstruction error
+per layer:
+
+1. **T² Algebraic** — keep indices divisible by 2 or 3.
+2. **Adaptive Top-K** — keep top-K indices by measured variance.
+3. **T³ Algebraic** — keep indices divisible by 2, 3, or a
+   secondary prime.
+
+```bash
+python tools/sp_regime_analysis.py --input kv_phi3.npz --sqfree
+python tools/sp_regime_analysis.py --input kv_qwen3.npz --sqfree \
+    --output regime.json
+```
+
+Produced the "T² algebraic skeleton never beats adaptive
+(0/476 wins)" finding that motivated the v1.14 default-skeleton
+change (75% → L/2 variance-ranked). Also produced the paper-side
+"context-length compressibility is architecture-dependent"
+finding (Phi-3 late layers concentrate with long context;
+Qwen3 slightly disperses), which informs per-model compression
+budget selection.
+
+---
+
+## sp_hierarchical_skeleton.py — Hierarchical predictor research
+
+The validation harness behind `sp_hier_cache_t` (v1.15). Tests
+whether the low-prime sub-projections of the Vilenkin basis can
+linearly predict the high-prime refinement, using calibration
+data from real K vectors.
+
+The Vilenkin basis on sqfree-padded dimensions has Kronecker
+structure:
+
+```
+hd=128 → pad=154 = 2 · 7 · 11 → Z/2Z × Z/7Z × Z/11Z
+```
+
+The script partitions the pad_dim coefficients into a **skeleton**
+(the Z/2Z × Z/7Z subgroup, 14 coefficients, ~9%) and a **refinement**
+(the other 140 coefficients, ~91%). It then fits a ridge-regression
+linear map from skeleton → refinement per (layer, head) slot.
+
+If the predictor is good, you can compress to:
+
+* 14 skeleton coefficients, banded-quantised (~70 bits)
+* a 14×140 matrix per slot, calibrated once (~31 KB, amortised)
+* a tiny residual correction on the predicted 140
+
+That's 9% skeleton instead of 50% — the architecture
+shannon-prime v1.15's `sp_hier_cache_t` ships.
+
+```bash
+python tools/sp_hierarchical_skeleton.py model.gguf
+python tools/sp_hierarchical_skeleton.py model.gguf --n-tokens 256
+```
+
+Prints per-slot predictor quality (R² against measured refinement)
+plus the aggregated reconstruction quality under quantisation
+budgets.
+
+---
+
+## sp_compress.py — End-to-end KV compression round-trip
+
+The most integrated research tool: loads a GGUF, runs a prompt,
+extracts the full KV state, applies VHT2 + adaptive top-K
+skeleton compression, reconstructs via inverse VHT2, **injects
+the compressed cache back into the model**, and generates
+continuation tokens with both the original and compressed caches.
+Compares perplexity and token agreement.
+
+```bash
+# Basic round-trip at 30% skeleton
+python tools/sp_compress.py --model model.gguf --skeleton-frac 0.30
+
+# Sweep compression ratios
+python tools/sp_compress.py --model model.gguf \
+    --skeleton-fracs 0.10,0.25,0.50,0.75 \
+    --prompt "The quick brown fox"
+```
+
+Answers the only question that matters for this whole stack:
+"does spectral KV compression actually preserve generation
+quality on a real model?" — which is the question
+`shannon-prime-engine`'s `perplexity --cache` verb now also
+answers end-to-end for GGUF-quantised models, without the
+HuggingFace round-trip.
+
+---
+
+## benchmark_ab.sh — A/B bench via sp-engine
+
+Wrapper around the `sp-engine` binary that runs three
+compression configs head-to-head and summarises the results:
+
+* **Config A** — shadow + Möbius reorder + default bands (ship path)
+* **Config B** — sqfree + variance-ranked L/2 skeleton
+* **Config C** — hierarchical Vilenkin predictor (~9% skeleton)
+
+Two phases:
+
+1. `kv_smoke` — synthetic Gaussian data (no model required), fast.
+2. `cache_ppl` — real model perplexity + K/V correlation + the
+   scaling-law numerator, real data (needs `--model` + `--textfile`).
+
+```bash
+SP_ENGINE=/path/to/sp-engine.exe ./benchmark_ab.sh \
+    --head-dim 128 --n-tokens 64 --n-head-kv 8 --n-layer 4
+
+# Full three-way comparison with a model:
+SP_ENGINE=/path/to/sp-engine.exe ./benchmark_ab.sh \
+    --model dolphin_1b.gguf --textfile wiki.test.raw \
+    --ctx 512 --chunks 2
+```
+
+This is the script that produced the **0/476 wins for T² algebraic
+skeleton vs adaptive** cross-model cross-compression comparison
+cited in the v1.14 commit message.
