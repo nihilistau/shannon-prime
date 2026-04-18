@@ -190,6 +190,23 @@ and is protected from closure.
 
 _Auto-generated from `logs/*.json` on 2026-04-17 22:04 UTC_
 
+> ⚠ **Caveat on all numbers in this section.** Every PPL figure below was
+> measured through the shannon-prime-llama post-decode hook, which runs a
+> decompress → attention → recompress round-trip on every decode rather
+> than storing compressed KV natively. That integration surface introduces
+> its own state — a single session's work surfaced four hook-specific bugs
+> (GPU-resident KV memcpy segfault, vkCmdCopyBuffer barrier miss, CPU/GPU
+> blob format mismatch, V-pipeline plumbing loss) that could each have
+> been misread as compression-math bugs. Absolute PPL values carry that
+> uncertainty; the **relative ordering** of configs (ship < sqfree+spinor
+> 5,4,4,4,5 < 10-band-auto < 10-band-uniform-3 < catastrophic
+> 10-band-uniform-2) has stayed stable across every hook refactor and is
+> the part to trust. The
+> [shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)
+> sibling repo (scaffolding landed) is intended as the bug-free reference
+> measurement; every figure here should be re-measured there before
+> treating as publication-grade.
+
 ### KV cache perplexity (VHT2 ship vs sqfree aggressive)
 
 | Model | Backend | Config | Median PPL | Ctx/Chunks | Date |
