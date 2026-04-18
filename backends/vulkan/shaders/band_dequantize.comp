@@ -10,16 +10,21 @@
 //
 // Inverse of band_quantize.comp. Reads the packed bit-streams back out,
 // multiplies by per-band scale, writes float coefficients.
-// One workgroup per vector; thread 0 serialises the bit-unpacking
-// (same shape as the quantiser for correctness — production can parallelise
-// via subgroup ops).
+//
+// v1.05 — widened to 16 bands with per-band span + non-divisible tail
+// absorption + UB-safe shifts to match the quantiser.
+//
+// One workgroup per vector; thread 0 serialises the bit-unpacking. The
+// non-finite scale guard from `sp_band_dequantize` is mirrored here: if
+// the per-band scale round-trips to Inf/NaN the band decodes as zeros
+// instead of poisoning the inverse VHT2.
 
 #version 450
 
-layout(local_size_x = 128) in;
+layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer Input {
-    uint input_data[];   // Packed compressed stream
+    uint input_data[];   // Packed compressed stream (uint32)
 };
 
 layout(set = 0, binding = 1) writeonly buffer Output {
@@ -27,22 +32,14 @@ layout(set = 0, binding = 1) writeonly buffer Output {
 };
 
 layout(push_constant) uniform PushConstants {
-    uint n;             // Vector length (head_dim)
-    uint n_bands;       // Number of bands
-    uint band_size;     // n / n_bands
-    uint total_words;   // Input words per vector
-    uint band_bits_0;
-    uint band_bits_1;
-    uint band_bits_2;
-    uint band_bits_3;
+    uint n;             // Logical vector length (head_dim)
+    uint n_bands;       // 1..16
+    uint total_words;   // Input uint words per vector
+    uint _pad;
+    uint band_bits[16];
 };
 
-uint get_band_bits(uint band) {
-    if (band == 0u) return band_bits_0;
-    if (band == 1u) return band_bits_1;
-    if (band == 2u) return band_bits_2;
-    return band_bits_3;
-}
+uint get_band_bits(uint band) { return band_bits[band]; }
 
 void main() {
     uint vec_idx = gl_WorkGroupID.x;
@@ -51,38 +48,38 @@ void main() {
     uint in_base  = vec_idx * total_words;
     uint out_base = vec_idx * n;
 
-    // Sequential decode in thread 0 mirrors the quantizer exactly.
+    // Typical band size; last band absorbs the remainder.
+    uint typical_sz = n / n_bands;
+
+    // Sequential decode in thread 0 mirrors the quantiser.
     if (tid == 0u) {
         uint in_word_offset = 0u;
-        uint bit_buffer     = 0u;
-        uint bit_pos        = 0u;
-        // Carry bits needed when a value straddles a 32-bit word boundary
-        uint carry_bits     = 0u;
-        uint carry_count    = 0u;
 
         for (uint b = 0u; b < n_bands; b++) {
-            uint bits = get_band_bits(b);
+            uint bits    = get_band_bits(b);
             uint max_val = (1u << (bits - 1u)) - 1u;
 
-            // Read per-band scale (first word for this band)
+            uint band_start = b * typical_sz;
+            uint band_sz    = (b == n_bands - 1u)
+                              ? (n - band_start)
+                              : typical_sz;
+
+            // Per-band scale (first word). Mirror the non-finite guard.
             float scale = uintBitsToFloat(input_data[in_base + in_word_offset]);
+            if (isinf(scale) || isnan(scale)) scale = 0.0;
             in_word_offset++;
 
-            // Reset bit reader at each band boundary (mirrors the quantizer:
-            // quantizer writes scale word, then bit-packs from scratch per band).
-            bit_buffer  = 0u;
-            bit_pos     = 0u;
-            carry_bits  = 0u;
-            carry_count = 0u;
+            // Reset bit reader at each band boundary (quantiser writes the
+            // scale word, then bit-packs from scratch per band).
+            uint bit_buffer = 0u;
+            uint bit_pos    = 0u;
 
-            for (uint i = 0u; i < band_size; i++) {
-                // Ensure we have at least `bits` bits of input available
+            for (uint i = 0u; i < band_sz; i++) {
                 while (bit_pos < bits) {
-                    // Merge the next input word
                     uint next_word = input_data[in_base + in_word_offset];
                     in_word_offset++;
                     bit_buffer |= (next_word << bit_pos);
-                    bit_pos += 32u;
+                    bit_pos    += 32u;
                 }
 
                 uint u = bit_buffer & ((1u << bits) - 1u);
@@ -90,7 +87,7 @@ void main() {
                 bit_pos    -= bits;
 
                 int q = int(u) - int(max_val);
-                output_data[out_base + b * band_size + i] = float(q) * scale;
+                output_data[out_base + band_start + i] = float(q) * scale;
             }
         }
     }

@@ -161,7 +161,14 @@ def main() -> int:
     ap.add_argument("--max-vecs", type=int, default=8192,
                     help="Cap on K vectors to read (default 8192)")
     ap.add_argument("--no-vht2", action="store_true",
-                    help="Assume dump is already in VHT2 space (skip forward transform)")
+                    help="Assume dump is already in VHT2 space (skip forward transform). "
+                         "Implied by --basis vilenkin.")
+    ap.add_argument("--basis", choices=["raw", "vilenkin"], default="raw",
+                    help="`raw` (default): dump is raw K at head_dim; the analyser "
+                         "applies Walsh-at-hd as a proxy basis. `vilenkin`: dump "
+                         "came from SHANNON_PRIME_DUMP_VILENKIN=<path> and is "
+                         "already in the runtime's sqfree-Vilenkin space — the "
+                         "analyser skips its forward transform entirely.")
     ap.add_argument("--json", action="store_true",
                     help="Emit JSON with energies + bits instead of comma list")
     args = ap.parse_args()
@@ -180,7 +187,8 @@ def main() -> int:
     raw = np.fromfile(path, dtype=np.float32, count=n_vecs * args.head_dim)
     raw = raw.reshape(n_vecs, args.head_dim).copy()
 
-    if not args.no_vht2:
+    skip_forward = args.no_vht2 or args.basis == "vilenkin"
+    if not skip_forward:
         if (args.head_dim & (args.head_dim - 1)) == 0:
             _vht2_p2(raw)
         else:

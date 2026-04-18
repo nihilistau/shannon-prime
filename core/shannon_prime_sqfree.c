@@ -16,6 +16,7 @@
 
 #include "shannon_prime.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -458,6 +459,40 @@ static int sp_sqfree_compress_one(sp_sqfree_cache_t *sc,
     // 2. Vilenkin forward
     memcpy(sc->coeff_scratch, sc->pad_scratch, pd * sizeof(float));
     sp_vilenkin_forward_f32(sc->coeff_scratch, pd);
+
+    // 2b. Optional: dump post-pad Vilenkin coefficients for offline analysis
+    // (tools/sp_auto_bands.py --basis vilenkin). Gated on
+    // SHANNON_PRIME_DUMP_VILENKIN=<path>; SHANNON_PRIME_DUMP_VILENKIN_LIMIT
+    // caps vector count (default 8192). Format: binary fp32 stream of `pd`
+    // floats per vector. Unlike the SHANNON_PRIME_DUMP_K hook in the
+    // llama integration (which captures raw pre-pad K), this dump gives the
+    // allocator the real sqfree basis it will be quantising.
+    {
+        static FILE     *dump_fp = NULL;
+        static long long dump_count = 0;
+        static long long dump_limit = 0;
+        static int       dump_init = 0;
+        if (!dump_init) {
+            dump_init = 1;
+            const char *dp = getenv("SHANNON_PRIME_DUMP_VILENKIN");
+            if (dp && *dp) {
+                dump_fp = fopen(dp, "wb");
+                const char *lim_s = getenv("SHANNON_PRIME_DUMP_VILENKIN_LIMIT");
+                dump_limit = lim_s ? atoll(lim_s) : 8192;
+                if (dump_fp) {
+                    fprintf(stderr,
+                        "[Shannon-Prime SQFREE] Vilenkin dump -> %s "
+                        "(limit=%lld vectors, pd=%d)\n",
+                        dp, dump_limit, pd);
+                }
+            }
+        }
+        if (dump_fp && (dump_limit == 0 || dump_count < dump_limit)) {
+            fwrite(sc->coeff_scratch, sizeof(float), (size_t)pd, dump_fp);
+            dump_count++;
+            if (dump_count == dump_limit) fflush(dump_fp);
+        }
+    }
 
     // 3. Extract skeleton coefficients into contiguous buffer
     float *skel_vals = sc->pad_scratch; // Reuse — safe since we're done with pad

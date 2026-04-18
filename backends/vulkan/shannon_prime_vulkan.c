@@ -387,7 +387,11 @@ static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
     // vilenkin push: 3 uints + 8 uints = 44 bytes (round up to 48 for alignment)
     if (vk_create_pipeline_layout(vk->device, vk->dsl_1, 48, &vk->pl_1) != 0) return -1;
     if (vk_create_pipeline_layout(vk->device, vk->dsl_3, 8,  &vk->pl_3) != 0) return -1; // mobius push: n, n_vecs
-    if (vk_create_pipeline_layout(vk->device, vk->dsl_2, 32, &vk->pl_2) != 0) return -1; // band_quantize/dequantize push block
+    // band_quantize/dequantize push: 4 u32 scalars (n, n_bands, total_words, _pad)
+    // + uint[16] band_bits = 16 + 64 = 80 bytes (v1.05 widened from 32).
+    // Must match sizeof(struct bq_pc) declared below; hard-coded here because
+    // init_vulkan_pipelines runs before the struct is in scope.
+    if (vk_create_pipeline_layout(vk->device, vk->dsl_2, 80, &vk->pl_2) != 0) return -1;
 
     // Compute pipelines
     if (vk_create_compute_pipeline(vk->device, vk->sm_vilenkin, vk->pl_1, &vk->pipe_vilenkin) != 0) return -1;
@@ -472,8 +476,18 @@ struct vil_pc { uint32_t n, n_vecs, n_factors; uint32_t factors[8]; };
 // Mobius push — layout(push_constant) uniform PC { uint n, n_vecs; };
 struct mob_pc { uint32_t n, n_vecs; };
 
-// Quant/dequant push
-struct bq_pc { uint32_t n, n_bands, band_size, total_words; uint32_t bits[4]; };
+// Quant/dequant push. v1.05 widened to match the shaders: per-band bit
+// array is now 16 entries (SP_MAX_BANDS), band_size is derived inside the
+// shader from n / n_bands with the last band absorbing the remainder, and
+// _pad keeps the 16-byte alignment the SPIR-V std430 rules expect before
+// the uint[16] array starts.
+struct bq_pc {
+    uint32_t n;            // logical head_dim
+    uint32_t n_bands;      // 1..16
+    uint32_t total_words;  // output uint words per vector
+    uint32_t _pad;
+    uint32_t bits[16];
+};
 
 // Dispatch helpers ---------------------------------------------------------
 
@@ -488,19 +502,23 @@ static int vk_submit_and_wait(sp_vk_impl_t *vk) {
 }
 
 static void bq_fill_push(const sp_band_config_t *bc, struct bq_pc *out) {
-    // head_dim is not stored explicitly; derive from the band layout
-    out->n = (uint32_t)(bc->n_bands * bc->band_size);
+    out->n       = (uint32_t)bc->head_dim;
     out->n_bands = (uint32_t)bc->n_bands;
-    out->band_size = (uint32_t)bc->band_size;
-    // Output words per vector — 1 word per band for the scale, plus bit-packed data
-    // ceil(band_size * bits / 32) per band + 1 (scale)
+    out->_pad    = 0;
+
+    // Output words per vector: 1 word per band for the scale, plus
+    // ceil(band_sz * bits / 32) per band. Last band absorbs the remainder,
+    // matching sp_band_span on the CPU side.
     uint32_t total_words = 0;
     for (int b = 0; b < bc->n_bands; b++) {
+        int off, sz;
+        sp_band_span(bc, b, &off, &sz);
         uint32_t bits = (uint32_t)bc->band_bits[b];
-        total_words += 1 + (uint32_t)((bc->band_size * bits + 31) / 32);
+        total_words += 1u + (uint32_t)(((uint32_t)sz * bits + 31u) / 32u);
     }
     out->total_words = total_words;
-    for (int b = 0; b < 4; b++) {
+
+    for (int b = 0; b < 16; b++) {
         out->bits[b] = (uint32_t)(b < bc->n_bands ? bc->band_bits[b] : 0);
     }
 }
@@ -566,23 +584,24 @@ static int vk_decompress_one_gpu(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
 //   1. vilenkin.comp hung on RTX 2060 (VK_ERROR_DEVICE_LOST at first
 //      vkWaitForFences) in v1.02; v1.03's validation-first pass showed the
 //      hang no longer reproduces but K correlation is ~0.62 vs CPU.
-//   2. band_quantize.comp / band_dequantize.comp push constants only expose
-//      band_bits_0..band_bits_3 and iterate `b * band_size + i`, so the GPU
-//      path is only correct for n_bands ≤ 4, head_dim % n_bands == 0, and
-//      head_dim ≤ 128 (mobius_reorder.comp's local_size_x=128 cap). The new
-//      v1.03 10-band / non-divisible configs and any hd=256 model will
-//      silently corrupt output through this path.
+//   2. (Resolved in v1.05) band_{quantize,dequantize}.comp push constants now
+//      carry up to 16 band-bit entries and the shaders compute per-band
+//      spans so the last band absorbs head_dim % n_bands. mobius_reorder.comp
+//      is now 256 threads wide with a strided loop. The 10-band sqfree
+//      configs and hd=256 paths no longer hit silent corruption — the only
+//      remaining blocker to flipping FORCE_GPU on by default is the
+//      vilenkin.comp parity issue above.
 //
-// Until the shaders are widened to match the CPU reference (per-band span,
-// 16-band push-constant layout, 256-thread workgroup) the GPU dispatch stays
-// behind SHANNON_PRIME_VULKAN_FORCE_GPU and the helper below refuses any
-// config that would exercise an unimplemented shader branch.
+// v1.05 widened the shaders to match the CPU reference: up to 16 bands,
+// per-band span (last band absorbs the non-divisible remainder),
+// 256-thread workgroup. The remaining blocker for turning FORCE_GPU on by
+// default is vilenkin.comp's K correlation drifting from the CPU reference
+// (~0.62 vs 0.99+) — tracked separately. This helper only refuses configs
+// the shaders still can't reach.
 static int vk_gpu_dispatch_is_supported(const sp_band_config_t *bc, int head_dim) {
-    // Matches the shipped shaders' baked-in layout: ≤4 bands, divisible,
-    // head_dim ≤ 128.
-    return bc->n_bands <= 4
-        && (head_dim % bc->n_bands) == 0
-        && head_dim <= 128;
+    return bc->n_bands >= 1
+        && bc->n_bands <= 16
+        && head_dim <= SP_MAX_HEAD_DIM;
 }
 static int vk_compress_one(sp_vulkan_cache_t *cc, const float *in,
                            const sp_band_config_t *bc, int apply_mobius,
@@ -609,9 +628,9 @@ static int vk_compress_one(sp_vulkan_cache_t *cc, const float *in,
             warned = 1;
             fprintf(stderr,
                 "[Shannon-Prime Vulkan] FORCE_GPU requested but n_bands=%d hd=%d "
-                "is outside the shipped shaders' supported domain (≤4 bands, "
-                "divisible, hd≤128). Falling back to CPU staged VHT2.\n",
-                bc->n_bands, cc->config.head_dim);
+                "is outside the supported domain (1..16 bands, hd≤%d). Falling "
+                "back to CPU staged VHT2.\n",
+                bc->n_bands, cc->config.head_dim, SP_MAX_HEAD_DIM);
         }
     }
 
