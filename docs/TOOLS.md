@@ -2,13 +2,15 @@
 
 ## Overview
 
-Three command-line tools for working with Shannon-Prime outside of the runtime integration:
+Command-line tools for working with Shannon-Prime outside of the runtime integration:
 
 | Tool | Purpose | Requires Model? |
 |------|---------|-----------------|
 | `sp_benchmark.py` | Validate VHT2 math, measure compression quality | No |
 | `sp_inject_freqs.py` | Inject lattice RoPE frequencies into GGUF models | Yes (GGUF) |
 | `sp_compress_model.py` | Analyze/compress model weights via VHT2 | Yes (safetensors) |
+| `sp_scaling_law.py` | K_corr → PPL design rule (pre-bench filter) | No |
+| `sp_auto_bands.py` | Fit `SHANNON_PRIME_K_BITS` from a live K-dump | Needs a dump file |
 
 ---
 
@@ -112,6 +114,10 @@ python tools/sp_inject_freqs.py model.gguf model_sp.gguf --alpha 0.17
 # Use prime frequencies instead of composite
 python tools/sp_inject_freqs.py model.gguf model_sp.gguf --alpha 0.22 --tier-mode prime
 ```
+
+**v1.03 change:** the tool now writes (or replaces) a real shared `rope_freqs.weight` tensor in the output GGUF — llama.cpp's `LLM_TENSOR_ROPE_FREQS` resolves to the unqualified root name even though the category is LAYER_REPEATING, so every layer reads the same tensor. No runtime env var or sidecar consumer is required; loading `model_sp.gguf` is enough for the injected frequencies to take effect.
+
+A companion `.sp_freq_factors.bin` sidecar is still written next to the output for debugging and for the alternate `SHANNON_PRIME_SIDECAR=<path>` loader (see `patches/llama-cpp-v1.03-sidecar-kdump.patch`), which patches existing rope-factor tensors in-place at context init via `ggml_backend_tensor_set`.
 
 ### Alpha Sweep
 
@@ -224,7 +230,7 @@ PyTorch, safetensors (`pip install torch safetensors`).
 
 ## Tool Workflow
 
-The three tools form a progression:
+The tools form a progression:
 
 ```
 1. sp_benchmark.py          Does VHT2 work at all?
@@ -235,6 +241,73 @@ The three tools form a progression:
 
 3. sp_compress_model.py     Do this model's weights have spectral structure?
    (needs HF safetensors)   → Identifies which tensors benefit from VHT2
+
+4. sp_scaling_law.py        Is this K_corr / bits / params combo worth running?
+   (no model)               → Predicts ΔPPL so you can skip doomed configs
+
+5. sp_auto_bands.py         What bit allocation does THIS model actually want?
+   (needs K dump)           → Fits K_BITS to measured per-band variance
 ```
 
 For production deployment, `sp_inject_freqs.py` is the immediate tool — it produces a GGUF file that runs in unmodified llama.cpp with measurable PPL improvement. The VHT2 KV cache compression (the core Shannon-Prime system) operates at inference time via the shannon-prime library integration, not via model file modification.
+
+---
+
+## sp_scaling_law.py — K_corr → PPL design rule
+
+Empirically-fitted formula across 9 measured configurations (±20%):
+```
+log(PPL / PPL_base) ≈ 4700 · (1 − K_corr)² / (params^1.1 · bits^1.5)
+```
+
+Use as a pre-bench filter. Before you burn an hour running perplexity, call `predicted_ppl_ratio(k_corr, params_b, bits)` — if the predicted ΔPPL is >5%, don't bother; pick a wider bit allocation or a bigger model. See `test_sqfree.py` for example usage.
+
+---
+
+## sp_auto_bands.py — Fit K_BITS from a measured K dump
+
+Picks a `SHANNON_PRIME_K_BITS` allocation by measuring per-band VHT2 variance on a warmup K dump. Closes the loop between "you have a real model" and "what allocation does its K actually want".
+
+### Workflow
+
+**Step 1 — Produce a K dump from a warmup run.** The llama.cpp integration patch (`patches/llama-cpp-v1.03-sidecar-kdump.patch`) adds a `SHANNON_PRIME_DUMP_K=<path>` env that stream-writes post-RoPE K vectors to disk inside the post-decode hook:
+
+```bash
+SHANNON_PRIME_ENABLED=1 \
+SHANNON_PRIME_SQFREE=1 SHANNON_PRIME_SPINOR=1 \
+SHANNON_PRIME_DUMP_K=/tmp/k_dump.bin \
+SHANNON_PRIME_DUMP_K_LIMIT=8192 \
+llama-perplexity -m model.gguf -f wiki.test.raw -c 512 --chunks 1
+```
+
+The dump is raw fp32, `head_dim` elements per vector (pre-pad — the hook captures K as it arrives at the cache, not post-sqfree-pad).
+
+**Step 2 — Fit the allocation.**
+
+```bash
+python tools/sp_auto_bands.py \
+    --dump /tmp/k_dump.bin \
+    --head-dim 128 \
+    --n-bands 10 \
+    --total-bits 35 \
+    --min-bits 3 --max-bits 6
+# → "4,4,4,4,4,3,3,3,3,3"
+```
+
+Defaults enforce the **3-bit floor** from CLAUDE.md invariant #3 (2-bit bands are catastrophic — measured PPL 428.78 on Qwen3-8B 10×2, see `logs/cuda_qwen3_sqfree_10band_2.json`). Override `--min-bits` at your own risk.
+
+**Step 3 — Use it.**
+
+```bash
+export SHANNON_PRIME_K_BITS=$(python tools/sp_auto_bands.py \
+    --dump /tmp/k_dump.bin --head-dim 128 --n-bands 10 --total-bits 35)
+./llama-perplexity ...
+```
+
+### How the allocator works
+
+Per-band VHT2 energy → log-weight allocation, clipped to `[min_bits, max_bits]`, rebalanced so the bits sum to `total_bits` exactly. Output can also be emitted as JSON with `--json` (band energies + chosen bits + metadata).
+
+### Known limitation
+
+For the sqfree+spinor aggressive path, the runtime operates on a **sqfree-padded** Vilenkin basis (pad_dim=154 for hd=128) while the dump captures the **unpadded** raw K. The analyser's Walsh-at-hd transform is a monotonic-decay proxy; the ordering of the allocation holds but the absolute magnitudes aren't comparable. Dumping the post-pad Vilenkin coefficients is a deferred v1.05 item — see `logs/vulkan_diagnostic_v1.03.json` for context.

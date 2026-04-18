@@ -1,0 +1,25 @@
+{
+  "date": "2026-04-18T10:30:00Z",
+  "binary": "D:/F/llama-cpp-sp/build-cuda/bin/llama-perplexity.exe (CUDA build, sm_75, GGML_CUDA=ON)",
+  "device": "NVIDIA GeForce RTX 2060 (12 GiB VRAM)",
+  "model": "Qwen3-8B-Q8_0",
+  "head_dim": 128,
+  "ctx": 4096,
+  "chunks": 8,
+  "wikitext": "wiki.test.raw",
+  "kv_offload": "-nkvo (KV on CPU, weights on GPU; SP hook needs host-buffer KV in v1.04 binary)",
+  "results": [
+    { "config": "baseline (no SP)",                   "k_bits": "-",                                   "ppl": 8.6685, "delta_pct":  0.000, "sec_per_pass": 3.96 },
+    { "config": "ship",                               "k_bits": "5,5,4,3",                             "ppl": 8.7079, "delta_pct": +0.454, "sec_per_pass": 17.65 },
+    { "config": "sqfree+spinor 5×(5,4,4,4,5)",       "k_bits": "5,4,4,4,5",                           "ppl": 8.8089, "delta_pct": +1.620, "sec_per_pass": 172.73 },
+    { "config": "sqfree+spinor 10×3 uniform",        "k_bits": "3,3,3,3,3,3,3,3,3,3",                 "ppl": 16.8182, "delta_pct": +93.999, "sec_per_pass": 172.33 },
+    { "config": "sqfree+spinor 10×auto (35-bit)",    "k_bits": "4,4,4,4,4,3,3,3,3,3",                 "ppl": 8.8689, "delta_pct": +2.312, "sec_per_pass": 172.00 }
+  ],
+  "summary_findings": [
+    "Ship 5,5,4,3 holds at <0.5% PPL on Qwen3-8B-Q8 — confirms v1.02 result at full ctx=4096/chunks=8 instead of the abbreviated ctx=2048/chunks=4 used in v1.03.",
+    "sqfree+spinor 5×(5,4,4,4,5) at +1.62% costs more PPL than ship at the same model — the residual+skeleton split adds error that doesn't pay back unless we want the extra compression headroom.",
+    "10-band uniform 3-bit is dramatically worse (+94%) than 5-band 5,4,4,4,5 — band-boundary artifacts dominate over per-band granularity once you cross the 4-band ship configuration. Confirms our v1.03 ctx=2048 finding was directionally correct.",
+    "10-band auto (4,4,4,4,4,3,3,3,3,3, total 35 bits) is comparable to but slightly worse than the 5-band default at fewer bits — extra bits in 10-band can't compensate for the boundary cost."
+  ],
+  "next_step": "10-band benches won't beat 5-band even at higher total bit budgets without (a) a smarter band-boundary scheme or (b) the v1.05 Vilenkin-coeff dump for sp_auto_bands so the allocator sees the actual sqfree spectrum instead of the Walsh-128 proxy."
+}

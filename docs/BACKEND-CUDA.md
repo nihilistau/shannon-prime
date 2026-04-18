@@ -34,9 +34,9 @@ GPU Memory Layout
 
 **`kernel_mobius_reorder` / `kernel_mobius_unreorder`:** Gather/scatter permutation. One thread per coefficient, one block per vector. The Möbius permutation tables are uploaded once at init and remain constant.
 
-**`kernel_band_quantize_simple`:** One thread per vector processes all bands sequentially. Suitable for decode (1 vector at a time). For prefill, launch with more threads per vector.
+**`kernel_band_quantize_simple`:** One thread per vector processes all bands sequentially. Suitable for decode (1 vector at a time). For prefill, launch with more threads per vector. Honours `sp_band_config_t.head_dim` (not `band_size * n_bands`) so the last band absorbs any head_dim-% n_bands remainder — matches the CPU `sp_band_span` helper for the v1.03 10-band configs on hd=128 / pad_dim=154.
 
-**`kernel_band_dequantize_simple`:** Inverse of quantize. Unpacks bit-packed integers, scales by fp16 scale factor. If a band's fp16 scale round-trips to a non-finite value (the real origin of the cascading NaN previously handled by the blanket output guard), the kernel zeros that band — the only surviving guard, and it lives at the root cause.
+**`kernel_band_dequantize_simple`:** Inverse of quantize. Unpacks bit-packed integers, scales by fp16 scale factor. If a band's fp16 scale round-trips to a non-finite value (the real origin of the cascading NaN previously handled by the blanket output guard), the kernel zeros that band — the only surviving guard, and it lives at the root cause. Same `head_dim`-anchored iteration as the quantize kernel.
 
 ## Building
 
