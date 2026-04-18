@@ -21,6 +21,26 @@ The 5/5/4/3 bit allocation beats lossless fp16 by 0.04%. Aggressive config
 make test-all   # 187/188 tests across 8 suites (one synthetic-K flake, see CLAUDE.md)
 ```
 
+## Sibling repositories
+
+The math core (this repo) is the canonical reference. Two sibling
+repositories build inference paths on top of it; both vendor this
+repo at `lib/shannon-prime/` as a git submodule, so they always run
+the same VHT2 / Möbius / sqfree implementation.
+
+| Repo | Role | Status |
+|---|---|---|
+| **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + greedy chat working on Llama-3 / Qwen3 (`chat --naive`); optimised single-token decode is shipped with a known logit-magnitude regression being tracked. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
+| **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Post-decode hook into llama.cpp. Inherits 30+ model architectures via the upstream loader, but the hook surface itself has been a source of integration bugs — every PPL number measured through it carries a footnote. | In production for ship + sqfree paths; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) and the measured-results section below. |
+
+The first published measurements that don't carry the hook-surface
+footnote will come from `shannon-prime-engine` when the optimised
+decode lands. The per-layer K-correlation report from its stage 5a
+already round-trips real RoPE'd K through `KvCache` at K=0.9941
+(Dolphin-1B ship) / K=0.9934 (Qwen3-8B ship) / K=0.9869
+(sqfree+spinor) — the documented 0.992+ ship target, on real model
+data, end-to-end.
+
 ## How It Works
 
 ### Ship path (default)
@@ -47,28 +67,56 @@ Möbius predictor gets r = 0.40–0.58 (vs ≈ 0 on pure power-of-2). Gated on
 
 ## Project Structure
 
+The math core lives in this repo. Two sibling repos depend on it
+via git submodule for inference-time use; each has its own
+project structure documented in their own READMEs.
+
 ```
-shannon-prime/
-├── core/                         C reference: VHT2, Möbius, banded quant,
-│   ├── shannon_prime.h           sqfree pad, Knight mask CSR, residual,
-│   ├── shannon_prime.c           spinor, shadow cache. 31 tests.
-│   └── shannon_prime_sqfree.c    Sqfree + spinor C implementation
-├── backends/
-│   ├── cuda/                     NVIDIA GPU kernels
-│   ├── vulkan/                   Cross-platform GPU + GLSL shaders
-│   ├── torch/                    Pure PyTorch (31 + 69 sqfree tests)
-│   └── adreno/                   Qualcomm: NEON tiers, Hexagon HVX, big.LITTLE
-├── tools/
-│   ├── shannon_prime_llama.*            llama.cpp ship-path (7 tests)
-│   ├── shannon_prime_llama_sqfree.c     llama.cpp sqfree hook
-│   ├── shannon_prime_comfyui.py         ComfyUI + Wan 2.1/2.2 (25 tests)
-│   ├── shannon_prime_comfyui_sqfree.py  ComfyUI sqfree variant
-│   ├── sp_scaling_law.py                K-corr → PPL design rule
-│   ├── sp_inject_freqs.py               GGUF frequency injection
-│   ├── sp_compress_model.py             Weight spectral analysis
-│   └── sp_benchmark.py                  Compression benchmark
-├── tests/                        8 test suites, 187/188 passing
-└── docs/                         Full documentation
+shannon-prime-repos/                  ← parent dir holding all three
+├── shannon-prime/                    ← THIS REPO (canonical math + tools)
+│   ├── core/
+│   │   ├── shannon_prime.h           VHT2, Möbius, banded quant, sqfree pad,
+│   │   ├── shannon_prime.c           Knight mask CSR, residual, spinor, shadow cache
+│   │   └── shannon_prime_sqfree.c    Sqfree + spinor C implementation
+│   ├── backends/
+│   │   ├── cuda/                     NVIDIA GPU kernels
+│   │   ├── vulkan/                   Cross-platform GPU + GLSL shaders
+│   │   ├── torch/                    Pure PyTorch (31 + 69 sqfree tests)
+│   │   └── adreno/                   Qualcomm: NEON tiers, Hexagon HVX, big.LITTLE
+│   ├── tools/
+│   │   ├── shannon_prime_llama.*            in-tree stub for the llama.cpp hook
+│   │   ├── shannon_prime_llama_sqfree.c     in-tree sqfree hook stub
+│   │   ├── shannon_prime_comfyui.py         ComfyUI + Wan 2.1/2.2 (25 tests)
+│   │   ├── shannon_prime_comfyui_sqfree.py  ComfyUI sqfree variant
+│   │   ├── sp_scaling_law.py                K-corr → PPL design rule
+│   │   ├── sp_inject_freqs.py               GGUF frequency injection
+│   │   ├── sp_compress_model.py             Weight spectral analysis
+│   │   └── sp_benchmark.py                  Compression benchmark
+│   ├── tests/                        8 test suites, 187/188 passing
+│   └── docs/                         Full documentation (incl. PRIME-ENGINE.md)
+│
+├── shannon-prime-engine/             ← SIBLING: standalone inference binary
+│   │                                   Owns compressed KV layout. Stage 5b.
+│   ├── lib/shannon-prime/            git submodule → this repo
+│   ├── vendor/ggml/                  git submodule → ggml-org/ggml (MIT)
+│   ├── src/                          ~900 LOC of engine code
+│   │   ├── engine.{h,cpp}            Public API + Config (PeMode, sqfree, mobius)
+│   │   ├── gguf_loader.{h,cpp}       Typed view over gguf_context
+│   │   ├── vocab.{h,cpp}             tokenizer.ggml.* arrays
+│   │   ├── tokenizer.{h,cpp}         GPT-2-style BPE encode/decode
+│   │   ├── llama_weights.{h,cpp}     Llama-family arch binding
+│   │   ├── forward.{h,cpp}           ggml graph: embed, block, full, decode
+│   │   ├── prime_pe.{h,cpp}          PrimePE-RoPE-ALiBi lattice math
+│   │   ├── kv_cache.{h,cpp}          Wrapper around sp_shadow_cache_t / sp_sqfree_cache_t
+│   │   └── cli/main.cpp              Verbs: info, encode, embed, logits, kv_smoke,
+│   │                                  prefill, chat
+│   └── CMakeLists.txt                CMake + Ninja, optional CUDA/Vulkan
+│
+└── shannon-prime-llama/              ← SIBLING: llama.cpp post-decode hook
+    │                                    Inherits 30+ archs from llama.cpp.
+    │                                    See docs/INTEGRATION-LLAMA.md.
+    ├── lib/shannon-prime/            git submodule → this repo
+    └── src/llama-shannon-prime.{h,cpp}  Hook implementation
 ```
 
 ## Documentation
@@ -76,6 +124,7 @@ shannon-prime/
 | Document | Contents |
 |----------|----------|
 | [docs/Shannon-Prime.md](docs/Shannon-Prime.md) | Theory, pipeline, license rationale, key results |
+| [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md) | shannon-prime-engine sibling: stages 3–5, KvCache, PrimePE-RoPE-ALiBi |
 | [docs/TOOLS.md](docs/TOOLS.md) | Command-line tools: benchmark, freq injection, weight compression |
 | [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) | llama.cpp: hook points, API, env vars, GQA support |
 | [docs/INTEGRATION-COMFYUI.md](docs/INTEGRATION-COMFYUI.md) | ComfyUI: Wan 2.1/2.2 MoE, expert switching, linear wrapper |
@@ -86,6 +135,22 @@ shannon-prime/
 | [docs/TESTING.md](docs/TESTING.md) | How to run, what to look for, interpreting failures |
 
 ## Quick Start
+
+### shannon-prime-engine (standalone binary; recommended for measurement)
+```bash
+git clone --recursive https://github.com/nihilistau/shannon-prime-engine
+cd shannon-prime-engine
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+
+# Sanity: per-layer K correlation on real RoPE'd K, ship vs sqfree.
+./build/bin/sp-engine prefill --model dolphin_1b.gguf "The quick brown fox"
+./build/bin/sp-engine prefill --sqfree --spinor --model dolphin_1b.gguf "..."
+
+# Greedy generation (use --naive while the optimised decode bug is open).
+./build/bin/sp-engine chat --model dolphin_1b.gguf --n-predict 16 --naive "The quick brown fox"
+```
+Full verb list and stage status in [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md).
 
 ### llama.cpp — ship path
 ```bash
@@ -101,9 +166,11 @@ export SHANNON_PRIME_ENABLED=1
 export SHANNON_PRIME_SQFREE=1
 export SHANNON_PRIME_SPINOR=1
 export SHANNON_PRIME_RESIDUAL_BITS=3
-export SHANNON_PRIME_K_BITS=3,3,3,3,3
+export SHANNON_PRIME_K_BITS=5,4,4,4,5
 ./llama-server -m Qwen3-8B-Q8_0.gguf -c 32768
 ```
+Note: 3,3,3,3,3 on the Knight skeleton was retracted in v1.07
+(catastrophic post-fix); the effective Pareto point is 5,4,4,4,5.
 
 ### ComfyUI (Wan 2.2 MoE)
 ```python
@@ -118,14 +185,34 @@ for step, sigma in enumerate(sigmas):
 
 ## Key Results
 
-### Ship path
+### Engine-measured K correlation on real RoPE'd K (no hook surface)
+
+Measured by `shannon-prime-engine`'s `prefill` verb, which captures
+post-RoPE pre-GQA K from a real prefill, pushes it through the
+KvCache wrapper, reads it back, and reports per-layer correlation
+against the un-cached source. No decompress→attention→recompress
+round-trip. Cache compression happens once on the write path; the
+correlation is the storage-layout fidelity, not a hook artefact.
+
+| Model | Path | K_corr (mean over all layers) | V_corr | Compression |
+|---|---|---|---|---|
+| Dolphin3.0-Llama3.2-1B-Q8 (hd=64, 16 layers) | ship 5,5,4,3 / 3 | **0.9941** | 0.9712 | 3.76× |
+| Dolphin3.0-Llama3.2-1B-Q8 | sqfree (pad 66) | 0.9768 | 0.9484 | 3.76× |
+| Dolphin3.0-Llama3.2-1B-Q8 | sqfree+spinor | 0.9869 | 0.9601 | 3.76× |
+| Qwen3-8B-Q8 (hd=128, 36 layers) | ship 5,5,4,3 / 3 | **0.9934** | 0.9691 | 4.06× |
+
+Spinor's +0.008–0.010 K-corr lift on the Knight skeleton matches
+the value documented in CLAUDE.md. Ship hits the 0.992+ target on
+real model data, end-to-end, on both architectures.
+
+### Ship path (synthetic + scaling-law projection)
 | Config | K Corr | Compression | PPL Impact |
 |--------|--------|-------------|------------|
 | 5/5/4/3 + Möbius (ship) | 0.992+ | 3.4× | −0.04% (better) |
 | 4/4/4/3 | 0.990 | 3.8× | +0.39% |
 | 3/3/3/3 (floor) | 0.976 | 4.6× | +3.90% |
 
-### Sqfree+spinor (Qwen3-8B Q8 hd=128)
+### Sqfree+spinor (Qwen3-8B Q8 hd=128, llama-cpp-sp hook)
 | Config | PPL | K Corr | Compression |
 |--------|-----|--------|-------------|
 | MOBIUS default 5/5/5/5/5 | 7.31 | 0.999 | 2.6× |

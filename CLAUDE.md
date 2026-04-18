@@ -11,6 +11,33 @@ with Möbius-ordered coefficient reordering and per-band quantization to deliver
 to 2.8× at equivalent quality on Q8+ backbones via the sqfree+spinor aggressive
 variant of the same pipeline.
 
+## Sibling Repositories
+
+Two sibling repos depend on this one via git submodule and are
+where most active integration work happens:
+
+- **`D:/F/shannon-prime-repos/shannon-prime-engine`** — standalone
+  inference binary that owns the compressed KV layout end-to-end.
+  Stage 5b: full forward pass + greedy chat work on Llama-3 / Qwen3.
+  The bug-free reference measurement surface — every PPL number
+  measured through the llama hook should be re-measured here.
+  Documented in `docs/PRIME-ENGINE.md`. Build at
+  `build/bin/sp-engine.exe`.
+- **`D:/F/llama-cpp-sp/`** — the llama.cpp fork carrying the
+  shannon-prime post-decode hook. Inherits 30+ archs but every
+  measurement carries a hook-surface footnote.
+
+When the user asks for inference results, defaults, or
+correctness-grade numbers, prefer the engine path. When they need
+to test against a specific exotic model architecture llama.cpp
+already supports, the hook is the right tool.
+
+The canonical PE family in the engine is **PrimePE-RoPE-ALiBi**
+(`PeMode` enum: Standard / PrimePe / PrimePeAlibi / AlibiOnly).
+The lattice math is the three-tier composite/prime allocation from
+`prime_rope.h`, alpha-blended with identity so `pe_alpha=0` is
+byte-identical to standard geometric RoPE.
+
 **VHT2 with p = 2 is the Walsh-Hadamard Transform.** Everywhere in the code —
 torch reference, C core, GPU kernels, integrations — the single transform is
 VHT2. On power-of-2 head dimensions it reduces to the WHT butterfly scaled by
