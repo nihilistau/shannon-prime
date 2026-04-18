@@ -172,7 +172,32 @@ persists across decode steps).
 
 Hierarchical at 9% skeleton is architecturally competitive with
 ship's K-corr at 5.5× smaller skeleton. Scaling-law projection
-at 70B Q8 puts hierarchical within 0.05% PPL of ship.
+at 70B Q8 puts hierarchical within 0.05% PPL of ship for prefill-
+style (single-pass forward) workloads.
+
+### Cache-mode PPL note
+
+`perplexity --cache` (prefill + decode-per-token) amplifies the
+compression penalty well beyond what the prefill-roundtrip
+scaling law predicts, because each decode reads its past K/V
+back through the compression pipeline. Measured on Qwen3-8B-Q8,
+ctx=512, wiki.test.raw:
+
+| Mode | Chunk 1 PPL | Chunk 2 PPL | Final |
+|---|---|---|---|
+| baseline (no cache) | 11.83 | 18.05 | 18.05 |
+| ship cache | 11.72 | 18.14 | **18.14 (+0.5%)** |
+| hierarchical cache | 17.43 | *(terminated)* | *(pending)* |
+
+Hierarchical's chunk-1 partial (+48% vs ship chunk 1) exceeded
+the CPU bench window before chunk 2 completed; the final number
+is pending a persistent-KV-tensor decode path and/or a GPU
+backend. The measurement shows decode-chain amplification is
+order-of-magnitude larger than prefill-only scaling predicts —
+same pattern seen on Dolphin-1B, where sqfree+spinor landed at
++325% PPL in decode-chain vs scaling law's single-pass
+prediction of +~100%. Ship mode is dramatically more robust to
+decode-chain compounding because its K_corr error is ~10× smaller.
 
 ### Sidecar injection (`<model>.sp_freq_factors.bin` auto-load)
 
