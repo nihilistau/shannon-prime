@@ -374,11 +374,50 @@ typedef struct {
     bool                use_skel_mobius;
     sp_mobius_mask_t    skel_mobius_mask;
     float              *skel_mobius_scratch; // sk_k floats
+
+    // ── Calibration state (transient, freed after calibrate_end) ─────
+    bool                calibrating;         // true between begin/end
+    double             *calib_sum;           // pad_dim doubles: Σ x_i
+    double             *calib_sum2;          // pad_dim doubles: Σ x_i²
+    int                 calib_n;             // number of vectors fed
+    int                 max_seq_len;         // stashed for re-init
 } sp_sqfree_cache_t;
 
 int  sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
                           int max_seq_len, int residual_bits, bool use_spinor);
 void sp_sqfree_cache_free(sp_sqfree_cache_t *sc);
+
+// ── Adaptive calibration (L/2 phase-transition + variance-ranked skeleton) ──
+//
+// Calibration collects raw KV vectors from a warmup pass, transforms them
+// into the Vilenkin domain, and accumulates per-coefficient variance. When
+// calibration ends, it rebuilds the Knight mask with real variance data and
+// the L/2 skeleton size, then re-initialises the band quantisers to match.
+//
+// Usage:
+//   sp_sqfree_calibrate_begin(sc);        // allocate accumulators
+//   for each warmup vector:
+//     sp_sqfree_calibrate_feed(sc, vec);  // pad → Vilenkin → accumulate
+//   sp_sqfree_calibrate_end(sc);          // rebuild mask + bands
+//
+// After calibrate_end, write/read use the adaptive mask. If calibrate is
+// never called, the cache uses the default L/2 skeleton with index-order
+// (squarefree-first) ranking — still correct, just not data-adapted.
+
+// Begin calibration: allocates per-coefficient running accumulators.
+// Returns 0 on success, -1 on alloc failure.
+int  sp_sqfree_calibrate_begin(sp_sqfree_cache_t *sc);
+
+// Feed one raw KV vector (head_dim floats, NOT padded). The vector is
+// sqfree-padded and Vilenkin-transformed internally; per-coefficient
+// squared values are accumulated for variance estimation.
+void sp_sqfree_calibrate_feed(sp_sqfree_cache_t *sc, const float *vec);
+
+// End calibration: computes per-coefficient variance from accumulators,
+// rebuilds the Knight mask with variance ranking at sk_k = pad_dim/2,
+// re-initialises band quantisers, and frees the accumulators.
+// Returns 0 on success, -1 if no vectors were fed.
+int  sp_sqfree_calibrate_end(sp_sqfree_cache_t *sc);
 
 // Write/read — same signatures as sp_shadow_cache but uses the sqfree path
 void sp_sqfree_write_k(sp_sqfree_cache_t *sc,
@@ -447,11 +486,32 @@ typedef struct {
     float              *vht2_scratch;   // head_dim floats
     float              *mobius_scratch; // head_dim floats
     float              *read_scratch;   // head_dim floats
+
+    // ── Variance-ranked reorder (adaptive alternative to Möbius) ─────
+    // When calibrated, `var_order` replaces `mobius_mask` on the write/read
+    // path: highest-variance VHT2 coefficients are pushed to the front
+    // (high-bit bands), lowest-variance to the back (low-bit bands).
+    bool                use_var_reorder;  // false until calibrated
+    int                *var_order;        // head_dim permutation (sorted by variance desc)
+    int                *var_unorder;      // inverse permutation for read path
+    // Calibration accumulators (transient)
+    bool                calibrating;
+    double             *calib_sum;        // head_dim doubles
+    double             *calib_sum2;       // head_dim doubles
+    int                 calib_n;
 } sp_shadow_cache_t;
 
 // Initialize shadow cache. Backend allocates compressed storage.
 int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg);
 void sp_shadow_cache_free(sp_shadow_cache_t *sc);
+
+// ── Variance-ranked calibration for the ship path ───────────────────
+// Same lifecycle as sqfree calibration. After calibrate_end, the write
+// path reorders VHT2 coefficients by variance instead of Möbius order,
+// so high-variance coefficients land in the highest-bit bands.
+int  sp_shadow_calibrate_begin(sp_shadow_cache_t *sc);
+void sp_shadow_calibrate_feed(sp_shadow_cache_t *sc, const float *vec);
+int  sp_shadow_calibrate_end(sp_shadow_cache_t *sc);
 
 // Compress and store a K vector.
 // layer, head: identifies the cache slot

@@ -142,7 +142,7 @@ static void sp_hartley_stage_f32(float *data, int total_len, int p, int stride) 
     }
 }
 
-void sp_vilenkin_forward_f32(float *data, int n) {
+static void sp_vilenkin_forward_f32(float *data, int n) {
     int factors[16];
     int n_factors = sp_prime_factorize(n, factors, 16);
     if (n_factors < 0) return; // Can't factorize
@@ -154,7 +154,7 @@ void sp_vilenkin_forward_f32(float *data, int n) {
     }
 }
 
-void sp_vilenkin_inverse_f32(float *data, int n) {
+static void sp_vilenkin_inverse_f32(float *data, int n) {
     // Self-inverse when each stage is normalized by 1/√p
     sp_vilenkin_forward_f32(data, n);
 }
@@ -363,6 +363,11 @@ int sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
     sc->residual_bits = residual_bits;
     sc->use_spinor = use_spinor;
     sc->pad_dim = sp_sqfree_pad_dim(cfg->head_dim);
+    sc->max_seq_len = max_seq_len;
+    sc->calibrating = false;
+    sc->calib_sum = NULL;
+    sc->calib_sum2 = NULL;
+    sc->calib_n = 0;
 
     // Init Vilenkin basis
     int factors[16];
@@ -378,10 +383,12 @@ int sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
             last_p = factors[i];
         }
     }
-    sp_vilenkin_init(&sc->vilenkin, seen_primes);
+    if (sp_vilenkin_init(&sc->vilenkin, seen_primes) != 0) return -1;
 
-    // Init Knight mask with default skeleton
-    int sk_k = (int)(sc->pad_dim * 0.75f);
+    // Init Knight mask with L/2 skeleton (phase-transition optimum).
+    // Research finding: adaptive top-K universally peaks at dim/2 (50%),
+    // not the prior 75%. Variance ranking is applied later via calibrate.
+    int sk_k = sc->pad_dim / 2;
     sp_knight_mask_init(&sc->mask, sc->pad_dim, sk_k, NULL);
     sc->mask.residual_bits = residual_bits;
     sc->mask.use_spinor = use_spinor;
@@ -476,6 +483,8 @@ void sp_sqfree_cache_free(sp_sqfree_cache_t *sc) {
         sp_mobius_mask_free(&sc->skel_mobius_mask);
         free(sc->skel_mobius_scratch);
     }
+    free(sc->calib_sum);
+    free(sc->calib_sum2);
     sp_knight_mask_free(&sc->mask);
     sp_vilenkin_free(&sc->vilenkin);
     memset(sc, 0, sizeof(*sc));
@@ -768,6 +777,136 @@ void sp_sqfree_read_v(const sp_sqfree_cache_t *sc,
                   + (sc->use_spinor ? (sc->mask.n_res + 7) / 8 : 0);
     sp_sqfree_reconstruct_one(sc, sc->v_cache[slot] + pos * bytes_per,
                               v_out, &sc->v_bands);
+}
+
+// ============================================================================
+// Adaptive calibration — variance-ranked Knight mask at L/2
+// ============================================================================
+
+int sp_sqfree_calibrate_begin(sp_sqfree_cache_t *sc) {
+    if (sc->calibrating) return -1;
+    int pd = sc->pad_dim;
+    sc->calib_sum  = (double *)calloc(pd, sizeof(double));
+    sc->calib_sum2 = (double *)calloc(pd, sizeof(double));
+    if (!sc->calib_sum || !sc->calib_sum2) {
+        free(sc->calib_sum);
+        free(sc->calib_sum2);
+        sc->calib_sum = NULL;
+        sc->calib_sum2 = NULL;
+        return -1;
+    }
+    sc->calib_n = 0;
+    sc->calibrating = true;
+    return 0;
+}
+
+void sp_sqfree_calibrate_feed(sp_sqfree_cache_t *sc, const float *vec) {
+    if (!sc->calibrating) return;
+    int hd = sc->config.head_dim;
+    int pd = sc->pad_dim;
+
+    // Pad vector
+    sp_sqfree_pad_f32(vec, hd, sc->pad_scratch, pd);
+
+    // Transform into Vilenkin domain
+    sp_vilenkin_forward_f32(sc->pad_scratch, pd);
+
+    // Accumulate per-coefficient statistics
+    for (int i = 0; i < pd; i++) {
+        double v = (double)sc->pad_scratch[i];
+        sc->calib_sum[i]  += v;
+        sc->calib_sum2[i] += v * v;
+    }
+    sc->calib_n++;
+}
+
+int sp_sqfree_calibrate_end(sp_sqfree_cache_t *sc) {
+    if (!sc->calibrating || sc->calib_n < 1) return -1;
+    sc->calibrating = false;
+
+    int pd = sc->pad_dim;
+    double inv_n = 1.0 / (double)sc->calib_n;
+
+    // Compute per-coefficient variance: Var = E[x²] − E[x]²
+    float *variance = (float *)malloc(pd * sizeof(float));
+    for (int i = 0; i < pd; i++) {
+        double mean = sc->calib_sum[i] * inv_n;
+        double var  = sc->calib_sum2[i] * inv_n - mean * mean;
+        variance[i] = (var > 0.0) ? (float)var : 0.0f;
+    }
+
+    // Free accumulators
+    free(sc->calib_sum);
+    free(sc->calib_sum2);
+    sc->calib_sum = NULL;
+    sc->calib_sum2 = NULL;
+
+    // Rebuild Knight mask with variance ranking at L/2
+    sp_knight_mask_free(&sc->mask);
+    int sk_k = pd / 2;
+    sp_knight_mask_init(&sc->mask, pd, sk_k, variance);
+    sc->mask.residual_bits = sc->residual_bits;
+    sc->mask.use_spinor = sc->use_spinor;
+
+    free(variance);
+
+    // Re-initialise band quantisers for the (possibly changed) skeleton size.
+    // Reuse the config's band bits if set, else defaults.
+    int default_k_bits[5] = {5, 4, 4, 4, 5};
+    const sp_config_t *cfg = &sc->config;
+    int k_nb = (cfg->k_n_bands > 0 && cfg->k_n_bands <= SP_MAX_BANDS)
+               ? cfg->k_n_bands : 5;
+    const int *k_bits = (cfg->k_n_bands > 0 && cfg->k_n_bands <= SP_MAX_BANDS)
+                        ? cfg->k_band_bits : default_k_bits;
+    int v_nb = (cfg->v_n_bands > 0 && cfg->v_n_bands <= SP_MAX_BANDS)
+               ? cfg->v_n_bands : k_nb;
+    const int *v_bits = (cfg->v_n_bands > 0 && cfg->v_n_bands <= SP_MAX_BANDS)
+                        ? cfg->v_band_bits : k_bits;
+    sp_band_config_init(&sc->k_bands, sc->mask.sk_k, k_nb, k_bits);
+    sp_band_config_init(&sc->v_bands, sc->mask.sk_k, v_nb, v_bits);
+
+    // Reallocate compressed storage (new sk_k may change bytes-per-pos)
+    int n_slots = cfg->n_layers * cfg->n_heads_kv;
+    int n_res = sc->mask.n_res;
+    int k_bytes_per_pos = sc->k_bands.total_bytes
+                        + (n_res * sc->residual_bits + 7) / 8
+                        + 4
+                        + (sc->use_spinor ? (n_res + 7) / 8 : 0);
+    int v_bytes_per_pos = sc->v_bands.total_bytes
+                        + (n_res * sc->residual_bits + 7) / 8
+                        + 4
+                        + (sc->use_spinor ? (n_res + 7) / 8 : 0);
+
+    for (int s = 0; s < n_slots; s++) {
+        free(sc->k_cache[s]);
+        free(sc->v_cache[s]);
+        sc->k_cache[s] = (uint8_t *)calloc(sc->max_seq_len, k_bytes_per_pos);
+        sc->v_cache[s] = (uint8_t *)calloc(sc->max_seq_len, v_bytes_per_pos);
+    }
+
+    // Resize pred_scratch for new residual count
+    free(sc->pred_scratch);
+    sc->pred_scratch = (float *)malloc(n_res * sizeof(float));
+
+    // Rebuild optional skeleton Möbius reorder if it was enabled
+    if (sc->use_skel_mobius) {
+        sp_mobius_mask_free(&sc->skel_mobius_mask);
+        free(sc->skel_mobius_scratch);
+        sc->use_skel_mobius = false;
+        if (sp_mobius_mask_init(&sc->skel_mobius_mask, sc->mask.sk_k) == 0) {
+            sc->use_skel_mobius = true;
+            sc->skel_mobius_scratch = (float *)malloc(sc->mask.sk_k * sizeof(float));
+        }
+    }
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime SQFREE] calibrated: sk_k=%d (L/2=%d) "
+                        "pad_dim=%d n_res=%d n_vectors=%d\n",
+                sc->mask.sk_k, pd / 2, pd, n_res, sc->calib_n);
+    }
+
+    sc->calib_n = 0;
+    return 0;
 }
 
 // ============================================================================

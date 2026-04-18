@@ -679,6 +679,7 @@ void sp_vilenkin_pass_free(sp_vilenkin_pass_t *pass) {
 // ============================================================================
 
 int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
+    memset(sc, 0, sizeof(*sc));
     memcpy(&sc->config, cfg, sizeof(sp_config_t));
 
     // Initialize band configs
@@ -708,6 +709,15 @@ int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
     sc->v_cache = NULL;
     sc->seq_len = (int *)calloc(cfg->n_layers, sizeof(int));
 
+    // Variance-ranked reorder: off until calibrated
+    sc->use_var_reorder = false;
+    sc->var_order = NULL;
+    sc->var_unorder = NULL;
+    sc->calibrating = false;
+    sc->calib_sum = NULL;
+    sc->calib_sum2 = NULL;
+    sc->calib_n = 0;
+
     return 0;
 }
 
@@ -719,11 +729,19 @@ void sp_shadow_cache_free(sp_shadow_cache_t *sc) {
     free(sc->mobius_scratch);
     free(sc->read_scratch);
     free(sc->seq_len);
+    free(sc->var_order);
+    free(sc->var_unorder);
+    free(sc->calib_sum);
+    free(sc->calib_sum2);
     // k_cache and v_cache freed by backend
     sc->vht2_scratch    = NULL;
     sc->mobius_scratch = NULL;
     sc->read_scratch   = NULL;
     sc->seq_len        = NULL;
+    sc->var_order      = NULL;
+    sc->var_unorder    = NULL;
+    sc->calib_sum      = NULL;
+    sc->calib_sum2     = NULL;
 }
 
 // Write path: raw KV → VHT2 → Möbius reorder → band quantize → store
@@ -737,7 +755,13 @@ void sp_shadow_write_k(sp_shadow_cache_t *sc,
     memcpy(scratch, k_vec, hd * sizeof(float));
     sp_vht2_forward_f32(scratch, hd);
 
-    if (sc->config.use_mobius_mask) {
+    // Reorder: variance-ranked (if calibrated) > Möbius (if enabled) > none
+    if (sc->use_var_reorder) {
+        // Permute by variance: high-variance → front → high-bit bands
+        float *tmp = sc->mobius_scratch;
+        for (int i = 0; i < hd; i++) tmp[i] = scratch[sc->var_order[i]];
+        memcpy(scratch, tmp, hd * sizeof(float));
+    } else if (sc->config.use_mobius_mask) {
         sp_mobius_reorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
@@ -778,7 +802,12 @@ void sp_shadow_read_k(const sp_shadow_cache_t *sc,
 
     sp_band_dequantize(src, scratch, &sc->k_bands);
 
-    if (sc->config.use_mobius_mask) {
+    // Inverse reorder: variance-ranked (if calibrated) > Möbius > none
+    if (sc->use_var_reorder) {
+        float *tmp = sc->mobius_scratch;
+        for (int i = 0; i < hd; i++) tmp[sc->var_order[i]] = scratch[i];
+        memcpy(scratch, tmp, hd * sizeof(float));
+    } else if (sc->config.use_mobius_mask) {
         sp_mobius_unreorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
@@ -847,6 +876,101 @@ void sp_shadow_read_v_batch(const sp_shadow_cache_t *sc,
     for (int i = 0; i < n_pos; i++) {
         sp_shadow_read_v(sc, layer, head, start_pos + i, v_out + (size_t)i * hd);
     }
+}
+
+// ============================================================================
+// Ship-path variance-ranked calibration
+// ============================================================================
+
+int sp_shadow_calibrate_begin(sp_shadow_cache_t *sc) {
+    if (sc->calibrating) return -1;
+    int hd = sc->config.head_dim;
+    sc->calib_sum  = (double *)calloc(hd, sizeof(double));
+    sc->calib_sum2 = (double *)calloc(hd, sizeof(double));
+    if (!sc->calib_sum || !sc->calib_sum2) {
+        free(sc->calib_sum);
+        free(sc->calib_sum2);
+        sc->calib_sum = NULL;
+        sc->calib_sum2 = NULL;
+        return -1;
+    }
+    sc->calib_n = 0;
+    sc->calibrating = true;
+    return 0;
+}
+
+void sp_shadow_calibrate_feed(sp_shadow_cache_t *sc, const float *vec) {
+    if (!sc->calibrating) return;
+    int hd = sc->config.head_dim;
+
+    // Transform to VHT2 domain using the persistent scratch
+    memcpy(sc->vht2_scratch, vec, hd * sizeof(float));
+    sp_vht2_forward_f32(sc->vht2_scratch, hd);
+
+    for (int i = 0; i < hd; i++) {
+        double v = (double)sc->vht2_scratch[i];
+        sc->calib_sum[i]  += v;
+        sc->calib_sum2[i] += v * v;
+    }
+    sc->calib_n++;
+}
+
+int sp_shadow_calibrate_end(sp_shadow_cache_t *sc) {
+    if (!sc->calibrating || sc->calib_n < 1) return -1;
+    sc->calibrating = false;
+
+    int hd = sc->config.head_dim;
+    double inv_n = 1.0 / (double)sc->calib_n;
+
+    // Compute per-coefficient variance
+    float *variance = (float *)malloc(hd * sizeof(float));
+    for (int i = 0; i < hd; i++) {
+        double mean = sc->calib_sum[i] * inv_n;
+        double var  = sc->calib_sum2[i] * inv_n - mean * mean;
+        variance[i] = (var > 0.0) ? (float)var : 0.0f;
+    }
+
+    free(sc->calib_sum);
+    free(sc->calib_sum2);
+    sc->calib_sum = NULL;
+    sc->calib_sum2 = NULL;
+
+    // Build variance-ranked permutation: indices sorted by variance descending
+    // so highest-variance coefficients land in band 0 (highest bits).
+    // Free any prior allocation (safe even on first call — they start NULL).
+    free(sc->var_order);
+    free(sc->var_unorder);
+    sc->var_order   = (int *)malloc(hd * sizeof(int));
+    sc->var_unorder = (int *)malloc(hd * sizeof(int));
+    for (int i = 0; i < hd; i++) sc->var_order[i] = i;
+
+    // Insertion sort (head_dim ≤ 256, not hot path)
+    for (int i = 1; i < hd; i++) {
+        int key = sc->var_order[i];
+        float kv = variance[key];
+        int j = i - 1;
+        while (j >= 0 && variance[sc->var_order[j]] < kv) {
+            sc->var_order[j + 1] = sc->var_order[j];
+            j--;
+        }
+        sc->var_order[j + 1] = key;
+    }
+
+    // Build inverse permutation for the read path
+    for (int i = 0; i < hd; i++) {
+        sc->var_unorder[sc->var_order[i]] = i;
+    }
+
+    sc->use_var_reorder = true;
+    free(variance);
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime SHADOW] variance-ranked reorder calibrated "
+                        "(head_dim=%d, n_vectors=%d)\n", hd, sc->calib_n);
+    }
+
+    sc->calib_n = 0;
+    return 0;
 }
 
 // ============================================================================
