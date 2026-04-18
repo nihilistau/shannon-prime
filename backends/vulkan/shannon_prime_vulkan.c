@@ -95,6 +95,17 @@ struct sp_vulkan_cache_s {
     // not the long-term store, so per-slot compressed bytes live here.
     uint8_t **k_cache;
     uint8_t **v_cache;
+    // Per-vector blob stride in the K/V cache. For the default CPU path this
+    // equals the corresponding `bands->total_bytes` (fp16 scale + uint8
+    // packed). When SHANNON_PRIME_VULKAN_FORCE_GPU=1 is set at init time
+    // the shaders emit a fp32-scale + uint32-packed layout that needs more
+    // room (e.g. 84 bytes vs 76 bytes for 5,5,4,3@hd=128), so we bump the
+    // slot stride to max(cpu_bytes, gpu_bytes) and all memcpys use this
+    // field instead of the raw `total_bytes`. A single cache can't mix
+    // both formats — the choice is frozen at init.
+    int k_blob_bytes;
+    int v_blob_bytes;
+    int force_gpu_blob;  // 1 when slots are allocated in GPU format
 
     // Either GPU impl or CPU fallback
     int use_cpu_fallback;
@@ -420,9 +431,23 @@ static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
     // Tracked separately; FORCE_GPU remains a diagnostic switch for now.
     const int hd = cc->config.head_dim;
     const int bytes_per_float_vec = hd * sizeof(float);
-    const int max_quant_bytes =
-        (cc->k_bands.total_bytes > cc->v_bands.total_bytes
-         ? cc->k_bands.total_bytes : cc->v_bands.total_bytes);
+    // buf_quant must hold both CPU and GPU compressed layouts. Compute the
+    // GPU upper bound (fp32 scale + uint32 packed per band) and max against
+    // the CPU byte count.
+    int gpu_bytes_for(const sp_band_config_t *bc) {
+        int total = 0;
+        for (int b = 0; b < bc->n_bands; b++) {
+            int off, sz; sp_band_span(bc, b, &off, &sz);
+            total += 1 + ((sz * bc->band_bits[b] + 31) / 32);
+        }
+        return total * 4;
+    }
+    int max_quant_bytes = cc->k_bands.total_bytes;
+    if (cc->v_bands.total_bytes > max_quant_bytes) max_quant_bytes = cc->v_bands.total_bytes;
+    int k_gpu = gpu_bytes_for(&cc->k_bands);
+    int v_gpu = gpu_bytes_for(&cc->v_bands);
+    if (k_gpu > max_quant_bytes) max_quant_bytes = k_gpu;
+    if (v_gpu > max_quant_bytes) max_quant_bytes = v_gpu;
 
     if (vk_alloc_buffer(vk, bytes_per_float_vec, &vk->buf_a, &vk->mem_a, &vk->map_a) != 0) return -1;
     if (vk_alloc_buffer(vk, bytes_per_float_vec, &vk->buf_b, &vk->mem_b, &vk->map_b) != 0) return -1;
@@ -702,11 +727,17 @@ static int vk_dispatch_all_four_gpu(sp_vulkan_cache_t *cc, const float *in,
                        0, sizeof(vpc), &vpc);
     vkCmdDispatch(vk->cmd_buf, 1, 1, 1);
 
+    // Barrier after VHT2 must cover BOTH the compute-shader read (mobius
+    // when apply_mobius=1) AND the transfer read (vkCmdCopyBuffer when
+    // apply_mobius=0). Missing TRANSFER_READ here was the cause of V's
+    // 0.63 correlation under FORCE_GPU — the copy ran against stale buf_a.
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT };
+        NULL, VK_ACCESS_SHADER_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT };
     vkCmdPipelineBarrier(vk->cmd_buf,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &mb, 0, NULL, 0, NULL);
 
     if (apply_mobius && cc->config.use_mobius_mask) {
         // Stage 2: reorder buf_a -> buf_b
@@ -742,7 +773,10 @@ static int vk_dispatch_all_four_gpu(sp_vulkan_cache_t *cc, const float *in,
     VK_OK(vkEndCommandBuffer(vk->cmd_buf));
     if (vk_submit_and_wait(vk) != 0) return -1;
 
-    memcpy(out_bytes, vk->map_quant, (size_t)bc->total_bytes);
+    // GPU shader emitted fp32-scale + uint32-packed stream — size is
+    // total_words*4. Copy that many bytes, not bc->total_bytes (which is
+    // the CPU fp16+uint8 stride and 8 bytes short on typical configs).
+    memcpy(out_bytes, vk->map_quant, (size_t)qpc.total_words * 4);
     return 0;
 }
 
@@ -781,7 +815,14 @@ static int vk_decompress_one_gpu(sp_vulkan_cache_t *cc, const uint8_t *in_bytes,
                                  float *out) {
     sp_vk_impl_t *vk = &cc->vk;
     const int hd = cc->config.head_dim;
-    memcpy(vk->map_quant, in_bytes, (size_t)bc->total_bytes);
+    // Compute the GPU stream byte count up-front so we copy exactly what the
+    // shader expects to read — see comment in vk_dispatch_all_four_gpu.
+    uint32_t total_words_in = 0;
+    for (int b = 0; b < bc->n_bands; b++) {
+        int off, sz; sp_band_span(bc, b, &off, &sz);
+        total_words_in += 1u + (uint32_t)(((uint32_t)sz * (uint32_t)bc->band_bits[b] + 31u) / 32u);
+    }
+    memcpy(vk->map_quant, in_bytes, (size_t)total_words_in * 4);
 
     struct bq_pc qpc; bq_fill_push(bc, &qpc);
     struct mob_pc mpc = { (uint32_t)hd, 1 };
@@ -911,13 +952,41 @@ int sp_vulkan_cache_init(sp_vulkan_cache_t **cc_out,
     // Try GPU path — if no user device provided, create our own
     if (init_vulkan_pipelines(cc, vk_device, vk_queue) == 0) {
         vk_ok = 1;
-        // Allocate host-side compressed storage (GPU is compute-only for v1.01)
+
+        // Determine slot blob format. force_gpu frozen at init time so a
+        // single cache can't mix CPU and GPU blob layouts.
+        const char *fg = getenv("SHANNON_PRIME_VULKAN_FORCE_GPU");
+        cc->force_gpu_blob = (fg && fg[0] == '1') ? 1 : 0;
+        cc->k_blob_bytes = cc->k_bands.total_bytes;
+        cc->v_blob_bytes = cc->v_bands.total_bytes;
+        if (cc->force_gpu_blob) {
+            int k_gpu = 0, v_gpu = 0;
+            for (int b = 0; b < cc->k_bands.n_bands; b++) {
+                int off, sz; sp_band_span(&cc->k_bands, b, &off, &sz);
+                k_gpu += 1 + ((sz * cc->k_bands.band_bits[b] + 31) / 32);
+            }
+            for (int b = 0; b < cc->v_bands.n_bands; b++) {
+                int off, sz; sp_band_span(&cc->v_bands, b, &off, &sz);
+                v_gpu += 1 + ((sz * cc->v_bands.band_bits[b] + 31) / 32);
+            }
+            k_gpu *= 4; v_gpu *= 4;
+            if (k_gpu > cc->k_blob_bytes) cc->k_blob_bytes = k_gpu;
+            if (v_gpu > cc->v_blob_bytes) cc->v_blob_bytes = v_gpu;
+        }
+
         int n_slots = cfg->n_layers * cfg->n_heads_kv;
         cc->k_cache = (uint8_t **)calloc(n_slots, sizeof(uint8_t *));
         cc->v_cache = (uint8_t **)calloc(n_slots, sizeof(uint8_t *));
         for (int i = 0; i < n_slots; i++) {
-            cc->k_cache[i] = (uint8_t *)calloc(max_seq_len, cc->k_bands.total_bytes);
-            cc->v_cache[i] = (uint8_t *)calloc(max_seq_len, cc->v_bands.total_bytes);
+            cc->k_cache[i] = (uint8_t *)calloc(max_seq_len, cc->k_blob_bytes);
+            cc->v_cache[i] = (uint8_t *)calloc(max_seq_len, cc->v_blob_bytes);
+        }
+        if (getenv("SHANNON_PRIME_VULKAN_DEBUG")) {
+            fprintf(stderr,
+                "[Shannon-Prime Vulkan] blob layout: force_gpu=%d "
+                "k_bytes=%d (cpu=%d) v_bytes=%d (cpu=%d)\n",
+                cc->force_gpu_blob, cc->k_blob_bytes, cc->k_bands.total_bytes,
+                cc->v_blob_bytes, cc->v_bands.total_bytes);
         }
     }
 #else
@@ -969,7 +1038,7 @@ void sp_vulkan_write_k(sp_vulkan_cache_t *cc,
     }
 #ifdef SHANNON_PRIME_VULKAN_ENABLED
     int slot = layer * cc->config.n_heads_kv + head;
-    uint8_t *dest = cc->k_cache[slot] + (size_t)pos * cc->k_bands.total_bytes;
+    uint8_t *dest = cc->k_cache[slot] + (size_t)pos * cc->k_blob_bytes;
     vk_compress_one(cc, k_vec, &cc->k_bands, /*apply_mobius=*/1, dest);
 #else
     (void)cc; (void)layer; (void)head; (void)pos; (void)k_vec;
@@ -985,7 +1054,7 @@ void sp_vulkan_write_v(sp_vulkan_cache_t *cc,
     }
 #ifdef SHANNON_PRIME_VULKAN_ENABLED
     int slot = layer * cc->config.n_heads_kv + head;
-    uint8_t *dest = cc->v_cache[slot] + (size_t)pos * cc->v_bands.total_bytes;
+    uint8_t *dest = cc->v_cache[slot] + (size_t)pos * cc->v_blob_bytes;
     vk_compress_one(cc, v_vec, &cc->v_bands, /*apply_mobius=*/0, dest);
 #else
     (void)cc; (void)layer; (void)head; (void)pos; (void)v_vec;
@@ -1001,7 +1070,7 @@ void sp_vulkan_read_k(const sp_vulkan_cache_t *cc,
     }
 #ifdef SHANNON_PRIME_VULKAN_ENABLED
     int slot = layer * cc->config.n_heads_kv + head;
-    const uint8_t *src = cc->k_cache[slot] + (size_t)pos * cc->k_bands.total_bytes;
+    const uint8_t *src = cc->k_cache[slot] + (size_t)pos * cc->k_blob_bytes;
     vk_decompress_one((sp_vulkan_cache_t *)cc, src, &cc->k_bands, 1, k_out);
 #else
     (void)cc; (void)layer; (void)head; (void)pos; (void)k_out;
@@ -1017,7 +1086,7 @@ void sp_vulkan_read_v(const sp_vulkan_cache_t *cc,
     }
 #ifdef SHANNON_PRIME_VULKAN_ENABLED
     int slot = layer * cc->config.n_heads_kv + head;
-    const uint8_t *src = cc->v_cache[slot] + (size_t)pos * cc->v_bands.total_bytes;
+    const uint8_t *src = cc->v_cache[slot] + (size_t)pos * cc->v_blob_bytes;
     vk_decompress_one((sp_vulkan_cache_t *)cc, src, &cc->v_bands, 0, v_out);
 #else
     (void)cc; (void)layer; (void)head; (void)pos; (void)v_out;
