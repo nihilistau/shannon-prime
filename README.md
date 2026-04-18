@@ -30,7 +30,7 @@ the same VHT2 / Möbius / sqfree implementation.
 
 | Repo | Role | Status |
 |---|---|---|
-| **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + greedy chat working on Llama-3 / Qwen3 (`chat --naive`); optimised single-token decode is shipped with a known logit-magnitude regression being tracked. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
+| **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + prefill + greedy chat with optimised single-token decode all working on Llama-3 / Qwen3, ship + sqfree + sqfree+spinor. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
 | **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Post-decode hook into llama.cpp. Inherits 30+ model architectures via the upstream loader, but the hook surface itself has been a source of integration bugs — every PPL number measured through it carries a footnote. | In production for ship + sqfree paths; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) and the measured-results section below. |
 
 The first published measurements that don't carry the hook-surface
@@ -147,8 +147,9 @@ cmake --build build
 ./build/bin/sp-engine prefill --model dolphin_1b.gguf "The quick brown fox"
 ./build/bin/sp-engine prefill --sqfree --spinor --model dolphin_1b.gguf "..."
 
-# Greedy generation (use --naive while the optimised decode bug is open).
-./build/bin/sp-engine chat --model dolphin_1b.gguf --n-predict 16 --naive "The quick brown fox"
+# Greedy generation through the optimised single-token decode + cache.
+./build/bin/sp-engine chat --model dolphin_1b.gguf --n-predict 16 "The quick brown fox"
+./build/bin/sp-engine chat --sqfree --spinor --model dolphin_1b.gguf --n-predict 16 "..."
 ```
 Full verb list and stage status in [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md).
 

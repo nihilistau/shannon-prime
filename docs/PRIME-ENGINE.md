@@ -43,8 +43,8 @@ correctness regression (see Stage 5b status below).
 | 3d | `logits --pe-mode primepe` | PrimePE-RoPE-ALiBi (composite/prime-tiered lattice, alpha-blended). | ✓ |
 | 4   | `kv_smoke` | KvCache wrapper around `sp_shadow_cache_t` / `sp_sqfree_cache_t`. | ✓ |
 | 5a  | `prefill` | Real RoPE'd K from prefill compressed through KvCache; per-layer K/V correlation reported. | ✓ |
-| 5b  | `chat` | Stateful prefill + decode loop (naive path correct, optimised decode path has a logit-magnitude regression). | partial |
-| 6   | (planned) | Persistent backend KV tensors; debug + ship optimised decode; perplexity verb. | — |
+| 5b  | `chat` | Stateful prefill + decode loop. Optimised single-token decode reads past K/V from the cache, concats with fresh new K/V, attends. | ✓ |
+| 6   | (planned) | Persistent backend KV tensors (avoid the per-step cache→host→graph round-trip); perplexity verb. | — |
 | 7   | (planned) | CUDA / Vulkan backend selection; release packaging. | — |
 
 ## Why a separate engine — the four-bug case
@@ -141,28 +141,56 @@ Measured on real RoPE'd K (CLAUDE.md ship-target: K corr ≥ 0.992):
 Spinor's +0.008–0.010 K-corr lift on the Knight skeleton matches
 the value documented in CLAUDE.md.
 
-## Stage 5b status — chat works, optimised decode pending
+## Stage 5b — chat with greedy decode works
 
 The stateful API
 (`bind_cache` / `prefill` / `decode` / `kv_pos`) is in. The
-`chat` verb does greedy generation. Two paths:
+`chat` verb does greedy generation through the optimised
+single-token decode graph: it reads past K/V from the bound
+KvCache as input tensors, concats with the freshly-projected new
+K/V along the position axis, runs attention over `[past_n + 1]`
+keys, writes the new K/V back to the cache, and emits logits.
 
-* **`chat --naive`** — re-runs `forward_full` over the running
-  prefix each step. Slow (O(n²) total) but provably correct.
-  Smoke test:
-  > `./sp-engine chat --model dolphin_1b.gguf --n-predict 16 --naive "The quick brown fox"`  
-  > → `"The quick brown fox jumps over the lazy dog. Here's a breakdown of the sentence: - "`
-* **`chat`** (default) — uses the optimised single-token `decode`
-  graph that reads past K/V from the cache as input tensors,
-  concats with the freshly-projected new K/V along the position
-  axis, runs attention over `[past_n + 1]` keys. Currently
-  produces output logits at ~half the magnitude of `forward_full`
-  at the same position, even with a near-lossless 8-bit cache.
-  Structural checks all pass (F32 dtypes, `[hd, n_kv, *]` shapes,
-  `ggml_concat` dim 2, GQA index math matches Llama-3 head→kv_head
-  mapping). Bug is in `build_block_decode`'s graph; localising it
-  needs a per-layer K diff against `forward_full` at the same
-  position. Tracked in source as a `FIXME(stage 5b)`.
+Smoke tests on Dolphin-1B and Qwen3-8B-Q8 (greedy, n_predict=20):
+
+> `./sp-engine chat --model dolphin_1b.gguf --n-predict 20 "The quick brown fox"`  
+> → `"The quick brown fox jumps over the lazy dog. The sentence \"The quick brown fox jumps over the lazy dog.\" is"`
+
+> `./sp-engine chat --sqfree --spinor --model dolphin_1b.gguf --n-predict 20 "..."`  
+> → `"...What is the correct order of the sentence? To determine the correct order"`
+
+> `./sp-engine chat --model Qwen3-8B-Q8_0.gguf --n-predict 20 "..."`  
+> → `"...This sentence is a well-known pangram. It is used to test"`
+
+`chat --naive` (re-runs `forward_full` over the running prefix
+each step) remains as a slower-but-trivially-correct fallback;
+it now produces identical output to the optimised path.
+
+### The decode bug we hunted (post-mortem)
+
+The first cut of `decode` produced logits at ~half the magnitude
+of `forward_full` at the same position, even with a near-lossless
+8-bit cache. Captured layer-0 K matched at correlation 1.0 against
+`forward_full`'s K, and the K_full data after concat matched too —
+which made the bug confusing. Captured V was smaller than expected,
+and the magnitude of the freshly-projected V differed *between two
+forward_full calls on overlapping prefixes*, which was the tell.
+
+Root cause: V at the projection capture point is a `ggml_reshape_3d`
+**view** over the `mul_mat` output and does not own a buffer.
+`ggml_set_output` on a view does not pin the underlying source buffer
+through subsequent ops, so the gallocr was repurposing it during the
+GQA broadcast / concat — corrupting both the captured V and the V
+data the attention op actually consumed. K was unaffected because it
+comes out of `ggml_rope_ext` (a real op output, own buffer).
+
+Fix: materialise V via `ggml_cont` once, before the capture point,
+and reuse the materialised tensor for both the capture and the
+downstream concat / GQA path. Applied symmetrically in both
+`build_block` (forward_full) and `build_block_decode`. The same
+fix doubles as a stability improvement for stage 5a's `prefill`
+verb, where per-layer V capture was returning data that depended
+on what other graphs had run since.
 
 ## Building (Windows / MinGW)
 
