@@ -32,6 +32,7 @@ the same VHT2 / Möbius / sqfree implementation.
 |---|---|---|
 | **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + prefill + greedy chat with optimised single-token decode all working on Llama-3 / Qwen3, ship + sqfree + sqfree+spinor. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
 | **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Post-decode hook into llama.cpp. Inherits 30+ model architectures via the upstream loader, but the hook surface itself has been a source of integration bugs — every PPL number measured through it carries a footnote. | In production for ship + sqfree paths; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) and the measured-results section below. |
+| **[shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)** | ComfyUI custom nodes that compress + cache cross-attention K/V in Wan 2.1 / 2.2 video models. Cross-attention from text embeddings is identical across diffusion timesteps — compute once, compress, reconstruct. | In production: 1.20× cross-attention speedup at 0.9984 output correlation on Wan 2.2 14B. See [docs/INTEGRATION-COMFYUI.md](docs/INTEGRATION-COMFYUI.md). |
 
 The first published measurements that don't carry the hook-surface
 footnote will come from `shannon-prime-engine` when the optimised
@@ -112,11 +113,16 @@ shannon-prime-repos/                  ← parent dir holding all three
 │   │                                  prefill, chat
 │   └── CMakeLists.txt                CMake + Ninja, optional CUDA/Vulkan
 │
-└── shannon-prime-llama/              ← SIBLING: llama.cpp post-decode hook
-    │                                    Inherits 30+ archs from llama.cpp.
-    │                                    See docs/INTEGRATION-LLAMA.md.
-    ├── lib/shannon-prime/            git submodule → this repo
-    └── src/llama-shannon-prime.{h,cpp}  Hook implementation
+├── shannon-prime-llama/              ← SIBLING: llama.cpp post-decode hook
+│   │                                    Inherits 30+ archs from llama.cpp.
+│   │                                    See docs/INTEGRATION-LLAMA.md.
+│   ├── lib/shannon-prime/            git submodule → this repo
+│   └── src/llama-shannon-prime.{h,cpp}  Hook implementation
+│
+└── shannon-prime-comfyui/            ← SIBLING: ComfyUI custom nodes for
+    │                                    Wan 2.1/2.2 cross-attention caching.
+    │                                    See docs/INTEGRATION-COMFYUI.md.
+    └── shannon_prime_comfyui*.py     ShannonPrimeWanCache + Sqfree variants
 ```
 
 ## Documentation
