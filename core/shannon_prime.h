@@ -365,6 +365,15 @@ typedef struct {
     float              *pad_scratch;   // pad_dim floats
     float              *coeff_scratch; // pad_dim floats
     float              *pred_scratch;  // n_res floats
+
+    // Optional: ship-path-style Möbius reorder of the Knight skeleton
+    // before band quantisation. Opt-in via SHANNON_PRIME_SQFREE_SKEL_MOBIUS=1
+    // at init. The mask is built at length sk_k and is a pure permutation
+    // of the already-extracted skeleton; distinct from the Knight-CSR
+    // predictor's Möbius-function-based μ values (those are always on).
+    bool                use_skel_mobius;
+    sp_mobius_mask_t    skel_mobius_mask;
+    float              *skel_mobius_scratch; // sk_k floats
 } sp_sqfree_cache_t;
 
 int  sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,

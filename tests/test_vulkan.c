@@ -152,6 +152,22 @@ int main(void) {
                     qout[i] = 0.0f;
                 }
                 int rc = sp_vulkan_diag_band_roundtrip(cc, which, qin, qout, hd);
+
+                // CPU reference: same inputs through sp_band_quantize +
+                // sp_band_dequantize. Tells us whether the GPU-side corr is
+                // at or below the inherent quant-floor on this random data.
+                sp_band_config_t bc_cpu;
+                int default_k_bits[] = {5, 5, 4, 3};
+                int default_v_bits[] = {3};
+                if (which == 0) sp_band_config_init(&bc_cpu, hd, 4, default_k_bits);
+                else            sp_band_config_init(&bc_cpu, hd, 1, default_v_bits);
+                uint8_t *buf = (uint8_t *)malloc(bc_cpu.total_bytes);
+                float *cpuout = (float *)malloc(hd * sizeof(float));
+                sp_band_quantize(qin, buf, &bc_cpu);
+                sp_band_dequantize(buf, cpuout, &bc_cpu);
+                float cpu_corr = sp_correlation_f32(qin, cpuout, hd);
+                free(buf); free(cpuout);
+
                 if (rc == 0) {
                     double max_err = 0.0;
                     for (int i = 0; i < hd; i++) {
@@ -159,9 +175,10 @@ int main(void) {
                         if (e > max_err) max_err = e;
                     }
                     float corr = sp_correlation_f32(qin, qout, hd);
-                    printf("  band_roundtrip %s: max_err=%.4f corr=%.4f\n",
+                    printf("  band_roundtrip %s: GPU max_err=%.4f corr=%.4f"
+                           "  CPU corr=%.4f (reference)\n",
                            which == 0 ? "K (4 bands 5,5,4,3)" : "V (1 band 3-bit)",
-                           max_err, corr);
+                           max_err, corr, cpu_corr);
                 }
                 free(qin); free(qout);
             }

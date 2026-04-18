@@ -431,6 +431,33 @@ int sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
     sc->coeff_scratch = (float *)malloc(sc->pad_dim * sizeof(float));
     sc->pred_scratch  = (float *)malloc(sc->mask.n_res * sizeof(float));
 
+    // Optional skeleton-level Möbius reorder (ship-path style, distinct
+    // from the Knight-CSR predictor's always-on μ usage). Gate via env
+    // so the default sqfree path is unchanged.
+    sc->use_skel_mobius = false;
+    sc->skel_mobius_scratch = NULL;
+    // Enable via either the specific env var or the top-level
+    // SHANNON_PRIME_MOBIUS=1 — the latter is what users expect to compose
+    // with SHANNON_PRIME_SQFREE=1. Prior to this commit MOBIUS was
+    // silently ignored when SQFREE was on; now it maps to skeleton-level
+    // reorder of the banded skeleton. The Knight-CSR μ predictor is
+    // always on independent of these envs.
+    const char *skel_mob_env = getenv("SHANNON_PRIME_SQFREE_SKEL_MOBIUS");
+    const char *mob_env      = getenv("SHANNON_PRIME_MOBIUS");
+    bool enable = (skel_mob_env && skel_mob_env[0] == '1')
+               || (mob_env      && mob_env[0]      == '1');
+    if (enable) {
+        if (sp_mobius_mask_init(&sc->skel_mobius_mask, sc->mask.sk_k) == 0) {
+            sc->use_skel_mobius = true;
+            sc->skel_mobius_scratch = (float *)malloc(sc->mask.sk_k * sizeof(float));
+            if (getenv("SHANNON_PRIME_VERBOSE")) {
+                fprintf(stderr, "[Shannon-Prime SQFREE] skeleton Möbius reorder: ON "
+                                "(sk_k=%d, squarefree=%d)\n",
+                        sc->mask.sk_k, sc->skel_mobius_mask.n_squarefree);
+            }
+        }
+    }
+
     return 0;
 }
 
@@ -445,6 +472,10 @@ void sp_sqfree_cache_free(sp_sqfree_cache_t *sc) {
     free(sc->pad_scratch);
     free(sc->coeff_scratch);
     free(sc->pred_scratch);
+    if (sc->use_skel_mobius) {
+        sp_mobius_mask_free(&sc->skel_mobius_mask);
+        free(sc->skel_mobius_scratch);
+    }
     sp_knight_mask_free(&sc->mask);
     sp_vilenkin_free(&sc->vilenkin);
     memset(sc, 0, sizeof(*sc));
@@ -507,8 +538,21 @@ static int sp_sqfree_compress_one(sp_sqfree_cache_t *sc,
         skel_vals[s] = sc->coeff_scratch[sc->mask.skeleton_idx[s]];
     }
 
-    // 4. Band-quantize skeleton
-    sp_band_quantize(skel_vals, write_ptr, bc);
+    // 4. Band-quantize skeleton. Optionally apply ship-path-style Möbius
+    //    reorder on the skeleton vector first so squarefree slots land in
+    //    the high-bit early bands. The CSR predictor below still reads
+    //    skel_vals in the original ordering — the reorder is scoped to
+    //    the band quant/dequant round-trip only.
+    if (sc->use_skel_mobius) {
+        float *reordered = sc->skel_mobius_scratch;
+        const int *ord = sc->skel_mobius_mask.order;
+        for (int i = 0; i < sc->mask.sk_k; i++) {
+            reordered[i] = skel_vals[ord[i]];
+        }
+        sp_band_quantize(reordered, write_ptr, bc);
+    } else {
+        sp_band_quantize(skel_vals, write_ptr, bc);
+    }
     write_ptr += bc->total_bytes;
 
     // 5. Möbius predict + residual quantize
@@ -599,8 +643,21 @@ static void sp_sqfree_reconstruct_one(const sp_sqfree_cache_t *sc,
     float coeffs[SP_MAX_HEAD_DIM * 2];
     memset(coeffs, 0, pd * sizeof(float));
 
-    // 1. Dequantize skeleton
-    sp_band_dequantize(read_ptr, skel_vals, bc);
+    // 1. Dequantize skeleton. If the compress-side applied the
+    //    ship-style Möbius reorder to the skeleton before banding, undo
+    //    the permutation here before scattering back into the full
+    //    coefficient vector — the CSR predictor below expects skel_vals
+    //    in the original Knight ordering.
+    if (sc->use_skel_mobius) {
+        float reordered[SP_MAX_HEAD_DIM * 2];
+        sp_band_dequantize(read_ptr, reordered, bc);
+        const int *ord = sc->skel_mobius_mask.order;
+        for (int i = 0; i < sc->mask.sk_k; i++) {
+            skel_vals[ord[i]] = reordered[i];
+        }
+    } else {
+        sp_band_dequantize(read_ptr, skel_vals, bc);
+    }
     read_ptr += bc->total_bytes;
 
     // Scatter skeleton into full coefficient vector
