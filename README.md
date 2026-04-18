@@ -267,12 +267,16 @@ Use as a pre-bench filter — skip configs with predicted ΔPPL > 5%.
 
 ## License
 
-**AGPLv3** for open-source, academic, and non-proprietary use. Everyone can use
-it and benefit. Derivative works must share alike.
+**AGPLv3** for open-source, academic, and non-proprietary use.
+Everyone can use it and benefit. Derivative works must share alike.
 
-**Commercial license** available for proprietary integration. The commercial
-aspect is secondary — the primary goal is that the work belongs to the commons
-and is protected from closure.
+**Dual License** — the primary goal is that the work belongs to the
+commons and is protected from closure. A commercial license is
+available for proprietary integration.
+
+## Contact
+
+Email: raydaniels@gmail.com
 
 <!-- SP-MEASURED-RESULTS:BEGIN -->
 
