@@ -399,7 +399,25 @@ static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
     if (vk_create_compute_pipeline(vk->device, vk->sm_bquant,   vk->pl_2, &vk->pipe_bquant)   != 0) return -1;
     if (vk_create_compute_pipeline(vk->device, vk->sm_bdequant, vk->pl_2, &vk->pipe_bdequant) != 0) return -1;
 
-    // Buffers — all host-visible coherent
+    // Buffers — all host-visible coherent.
+    //
+    // Known limitation (v1.07): the GPU shaders (`band_quantize.comp`,
+    // `band_dequantize.comp`) use a different on-wire compressed layout
+    // than the CPU `sp_band_quantize` — GPU packs fp32 scale + uint32
+    // stream, CPU packs fp16 scale + uint8 stream. For a typical 4-band
+    // 5,5,4,3 config at hd=128 that's 84 GPU bytes vs 76 CPU bytes. As
+    // long as the full round-trip stays on ONE side the round-trip is
+    // self-consistent, but SHANNON_PRIME_VULKAN_FORCE_GPU currently
+    // routes through the shadow-cache slot (sized to CPU `total_bytes`)
+    // so the extra 8 bytes from the GPU quantiser are silently dropped
+    // on the compress-side memcpy, and the decompress side reads 8 bytes
+    // of uninitialised buffer — producing the 0.62 K-correlation we see
+    // under FORCE_GPU. vilenkin.comp itself is proven bit-exact vs the
+    // CPU reference (`test_vulkan` diagnostic path, max_err ~1e-7).
+    // Fixing this requires either (a) converting the GPU shaders to the
+    // CPU blob layout (fp16 scale via manual uint packing, uint8 output
+    // stream), or (b) widening the shadow-cache slot to max(cpu, gpu).
+    // Tracked separately; FORCE_GPU remains a diagnostic switch for now.
     const int hd = cc->config.head_dim;
     const int bytes_per_float_vec = hd * sizeof(float);
     const int max_quant_bytes =
@@ -529,7 +547,13 @@ static void bq_fill_push(const sp_band_config_t *bc, struct bq_pc *out) {
 // stage — while keeping the small bookkeeping (reorder, bit-pack) on CPU.
 // All four shaders still land on the GPU in their own dispatch via
 // vk_dispatch_all_four, which test-vulkan exercises separately.
-static int vk_vht2_forward_gpu(sp_vulkan_cache_t *cc, float *inout, int hd) {
+// Public diagnostic wrapper — see header comment.
+int sp_vulkan_diag_vht2_forward(sp_vulkan_cache_t *cc, float *inout, int hd) {
+    extern int vk_vht2_forward_gpu(sp_vulkan_cache_t *cc, float *inout, int hd);
+    return vk_vht2_forward_gpu(cc, inout, hd);
+}
+
+int vk_vht2_forward_gpu(sp_vulkan_cache_t *cc, float *inout, int hd) {
     sp_vk_impl_t *vk = &cc->vk;
     memcpy(vk->map_a, inout, (size_t)hd * sizeof(float));
 

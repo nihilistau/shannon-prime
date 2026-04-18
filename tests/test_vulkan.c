@@ -11,6 +11,7 @@
 // the API surface and ensure correct results through the Vulkan abstraction.
 
 #include "../backends/vulkan/shannon_prime_vulkan.h"
+#include "../core/shannon_prime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -100,6 +101,44 @@ int main(void) {
         // Test 4: Memory reporting
         printf("\n== Memory ==\n");
         sp_vulkan_print_memory(cc);
+
+        // Test 5 (diagnostic, only fires when SHANNON_PRIME_VULKAN_FORCE_GPU=1):
+        // GPU vilenkin.comp parity vs CPU sp_vht2_forward_f32. Gated on env
+        // because the default CPU-fallback config makes this check redundant
+        // (same code both sides), and because the GPU path is known to be
+        // low-correlation today and we don't want the default test suite to
+        // red-flag on an opt-in diagnostic.
+        const char * force_gpu = getenv("SHANNON_PRIME_VULKAN_FORCE_GPU");
+        if (force_gpu && force_gpu[0] == '1') {
+            printf("\n== GPU vilenkin.comp parity (diagnostic) ==\n");
+            float *cpu = (float *)malloc(hd * sizeof(float));
+            float *gpu = (float *)malloc(hd * sizeof(float));
+            for (int i = 0; i < hd; i++) {
+                cpu[i] = (float)rand() / (float)RAND_MAX - 0.5f;
+                gpu[i] = cpu[i];
+            }
+            sp_vht2_forward_f32(cpu, hd);
+            int rc = sp_vulkan_diag_vht2_forward(cc, gpu, hd);
+            if (rc != 0) {
+                printf("  [%s] diag_vht2_forward returned %d\n", FAIL, rc);
+                tests_run++;
+            } else {
+                double max_err = 0.0, sum_err = 0.0;
+                for (int i = 0; i < hd; i++) {
+                    double e = fabs((double)cpu[i] - (double)gpu[i]);
+                    if (e > max_err) max_err = e;
+                    sum_err += e;
+                }
+                float corr = sp_correlation_f32(cpu, gpu, hd);
+                printf("  cpu[:8] = %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f\n",
+                       cpu[0], cpu[1], cpu[2], cpu[3], cpu[4], cpu[5], cpu[6], cpu[7]);
+                printf("  gpu[:8] = %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f %+.4f\n",
+                       gpu[0], gpu[1], gpu[2], gpu[3], gpu[4], gpu[5], gpu[6], gpu[7]);
+                printf("  max_err=%.6g mean_err=%.6g corr=%.4f\n",
+                       max_err, sum_err / hd, corr);
+            }
+            free(cpu); free(gpu);
+        }
 
         free(k_orig); free(k_recon);
         free(v_orig); free(v_recon);

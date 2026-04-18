@@ -120,6 +120,13 @@ void sp_vulkan_print_memory(const sp_vulkan_cache_t *cc);
 // Check device capabilities (shared memory size, max workgroup, etc.)
 int sp_vulkan_check_device(const sp_vulkan_cache_t *cc);
 
+// Diagnostic: dispatch only the vilenkin.comp stage on the GPU for one
+// vector. Used by tests to isolate shader correctness from the rest of
+// the pipeline (band quant, Möbius). `inout` is a host pointer with `hd`
+// floats; replaced in-place with the GPU-computed VHT2-forward result.
+// Returns 0 on success, negative on Vulkan / device error.
+int sp_vulkan_diag_vht2_forward(sp_vulkan_cache_t *cc, float *inout, int hd);
+
 #ifdef __cplusplus
 }
 #endif
