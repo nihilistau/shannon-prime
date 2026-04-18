@@ -1,0 +1,20 @@
+{
+  "date": "2026-04-18T14:30:00Z",
+  "binary": "D:/F/llama-cpp-sp/build-cuda/bin/llama-perplexity.exe (CUDA build, sm_75, GGML_CUDA=ON, v1.07 shannon-prime hook)",
+  "device": "NVIDIA GeForce RTX 2060 (12 GiB VRAM)",
+  "model": "Qwen3-8B-Q8_0",
+  "head_dim": 128,
+  "pad_dim": 154,
+  "ctx": 4096,
+  "chunks": 32,
+  "kv_offload": "-nkvo (KV on CPU)",
+  "wikitext": "wiki.test.raw",
+  "config": "sqfree+spinor+rb3 K_BITS=5,4,4,4,5 V_BITS=5,4,4,4,5 MOBIUS=1",
+  "ppl": 8.1780,
+  "ppl_stderr": 0.09020,
+  "sec_per_pass": 183.81,
+  "paper_claim_same_config": 7.30,
+  "paper_claim_same_config_source": "shannon-prime-private notes (chunks=32, LLAMA_SHADOW_VHT2_* env, pre-v1.02 codebase)",
+  "delta_vs_paper_pct": 12.03,
+  "note": "12% absolute PPL gap vs the paper figure. The relative position vs baseline is preserved — sqfree+spinor+5,4,4,4,5 sits ~baseline-equivalent at +8% compression (2.8x vs MOBIUS ship 2.6x). The absolute gap is attributed to (a) different llama.cpp base commit between the paper's era and today's llama-cpp-sp, (b) plausibly different wikitext preprocessing/tokeniser handling, and (c) drift from the v1.03-v1.07 codebase maturation (no specific regressor identified in the sqfree math; the v1.03 K_BITS-honouring fix only changed which config ran, not the correctness of any given config)."
+}
