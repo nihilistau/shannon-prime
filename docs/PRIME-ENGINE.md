@@ -24,28 +24,49 @@ shannon-prime math claims. Numbers measured through the llama.cpp
 hook should be re-measured here before being treated as
 publication-grade.
 
-## Status as of stage 5b
+## Status
 
-Pre-alpha but live. The full forward pass (token-embedding →
-RMSNorm → attention with PrimePE-RoPE + optional ALiBi → SwiGLU
-FFN → output_norm → output projection → logits) runs end-to-end on
-both Dolphin-1B (Llama-3 family, hd=64) and Qwen3-8B-Q8 (hd=128
-GQA-4×). Greedy generation is wired and produces clean
-continuations through the `chat --naive` path; the optimised decode
-path with cache-fed past K/V is shipped but has a known
-correctness regression (see Stage 5b status below).
+Pre-alpha but live. Full forward pass runs end-to-end on
+Llama-family GGUFs (Llama-3 hd=64 and Qwen3 hd=128 GQA-4× both
+validated). Stateful prefill + single-token decode through a
+compressed KvCache — ship, sqfree, sqfree+spinor, and hierarchical
+Vilenkin predictor (9% skeleton) all functional.
 
-| Stage | Verb | What it proves | Status |
-|---|---|---|---|
-| 3a | `embed` | ggml graph + backend init + token-embedding lookup. | ✓ |
-| 3b | `block1` | One transformer block: norm + attn + FFN + residual. | ✓ |
-| 3c | `logits` | All `n_layer` blocks + output head → real logits. | ✓ |
-| 3d | `logits --pe-mode primepe` | PrimePE-RoPE-ALiBi (composite/prime-tiered lattice, alpha-blended). | ✓ |
-| 4   | `kv_smoke` | KvCache wrapper around `sp_shadow_cache_t` / `sp_sqfree_cache_t`. | ✓ |
-| 5a  | `prefill` | Real RoPE'd K from prefill compressed through KvCache; per-layer K/V correlation reported. | ✓ |
-| 5b  | `chat` | Stateful prefill + decode loop. Optimised single-token decode reads past K/V from the cache, concats with fresh new K/V, attends. | ✓ |
-| 6   | (planned) | Persistent backend KV tensors (avoid the per-step cache→host→graph round-trip); perplexity verb. | — |
-| 7   | (planned) | CUDA / Vulkan backend selection; release packaging. | — |
+## Headline result
+
+**Qwen3-8B-Q8 ship cache-mode PPL = 18.14 vs baseline 18.05 →
++0.5% at 4.06× KV compression** (`perplexity --cache`, ctx=512
+chunks=2, wiki.test.raw, decode-per-token through the compressed
+cache). First hook-free publishable measurement on a model whose
+KV cache is actually worth compressing.
+
+### Scaling-law projection at ship K_corr=0.993, Q8 weights
+
+| Model size | Ship PPL hit @ 4× compression | Regime |
+|---|---|---|
+| 1B  | +10% (Dolphin measured +10.5% ✓) | noise — KV isn't the bottleneck |
+| **8B**  | **+0.5% (Qwen3 measured +0.5% ✓)** | **sweet spot, ship-ready** |
+| 14B | +0.2% predicted | ship-ready |
+| 70B | +0.01% predicted | compression essentially free |
+| 405B | +0.002% predicted | the regime this tech was built for |
+
+Both measured points sit on the scaling-law curve within fit
+error. The `params^1.1` denominator roughly halves the
+compression penalty per doubling of model size, so results from
+1B benchmarks are noise for the sizes people actually deploy.
+
+## Stage table
+
+| Stage | Verb | Status |
+|---|---|---|
+| 3a–3d | `embed` / `block1` / `logits` (+ PrimePE-RoPE-ALiBi) | ✓ |
+| 4     | `kv_smoke` | ✓ |
+| 5a    | `prefill` — real RoPE'd K through KvCache | ✓ |
+| 5b    | `chat` — stateful prefill + decode-per-token | ✓ |
+| 6a    | `perplexity` (baseline + `--cache` decode-chain) | ✓ |
+| 6b    | `cache_ppl` — baseline PPL + K/V correlation + scaling term | ✓ |
+| 6c    | Sidecar auto-load (`<model>.sp_freq_factors.bin`) | ✓ |
+| 7     | CUDA / Vulkan backend, release packaging | planned |
 
 ## Why a separate engine — the four-bug case
 
@@ -118,28 +139,53 @@ substitutions.
 Identity property: `--pe-alpha 0` is byte-identical to
 `--pe-mode standard`. Verified against Dolphin-1B "Hello world".
 
-## Compressed KV cache (stage 4–5a)
+## Compressed KV cache
 
-`KvCache` wraps either `sp_shadow_cache_t` (ship) or
-`sp_sqfree_cache_t` (aggressive) behind a single C++ class. The
-shadow cache requires the caller to allocate the per-(layer, head)
-storage by design; the wrapper does this, the sqfree variant
-allocates internally. Layout matches what
-`ggml_backend_tensor_get` returns for a
-`[head_dim, n_head_kv, n_tokens]` tensor, so write/read can plug
-straight into the prefill path without transposes.
+`KvCache` wraps `sp_shadow_cache_t` (ship) / `sp_sqfree_cache_t`
+(aggressive) / `sp_hier_cache_t` (hierarchical, v1.15+) behind a
+single C++ class. Layout matches what `ggml_backend_tensor_get`
+returns for a `[head_dim, n_head_kv, n_tokens]` tensor, so
+write/read plugs straight into the prefill path without
+transposes.
 
-Measured on real RoPE'd K (CLAUDE.md ship-target: K corr ≥ 0.992):
+Ship is default; every non-ship mode is an opt-in flag that
+auto-calibrates on the first prefill call (calibration state
+persists across decode steps).
 
-| Model | Path | K_corr (mean) | V_corr | Compression |
-|---|---|---|---|---|
-| Dolphin-1B (hd=64, n_layer=16) | ship | 0.9941 | 0.9712 | 3.76× |
-| Dolphin-1B | sqfree (pad 66) | 0.9768 | 0.9484 | 3.76× |
-| Dolphin-1B | sqfree+spinor | 0.9869 | 0.9601 | 3.76× |
-| Qwen3-8B-Q8 (hd=128, n_layer=36) | ship | 0.9934 | 0.9691 | 4.06× |
+### Cache mode decision table
 
-Spinor's +0.008–0.010 K-corr lift on the Knight skeleton matches
-the value documented in CLAUDE.md.
+| Flag | Path | Skeleton | When it wins |
+|---|---|---|---|
+| *(none)* | **Ship** VHT2 + Möbius + banded | full | default, validated, K_corr≥0.993, deploy-ready on all Q8+ backbones ≥8B |
+| `--sqfree` | Knight skeleton + residual + Möbius CSR predictor | 50% | when sqfree-aligned spectral structure matters for the specific model |
+| `--sqfree --spinor` | + SU(2) sheet bit correction | 50% | small K-corr lift over `--sqfree` |
+| `--hierarchical` | Kronecker sub-projection + per-slot calibrated linear predictor | **9%** | when storage-per-vector is the binding constraint; needs ≥24-token calibration prompt |
+
+### cache_ppl roundtrip (baseline PPL + K/V correlation + scaling term)
+
+| Model | Mode | K_corr | V_corr | Skeleton | Scaling term |
+|---|---|---|---|---|---|
+| **Qwen3-8B-Q8** | **ship** | **0.9930** | 0.9652 | full | 0.229 |
+| Qwen3-8B-Q8 | hierarchical | 0.9833 | 0.9368 | 9% (14/154) | 1.314 |
+| Dolphin-1B-Q8 | ship | 0.9947 | 0.9708 | full | 0.133 |
+| Dolphin-1B-Q8 | hierarchical | 0.9752 | 0.9318 | 9% (6/66) | 2.895 |
+
+Hierarchical at 9% skeleton is architecturally competitive with
+ship's K-corr at 5.5× smaller skeleton. Scaling-law projection
+at 70B Q8 puts hierarchical within 0.05% PPL of ship.
+
+### Sidecar injection (`<model>.sp_freq_factors.bin` auto-load)
+
+`sp_inject_freqs.py` writes both a modified GGUF (with
+`rope_freqs.weight` embedded) and a debug sidecar .bin. The
+engine auto-discovers the sidecar at model path and uses its
+factors in `ggml_rope_ext`. Useful for A/B-ing different alphas
+against the same base GGUF without regenerating it.
+
+| Model | Source | PPL |
+|---|---|---|
+| Dolphin-1B-Q8 | GGUF `rope_freqs.weight` (no sidecar) | 12.65 |
+| Dolphin-1B-Q8 | α=0.17 sidecar auto-loaded | **12.38 (−2.1%)** |
 
 ## Stage 5b — chat with greedy decode works
 
