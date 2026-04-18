@@ -444,6 +444,178 @@ void sp_sqfree_read_k_batch(const sp_sqfree_cache_t *sc,
                             float *k_out);
 
 // ============================================================================
+// Hierarchical Vilenkin Predictor — small skeleton → full reconstruction
+// ============================================================================
+//
+// The Vilenkin basis on sqfree-padded dims has Kronecker product structure:
+//   hd=128 → pad=154 = 2·7·11 → Z/2Z × Z/7Z × Z/11Z
+//
+// The Kronecker sub-projection over the first k primes gives a natural
+// hierarchy of nested skeletons:
+//   Level 1: Z/2Z             →   2 coeffs ( 1.3%)
+//   Level 2: Z/2Z × Z/7Z     →  14 coeffs ( 9.1%)
+//   Level 3: full             → 154 coeffs (100%)
+//
+// The hierarchical predictor stores only the level-2 sub-projection
+// (the "core skeleton") and uses a calibrated linear map W to predict
+// all remaining coefficients:
+//
+//   target_coeffs ≈ W · skeleton_coeffs
+//
+// W is a (n_skeleton × n_target) fp16 matrix, calibrated from warmup
+// KV vectors via ridge regression. It is per-(layer, head) but amortized
+// across all sequence positions.
+//
+// Write path: pad → Vilenkin → extract core skeleton → band quantize
+//             → W·skel predicts targets → quantize residual → store
+// Read path:  dequant skeleton → W·skel → add residual → scatter
+//             → inverse Vilenkin → unpad
+//
+// Storage per position:  n_skeleton × skel_bits + n_target × res_bits
+// Predictor overhead:    n_skeleton × n_target × 2 bytes per (layer, head)
+//
+// For hd=128 (pad=154, 14-skeleton):
+//   Per-position:  14×5 + 140×2 = 350 bits = 43.75 bytes
+//   vs L/2 Knight: 77×4.25 + 77×3 = ~559 bits = ~70 bytes → 1.6× smaller
+//   vs fp16:       154×16 = 2464 bits = 308 bytes → 7.0× compression
+//
+// With aggressive skeleton quantisation (14×4 = 56 bits) and 1-bit residual:
+//   Per-position:  56 + 140 = 196 bits = 24.5 bytes → 12.6× compression
+
+// Maximum hierarchy depth (number of prime factors in pad_dim)
+#define SP_HIER_MAX_LEVELS  5
+
+typedef struct {
+    int     pad_dim;            // Sqfree padded dimension
+    int     n_primes;           // Number of primes in pad_dim factorization
+    int     primes[SP_HIER_MAX_LEVELS]; // The prime factors
+
+    // Core skeleton: Kronecker sub-projection indices.
+    // These are the coefficient indices belonging to the sub-space spanned
+    // by the first `hier_level` primes. Model-independent — determined
+    // entirely by pad_dim and hier_level.
+    int     hier_level;         // How many primes define the skeleton (1..n_primes-1)
+    int     n_skeleton;         // Number of core skeleton coefficients
+    int    *skeleton_idx;       // [n_skeleton] indices into [0, pad_dim)
+
+    // Target: everything not in the skeleton
+    int     n_target;           // = pad_dim - n_skeleton
+    int    *target_idx;         // [n_target] indices into [0, pad_dim)
+
+    // Calibrated linear predictor: target ≈ W · skeleton
+    // W is stored in row-major order: W[t * n_skeleton + s]
+    // where t is the target index and s is the skeleton index.
+    // NULL before calibration; set to fp32 after calibrate_end.
+    // (Future: quantise to fp16 for storage efficiency.)
+    float  *W;                  // [n_target × n_skeleton] or NULL
+    bool    calibrated;         // true after successful calibrate_end
+
+    // Calibration accumulators (transient, freed after calibrate_end)
+    bool    calibrating;
+    double *calib_XtX;          // [n_skeleton × n_skeleton] Σ skeleton·skeleton^T
+    double *calib_XtY;          // [n_skeleton × n_target]   Σ skeleton·target^T
+    int     calib_n;            // number of vectors fed
+
+    // Band quantisation for the core skeleton
+    sp_band_config_t skel_bands;
+
+    // Residual config for predicted targets
+    int     target_res_bits;    // 1-4 bits for target residual (default 2)
+} sp_hier_predictor_t;
+
+// Build the Kronecker sub-projection for the given pad_dim and hierarchy level.
+// hier_level=0 → automatic (picks second-to-last prime grouping).
+// Returns 0 on success.
+int  sp_hier_predictor_init(sp_hier_predictor_t *hp, int pad_dim,
+                            int hier_level, int target_res_bits,
+                            int skel_n_bands, const int *skel_band_bits);
+void sp_hier_predictor_free(sp_hier_predictor_t *hp);
+
+// Calibration: collect Vilenkin-domain vectors, fit W via ridge regression.
+int  sp_hier_calibrate_begin(sp_hier_predictor_t *hp);
+void sp_hier_calibrate_feed(sp_hier_predictor_t *hp, const float *vilenkin_coeffs);
+int  sp_hier_calibrate_end(sp_hier_predictor_t *hp);
+
+// Predict targets from skeleton coefficients.
+// skeleton_vals: [n_skeleton] input
+// target_out:    [n_target] output (predicted values, before residual correction)
+void sp_hier_predict(const sp_hier_predictor_t *hp,
+                     const float *skeleton_vals, float *target_out);
+
+// ============================================================================
+// Hierarchical sqfree cache — maximum compression path
+// ============================================================================
+//
+// Like sp_sqfree_cache_t but uses the hierarchical Vilenkin predictor
+// instead of Knight mask + Möbius CSR. Achieves higher compression by
+// storing a much smaller skeleton (~9% vs 50%) at the cost of a
+// per-(layer,head) predictor matrix.
+//
+// The predictor matrices are calibrated during the first prefill and
+// then frozen. Storage layout per position:
+//   [banded skeleton (skel_bands.total_bytes)]
+//   [residual magnitude (4 bytes)]
+//   [packed residual levels (n_target * target_res_bits / 8)]
+
+typedef struct {
+    sp_config_t          config;
+    sp_vilenkin_basis_t  vilenkin;       // Transform basis for pad_dim
+    int                  pad_dim;
+    int                  max_seq_len;
+
+    // One predictor per (layer, head) slot. Each predictor has its own
+    // calibrated W matrix — different attention heads learn different
+    // spectral patterns, so per-head predictors beat a shared one.
+    int                  n_slots;        // = n_layers × n_heads_kv
+    sp_hier_predictor_t *predictors;     // [n_slots]
+
+    // Compressed storage
+    uint8_t            **k_cache;        // [n_slots][max_seq × bytes_per_pos]
+    uint8_t            **v_cache;
+    int                  k_bytes_per_pos;
+    int                  v_bytes_per_pos;
+
+    // Scratch buffers (allocated once, reused every write/read)
+    float               *pad_scratch;    // pad_dim
+    float               *coeff_scratch;  // pad_dim
+    float               *skel_scratch;   // n_skeleton
+    float               *target_scratch; // n_target
+    float               *pred_scratch;   // n_target
+    uint8_t             *levels_scratch; // n_target (residual quant levels)
+} sp_hier_cache_t;
+
+// Initialize hierarchical cache.
+// hier_level: 0 = automatic, 1..n_primes-1 = explicit.
+// skel_bits_csv: band bit allocation for skeleton (e.g. "5,5" for 2 bands).
+// target_res_bits: 1-4 bits for target residuals.
+int  sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
+                        int max_seq_len, int hier_level,
+                        int skel_n_bands, const int *skel_band_bits,
+                        int target_res_bits);
+void sp_hier_cache_free(sp_hier_cache_t *hc);
+
+// Calibration: feeds Vilenkin-domain vectors to ALL slot predictors.
+// slot = layer * n_heads_kv + head. Caller decides which slot(s) to feed.
+int  sp_hier_cache_calibrate_begin(sp_hier_cache_t *hc);
+void sp_hier_cache_calibrate_feed(sp_hier_cache_t *hc, int slot,
+                                  const float *raw_vec);
+int  sp_hier_cache_calibrate_end(sp_hier_cache_t *hc);
+
+// Write/read
+void sp_hier_cache_write_k(sp_hier_cache_t *hc,
+                           int layer, int head, int pos,
+                           const float *k_vec);
+void sp_hier_cache_write_v(sp_hier_cache_t *hc,
+                           int layer, int head, int pos,
+                           const float *v_vec);
+void sp_hier_cache_read_k(const sp_hier_cache_t *hc,
+                          int layer, int head, int pos,
+                          float *k_out);
+void sp_hier_cache_read_v(const sp_hier_cache_t *hc,
+                          int layer, int head, int pos,
+                          float *v_out);
+
+// ============================================================================
 // Scaling law — K-corr → PPL design rule
 // ============================================================================
 //

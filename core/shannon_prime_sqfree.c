@@ -910,6 +910,588 @@ int sp_sqfree_calibrate_end(sp_sqfree_cache_t *sc) {
 }
 
 // ============================================================================
+// Hierarchical Vilenkin Predictor
+// ============================================================================
+
+// Build Kronecker sub-projection indices. For pad_dim = p1·p2·...·pk,
+// the sub-projection over primes[0..level-1] keeps only indices whose
+// mixed-radix digits for primes[level..k-1] are all zero.
+static int sp_kronecker_sub_indices(int pad_dim, const int *all_primes,
+                                    int n_primes, int level,
+                                    int **out_idx, int *out_count) {
+    if (level <= 0 || level > n_primes) return -1;
+
+    // Sub-dimension = product of kept primes
+    int sub_dim = 1;
+    for (int i = 0; i < level; i++) sub_dim *= all_primes[i];
+
+    int *idx = (int *)malloc(sub_dim * sizeof(int));
+    int count = 0;
+
+    for (int i = 0; i < pad_dim; i++) {
+        // Decompose i in mixed-radix representation:
+        //   i = d0 + p0*(d1 + p1*(d2 + ...))
+        // Check that digits for primes at positions >= level are zero.
+        int remaining = i;
+        bool keep = true;
+        for (int f = 0; f < n_primes; f++) {
+            int digit = remaining % all_primes[f];
+            remaining /= all_primes[f];
+            if (f >= level && digit != 0) {
+                keep = false;
+                break;
+            }
+        }
+        if (keep && count < sub_dim) {
+            idx[count++] = i;
+        }
+    }
+
+    *out_idx = idx;
+    *out_count = count;
+    return 0;
+}
+
+int sp_hier_predictor_init(sp_hier_predictor_t *hp, int pad_dim,
+                           int hier_level, int target_res_bits,
+                           int skel_n_bands, const int *skel_band_bits) {
+    memset(hp, 0, sizeof(*hp));
+    hp->pad_dim = pad_dim;
+
+    // Factorize pad_dim into unique primes
+    int factors[16];
+    int nf = sp_prime_factorize(pad_dim, factors, 16);
+    if (nf < 0) return -1;
+
+    hp->n_primes = 0;
+    int last_p = 0;
+    for (int i = 0; i < nf; i++) {
+        if (factors[i] != last_p) {
+            if (hp->n_primes >= SP_HIER_MAX_LEVELS) return -1;
+            hp->primes[hp->n_primes++] = factors[i];
+            last_p = factors[i];
+        }
+    }
+
+    // Auto level: use second-to-last grouping (leaves one prime for prediction)
+    if (hier_level <= 0 || hier_level >= hp->n_primes) {
+        hier_level = hp->n_primes - 1;
+    }
+    hp->hier_level = hier_level;
+
+    // Build skeleton indices from Kronecker sub-projection
+    if (sp_kronecker_sub_indices(pad_dim, hp->primes, hp->n_primes,
+                                 hier_level, &hp->skeleton_idx,
+                                 &hp->n_skeleton) != 0) {
+        return -1;
+    }
+
+    // Build target indices = complement of skeleton
+    bool *in_skel = (bool *)calloc(pad_dim, sizeof(bool));
+    for (int i = 0; i < hp->n_skeleton; i++) {
+        in_skel[hp->skeleton_idx[i]] = true;
+    }
+    hp->n_target = pad_dim - hp->n_skeleton;
+    hp->target_idx = (int *)malloc(hp->n_target * sizeof(int));
+    int ti = 0;
+    for (int i = 0; i < pad_dim; i++) {
+        if (!in_skel[i]) hp->target_idx[ti++] = i;
+    }
+    free(in_skel);
+
+    // W starts NULL — set by calibration
+    hp->W = NULL;
+    hp->calibrated = false;
+    hp->calibrating = false;
+    hp->calib_XtX = NULL;
+    hp->calib_XtY = NULL;
+    hp->calib_n = 0;
+
+    // Band config for skeleton
+    int default_skel_bits[2] = {5, 5};
+    int nb = (skel_n_bands > 0 && skel_n_bands <= SP_MAX_BANDS)
+             ? skel_n_bands : 2;
+    const int *bits = (skel_n_bands > 0) ? skel_band_bits : default_skel_bits;
+    sp_band_config_init(&hp->skel_bands, hp->n_skeleton, nb, bits);
+
+    hp->target_res_bits = (target_res_bits >= 1 && target_res_bits <= 4)
+                          ? target_res_bits : 2;
+
+    return 0;
+}
+
+void sp_hier_predictor_free(sp_hier_predictor_t *hp) {
+    free(hp->skeleton_idx);
+    free(hp->target_idx);
+    free(hp->W);
+    free(hp->calib_XtX);
+    free(hp->calib_XtY);
+    memset(hp, 0, sizeof(*hp));
+}
+
+int sp_hier_calibrate_begin(sp_hier_predictor_t *hp) {
+    if (hp->calibrating) return -1;
+    int ns = hp->n_skeleton;
+    int nt = hp->n_target;
+
+    hp->calib_XtX = (double *)calloc((size_t)ns * ns, sizeof(double));
+    hp->calib_XtY = (double *)calloc((size_t)ns * nt, sizeof(double));
+    if (!hp->calib_XtX || !hp->calib_XtY) {
+        free(hp->calib_XtX);
+        free(hp->calib_XtY);
+        hp->calib_XtX = NULL;
+        hp->calib_XtY = NULL;
+        return -1;
+    }
+    hp->calib_n = 0;
+    hp->calibrating = true;
+    return 0;
+}
+
+void sp_hier_calibrate_feed(sp_hier_predictor_t *hp,
+                            const float *vilenkin_coeffs) {
+    if (!hp->calibrating) return;
+    int ns = hp->n_skeleton;
+    int nt = hp->n_target;
+
+    // Extract skeleton and target values from the full Vilenkin vector
+    // and accumulate outer products for the normal equations:
+    //   XtX += skeleton · skeleton^T
+    //   XtY += skeleton · target^T
+
+    for (int i = 0; i < ns; i++) {
+        float xi = vilenkin_coeffs[hp->skeleton_idx[i]];
+        // XtX[i][j] += xi * xj
+        for (int j = 0; j < ns; j++) {
+            float xj = vilenkin_coeffs[hp->skeleton_idx[j]];
+            hp->calib_XtX[i * ns + j] += (double)xi * xj;
+        }
+        // XtY[i][t] += xi * yt
+        for (int t = 0; t < nt; t++) {
+            float yt = vilenkin_coeffs[hp->target_idx[t]];
+            hp->calib_XtY[i * nt + t] += (double)xi * yt;
+        }
+    }
+    hp->calib_n++;
+}
+
+// Solve AX = B where A is ns×ns SPD, B is ns×nt, X is ns×nt.
+// In-place: A is modified (Cholesky), solution written to B.
+static int sp_solve_spd(double *A, double *B, int ns, int nt) {
+    // Cholesky factorisation: A = L·L^T
+    for (int j = 0; j < ns; j++) {
+        double sum = A[j * ns + j];
+        for (int k = 0; k < j; k++) {
+            sum -= A[j * ns + k] * A[j * ns + k];
+        }
+        if (sum <= 0.0) return -1; // not positive definite
+        A[j * ns + j] = sqrt(sum);
+        double inv_ljj = 1.0 / A[j * ns + j];
+        for (int i = j + 1; i < ns; i++) {
+            double s = A[i * ns + j];
+            for (int k = 0; k < j; k++) {
+                s -= A[i * ns + k] * A[j * ns + k];
+            }
+            A[i * ns + j] = s * inv_ljj;
+        }
+    }
+
+    // Forward substitution: L · Z = B  →  Z
+    for (int t = 0; t < nt; t++) {
+        for (int i = 0; i < ns; i++) {
+            double s = B[i * nt + t];
+            for (int k = 0; k < i; k++) {
+                s -= A[i * ns + k] * B[k * nt + t];
+            }
+            B[i * nt + t] = s / A[i * ns + i];
+        }
+    }
+
+    // Back substitution: L^T · X = Z  →  X
+    for (int t = 0; t < nt; t++) {
+        for (int i = ns - 1; i >= 0; i--) {
+            double s = B[i * nt + t];
+            for (int k = i + 1; k < ns; k++) {
+                s -= A[k * ns + i] * B[k * nt + t];
+            }
+            B[i * nt + t] = s / A[i * ns + i];
+        }
+    }
+
+    return 0;
+}
+
+int sp_hier_calibrate_end(sp_hier_predictor_t *hp) {
+    if (!hp->calibrating || hp->calib_n < 1) return -1;
+    hp->calibrating = false;
+
+    int ns = hp->n_skeleton;
+    int nt = hp->n_target;
+
+    // Add ridge regularisation: XtX += λI
+    // λ scales with data count to keep the ridge effect consistent
+    double lambda = 1e-4 * hp->calib_n;
+    for (int i = 0; i < ns; i++) {
+        hp->calib_XtX[i * ns + i] += lambda;
+    }
+
+    // Solve (X^T X + λI) W = X^T Y  →  W = (X^T X + λI)^{-1} X^T Y
+    // calib_XtY is overwritten with the solution W
+    if (sp_solve_spd(hp->calib_XtX, hp->calib_XtY, ns, nt) != 0) {
+        // Fallback: Cholesky failed, set W to zero (pure residual mode)
+        memset(hp->calib_XtY, 0, (size_t)ns * nt * sizeof(double));
+        if (getenv("SHANNON_PRIME_VERBOSE")) {
+            fprintf(stderr, "[Shannon-Prime HIER] Cholesky failed, "
+                            "falling back to zero predictor\n");
+        }
+    }
+
+    // Copy W to fp32
+    free(hp->W);
+    hp->W = (float *)malloc((size_t)ns * nt * sizeof(float));
+    for (int i = 0; i < ns * nt; i++) {
+        hp->W[i] = (float)hp->calib_XtY[i];
+    }
+
+    // Free accumulators
+    free(hp->calib_XtX);
+    free(hp->calib_XtY);
+    hp->calib_XtX = NULL;
+    hp->calib_XtY = NULL;
+
+    hp->calibrated = true;
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        // Compute predictor storage
+        int pred_bytes = ns * nt * 2; // fp16
+        fprintf(stderr, "[Shannon-Prime HIER] calibrated: %d skeleton → %d target, "
+                        "W = %d×%d (%.1f KB fp16), n_vectors=%d\n",
+                ns, nt, ns, nt, pred_bytes / 1024.0, hp->calib_n);
+    }
+
+    hp->calib_n = 0;
+    return 0;
+}
+
+void sp_hier_predict(const sp_hier_predictor_t *hp,
+                     const float *skeleton_vals, float *target_out) {
+    if (!hp->W) {
+        // No predictor — zero-fill targets
+        memset(target_out, 0, hp->n_target * sizeof(float));
+        return;
+    }
+
+    int ns = hp->n_skeleton;
+    int nt = hp->n_target;
+
+    // target[t] = Σ_s W[s * nt + t] · skeleton[s]
+    for (int t = 0; t < nt; t++) {
+        float sum = 0.0f;
+        for (int s = 0; s < ns; s++) {
+            sum += hp->W[s * nt + t] * skeleton_vals[s];
+        }
+        target_out[t] = sum;
+    }
+}
+
+// ============================================================================
+// Hierarchical sqfree cache
+// ============================================================================
+
+int sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
+                       int max_seq_len, int hier_level,
+                       int skel_n_bands, const int *skel_band_bits,
+                       int target_res_bits) {
+    memset(hc, 0, sizeof(*hc));
+    hc->config = *cfg;
+    hc->max_seq_len = max_seq_len;
+    hc->pad_dim = sp_sqfree_pad_dim(cfg->head_dim);
+
+    // Init Vilenkin basis
+    int factors[16];
+    int nf = sp_prime_factorize(hc->pad_dim, factors, 16);
+    if (nf < 0) return -1;
+    int seen_primes = 0, last_p = 0;
+    for (int i = 0; i < nf; i++) {
+        if (factors[i] != last_p) { seen_primes++; last_p = factors[i]; }
+    }
+    if (sp_vilenkin_init(&hc->vilenkin, seen_primes) != 0) return -1;
+
+    // Allocate one predictor per slot
+    hc->n_slots = cfg->n_layers * cfg->n_heads_kv;
+    hc->predictors = (sp_hier_predictor_t *)calloc(
+        hc->n_slots, sizeof(sp_hier_predictor_t));
+    if (!hc->predictors) {
+        sp_vilenkin_free(&hc->vilenkin);
+        return -1;
+    }
+
+    for (int s = 0; s < hc->n_slots; s++) {
+        if (sp_hier_predictor_init(&hc->predictors[s], hc->pad_dim,
+                                    hier_level, target_res_bits,
+                                    skel_n_bands, skel_band_bits) != 0) {
+            // Cleanup already-inited
+            for (int j = 0; j < s; j++) sp_hier_predictor_free(&hc->predictors[j]);
+            free(hc->predictors);
+            sp_vilenkin_free(&hc->vilenkin);
+            return -1;
+        }
+    }
+
+    // Compute storage per position (using slot 0 as reference — all identical)
+    sp_hier_predictor_t *hp0 = &hc->predictors[0];
+    int res_bytes = (hp0->n_target * hp0->target_res_bits + 7) / 8;
+    hc->k_bytes_per_pos = hp0->skel_bands.total_bytes + 4 + res_bytes;
+    hc->v_bytes_per_pos = hp0->skel_bands.total_bytes + 4 + res_bytes;
+
+    // Allocate compressed storage
+    hc->k_cache = (uint8_t **)calloc(hc->n_slots, sizeof(uint8_t *));
+    hc->v_cache = (uint8_t **)calloc(hc->n_slots, sizeof(uint8_t *));
+    for (int s = 0; s < hc->n_slots; s++) {
+        hc->k_cache[s] = (uint8_t *)calloc(max_seq_len, hc->k_bytes_per_pos);
+        hc->v_cache[s] = (uint8_t *)calloc(max_seq_len, hc->v_bytes_per_pos);
+    }
+
+    // Scratch buffers (one-time alloc, reused every write/read)
+    hc->pad_scratch    = (float *)malloc(hc->pad_dim * sizeof(float));
+    hc->coeff_scratch  = (float *)malloc(hc->pad_dim * sizeof(float));
+    hc->skel_scratch   = (float *)malloc(hp0->n_skeleton * sizeof(float));
+    hc->target_scratch = (float *)malloc(hp0->n_target * sizeof(float));
+    hc->pred_scratch   = (float *)malloc(hp0->n_target * sizeof(float));
+    hc->levels_scratch = (uint8_t *)malloc(hp0->n_target * sizeof(uint8_t));
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime HIER] pad_dim=%d, skeleton=%d (%.1f%%), "
+                        "target=%d, skel_bands=%d bytes, res_bits=%d\n",
+                hc->pad_dim, hp0->n_skeleton,
+                100.0 * hp0->n_skeleton / hc->pad_dim,
+                hp0->n_target, hp0->skel_bands.total_bytes,
+                hp0->target_res_bits);
+        fprintf(stderr, "[Shannon-Prime HIER] bytes/pos: K=%d V=%d (%.1f× vs fp16)\n",
+                hc->k_bytes_per_pos, hc->v_bytes_per_pos,
+                (float)(cfg->head_dim * 4) / (hc->k_bytes_per_pos + hc->v_bytes_per_pos));
+    }
+
+    return 0;
+}
+
+void sp_hier_cache_free(sp_hier_cache_t *hc) {
+    for (int s = 0; s < hc->n_slots; s++) {
+        sp_hier_predictor_free(&hc->predictors[s]);
+        free(hc->k_cache[s]);
+        free(hc->v_cache[s]);
+    }
+    free(hc->predictors);
+    free(hc->k_cache);
+    free(hc->v_cache);
+    free(hc->pad_scratch);
+    free(hc->coeff_scratch);
+    free(hc->skel_scratch);
+    free(hc->target_scratch);
+    free(hc->pred_scratch);
+    free(hc->levels_scratch);
+    sp_vilenkin_free(&hc->vilenkin);
+    memset(hc, 0, sizeof(*hc));
+}
+
+int sp_hier_cache_calibrate_begin(sp_hier_cache_t *hc) {
+    for (int s = 0; s < hc->n_slots; s++) {
+        if (sp_hier_calibrate_begin(&hc->predictors[s]) != 0) return -1;
+    }
+    return 0;
+}
+
+void sp_hier_cache_calibrate_feed(sp_hier_cache_t *hc, int slot,
+                                  const float *raw_vec) {
+    if (slot < 0 || slot >= hc->n_slots) return;
+    int hd = hc->config.head_dim;
+    int pd = hc->pad_dim;
+
+    // Pad and transform to Vilenkin domain
+    sp_sqfree_pad_f32(raw_vec, hd, hc->pad_scratch, pd);
+    sp_vilenkin_forward_f32(hc->pad_scratch, pd);
+
+    // Feed the Vilenkin-domain vector to this slot's predictor
+    sp_hier_calibrate_feed(&hc->predictors[slot], hc->pad_scratch);
+}
+
+int sp_hier_cache_calibrate_end(sp_hier_cache_t *hc) {
+    int ok = 0;
+    for (int s = 0; s < hc->n_slots; s++) {
+        if (sp_hier_calibrate_end(&hc->predictors[s]) != 0) ok = -1;
+    }
+    return ok;
+}
+
+// Internal: compress one vector through the hierarchical pipeline
+static int sp_hier_compress_one(sp_hier_cache_t *hc, int slot,
+                                const float *vec, uint8_t *out) {
+    int hd = hc->config.head_dim;
+    int pd = hc->pad_dim;
+    sp_hier_predictor_t *hp = &hc->predictors[slot];
+    uint8_t *write_ptr = out;
+
+    // 1. Pad
+    sp_sqfree_pad_f32(vec, hd, hc->pad_scratch, pd);
+
+    // 2. Vilenkin forward
+    sp_vilenkin_forward_f32(hc->pad_scratch, pd);
+
+    // Copy coefficients (pad_scratch will be reused)
+    memcpy(hc->coeff_scratch, hc->pad_scratch, pd * sizeof(float));
+
+    // 3. Extract skeleton coefficients
+    for (int i = 0; i < hp->n_skeleton; i++) {
+        hc->skel_scratch[i] = hc->coeff_scratch[hp->skeleton_idx[i]];
+    }
+
+    // 4. Band-quantize skeleton
+    sp_band_quantize(hc->skel_scratch, write_ptr, &hp->skel_bands);
+    write_ptr += hp->skel_bands.total_bytes;
+
+    // 5. Predict targets from skeleton
+    sp_hier_predict(hp, hc->skel_scratch, hc->pred_scratch);
+
+    // 6. Compute residual = actual - predicted
+    for (int t = 0; t < hp->n_target; t++) {
+        hc->target_scratch[t] = hc->coeff_scratch[hp->target_idx[t]]
+                               - hc->pred_scratch[t];
+    }
+
+    // 7. Residual magnitude
+    float mag = 0.0f;
+    for (int t = 0; t < hp->n_target; t++) {
+        mag += fabsf(hc->target_scratch[t]);
+    }
+    mag /= (float)hp->n_target;
+    if (mag < 1e-12f) mag = 1e-12f;
+    memcpy(write_ptr, &mag, 4);
+    write_ptr += 4;
+
+    // 8. Quantize residuals (levels_scratch is pre-allocated on hc)
+    int n_res = hp->n_target;
+    int nbits = hp->target_res_bits;
+    sp_quantize_residual(hc->target_scratch, n_res, nbits, mag,
+                         hc->levels_scratch);
+
+    // 9. Pack residual bits
+    int res_bytes = (n_res * nbits + 7) / 8;
+    memset(write_ptr, 0, res_bytes);
+    for (int i = 0; i < n_res; i++) {
+        int bit_off = i * nbits;
+        write_ptr[bit_off / 8] |= (hc->levels_scratch[i] << (bit_off % 8));
+        if ((bit_off % 8) + nbits > 8 && (bit_off / 8 + 1) < res_bytes) {
+            write_ptr[bit_off / 8 + 1] |= (hc->levels_scratch[i] >> (8 - bit_off % 8));
+        }
+    }
+    write_ptr += res_bytes;
+    return (int)(write_ptr - out);
+}
+
+// Internal: reconstruct one vector from hierarchical compressed bytes
+static void sp_hier_reconstruct_one(const sp_hier_cache_t *hc, int slot,
+                                    const uint8_t *in, float *vec_out) {
+    int hd = hc->config.head_dim;
+    int pd = hc->pad_dim;
+    const sp_hier_predictor_t *hp = &hc->predictors[slot];
+    const uint8_t *read_ptr = in;
+
+    // Use non-const scratch pointers (safe — callers serialize)
+    float *skel  = ((sp_hier_cache_t *)hc)->skel_scratch;
+    float *pred  = ((sp_hier_cache_t *)hc)->pred_scratch;
+    float *coeffs = ((sp_hier_cache_t *)hc)->coeff_scratch;
+
+    // 1. Dequantize skeleton
+    sp_band_dequantize(read_ptr, skel, &hp->skel_bands);
+    read_ptr += hp->skel_bands.total_bytes;
+
+    // 2. Predict targets from skeleton
+    sp_hier_predict(hp, skel, pred);
+
+    // 3. Read residual magnitude
+    float mag;
+    memcpy(&mag, read_ptr, 4);
+    read_ptr += 4;
+
+    // 4. Dequantize residuals (levels_scratch is pre-allocated on hc)
+    int n_res = hp->n_target;
+    int nbits = hp->target_res_bits;
+    int res_bytes = (n_res * nbits + 7) / 8;
+    uint8_t *levels = ((sp_hier_cache_t *)hc)->levels_scratch;
+    int L = 1 << nbits;
+    for (int i = 0; i < n_res; i++) {
+        int bit_off = i * nbits;
+        int val = (read_ptr[bit_off / 8] >> (bit_off % 8));
+        if ((bit_off % 8) + nbits > 8 && (bit_off / 8 + 1) < res_bytes) {
+            val |= (read_ptr[bit_off / 8 + 1] << (8 - bit_off % 8));
+        }
+        levels[i] = (uint8_t)(val & (L - 1));
+    }
+
+    float *residual = ((sp_hier_cache_t *)hc)->target_scratch;
+    sp_dequantize_residual(levels, n_res, nbits, mag, residual);
+
+    // 5. Reconstruct full coefficient vector
+    memset(coeffs, 0, pd * sizeof(float));
+    // Scatter skeleton
+    for (int i = 0; i < hp->n_skeleton; i++) {
+        coeffs[hp->skeleton_idx[i]] = skel[i];
+    }
+    // Scatter predicted + residual to target positions
+    for (int t = 0; t < hp->n_target; t++) {
+        coeffs[hp->target_idx[t]] = pred[t] + residual[t];
+    }
+
+    // 6. Inverse Vilenkin
+    sp_vilenkin_forward_f32(coeffs, pd); // self-inverse
+
+    // 7. Unpad
+    sp_sqfree_unpad_f32(coeffs, vec_out, hd);
+}
+
+void sp_hier_cache_write_k(sp_hier_cache_t *hc,
+                           int layer, int head, int pos,
+                           const float *k_vec) {
+    if (pos < 0 || pos >= hc->max_seq_len) return;
+    int slot = layer * hc->config.n_heads_kv + head;
+    if (slot < 0 || slot >= hc->n_slots) return;
+    sp_hier_compress_one(hc, slot, k_vec,
+                         hc->k_cache[slot] + pos * hc->k_bytes_per_pos);
+}
+
+void sp_hier_cache_write_v(sp_hier_cache_t *hc,
+                           int layer, int head, int pos,
+                           const float *v_vec) {
+    if (pos < 0 || pos >= hc->max_seq_len) return;
+    int slot = layer * hc->config.n_heads_kv + head;
+    if (slot < 0 || slot >= hc->n_slots) return;
+    sp_hier_compress_one(hc, slot, v_vec,
+                         hc->v_cache[slot] + pos * hc->v_bytes_per_pos);
+}
+
+void sp_hier_cache_read_k(const sp_hier_cache_t *hc,
+                          int layer, int head, int pos,
+                          float *k_out) {
+    if (pos < 0 || pos >= hc->max_seq_len) { memset(k_out, 0, hc->config.head_dim * sizeof(float)); return; }
+    int slot = layer * hc->config.n_heads_kv + head;
+    if (slot < 0 || slot >= hc->n_slots) { memset(k_out, 0, hc->config.head_dim * sizeof(float)); return; }
+    sp_hier_reconstruct_one(hc, slot,
+                            hc->k_cache[slot] + pos * hc->k_bytes_per_pos,
+                            k_out);
+}
+
+void sp_hier_cache_read_v(const sp_hier_cache_t *hc,
+                          int layer, int head, int pos,
+                          float *v_out) {
+    if (pos < 0 || pos >= hc->max_seq_len) { memset(v_out, 0, hc->config.head_dim * sizeof(float)); return; }
+    int slot = layer * hc->config.n_heads_kv + head;
+    if (slot < 0 || slot >= hc->n_slots) { memset(v_out, 0, hc->config.head_dim * sizeof(float)); return; }
+    sp_hier_reconstruct_one(hc, slot,
+                            hc->v_cache[slot] + pos * hc->v_bytes_per_pos,
+                            v_out);
+}
+
+// ============================================================================
 // Scaling law
 // ============================================================================
 
