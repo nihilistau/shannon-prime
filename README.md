@@ -10,12 +10,12 @@ structure that RoPE imprints on key vectors. The single transform is **VHT2**
 Walsh-Hadamard Transform. At power-of-2 head_dim it reduces to the WHT
 butterfly scaled by 1/√2 per stage (self-inverse, no 1/N needed); at
 sqfree-padded dimensions it factors across small primes {2, 3, 5, 7, 11} and
-unlocks the Möbius predictor + SU(2) spinor sheet bit for aggressive 3.3×
+unlocks the Möbius predictor + SU(2) spinor sheet bit for aggressive 2.8×
 compression on Q8+ backbones.
 
 Ship configuration: **3.4–3.8× total KV compression at <1.25% perplexity cost.**
 The 5/5/4/3 bit allocation beats lossless fp16 by 0.04%. Aggressive config
-(sqfree + spinor): **3.3× at MOBIUS-default quality** on Qwen3-8B Q8 hd=128.
+(sqfree + spinor, 5,4,4,4,5): **2.8× at MOBIUS-default quality** on Qwen3-8B Q8 hd=128.
 
 ```bash
 make test-all   # 187/188 tests across 8 suites (one synthetic-K flake, see CLAUDE.md)
@@ -130,7 +130,13 @@ for step, sigma in enumerate(sigmas):
 |--------|-----|--------|-------------|
 | MOBIUS default 5/5/5/5/5 | 7.31 | 0.999 | 2.6× |
 | K+μ+3bit+spinor 5/4/4/4/5 | 7.30 | 0.988 | 2.8× |
-| K+μ+3bit+spinor 3/3/3/3/3 | 7.32 | 0.972 | 3.3× |
+| ~~K+μ+3bit+spinor 3/3/3/3/3~~ | ~~7.32~~ | ~~0.972~~ | ~~3.3×~~ |
+
+> Retracted: the 3/3/3/3/3 row was measured before the v1.03 fix to
+> `sp_sqfree_cache_init`. Pre-fix, that call hard-coded 5,4,4,4,5 and
+> silently ignored K_BITS, so the "3,3,3,3,3" run was actually running
+> 5,4,4,4,5. Post-fix, true 3/3/3/3/3 on the Knight skeleton is catastrophic.
+> The effective Pareto point is **5,4,4,4,5 at 2.8×**.
 
 ### Scaling law
 ```

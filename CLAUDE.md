@@ -8,7 +8,7 @@ Transform (VHT2)** — a staged, orthonormal generalization of the Walsh-Hadamar
 Transform that extends cleanly to non-power-of-2 dimensions. VHT2 composes
 with Möbius-ordered coefficient reordering and per-band quantization to deliver
 3.4–3.8× KV compression at <1.25% PPL cost in the ship configuration, or up
-to 3.3× at equivalent quality on Q8+ backbones via the sqfree+spinor aggressive
+to 2.8× at equivalent quality on Q8+ backbones via the sqfree+spinor aggressive
 variant of the same pipeline.
 
 **VHT2 with p = 2 is the Walsh-Hadamard Transform.** Everywhere in the code —
@@ -28,7 +28,7 @@ spectral structure that underpins the Möbius predictor.
 - Production-validated on desktop (Qwen3-8B), mobile (Dolphin 1B / S22 Ultra),
   and video gen (Wan 2.2 TI2V-5B / ComfyUI)
 - Ship config: 3.4–3.8× KV compression at <1.25% PPL cost
-- Aggressive config (sqfree+spinor on Q8+ @ hd=128): 3.3× at MOBIUS-default quality
+- Aggressive config (sqfree+spinor on Q8+ @ hd=128, 5,4,4,4,5): 2.8× at MOBIUS-default quality
 
 ## Two Configurations of the Same Pipeline
 
@@ -55,7 +55,13 @@ Read:  Load → Band dequant skeleton → Möbius predict → Spinor correct
 Uses the same VHT2 transform on a sqfree-padded dimension so the Möbius
 predictor gets r = 0.40–0.58 (vs ≈ 0 on pure power-of-2). The spinor bit is
 the SU(2) double-cover correction for the causal-mask boundary. On Qwen3-8B Q8
-hd=128: PPL 7.32 @ 3.3× (matches MOBIUS default 7.31 @ 2.6×, +27% compression).
+hd=128 at 5,4,4,4,5: PPL matches MOBIUS default at +8% compression (2.8× vs
+2.6×). A **pre-v1.03 bug** in `sp_sqfree_cache_init` hard-coded the 5-band
+5,4,4,4,5 allocation and silently ignored caller K_BITS, which made an earlier
+"3,3,3,3,3 @ 3.3× / PPL 7.32" measurement appear — it was actually running
+5,4,4,4,5. The fix that made K_BITS take effect (v1.03, `47a2c0b`) exposed
+that true 3,3,3,3,3 on the Knight skeleton is catastrophic (PPL 16–43 on
+Qwen3-8B ctx=2048 chunks=2). The real Pareto point is 5,4,4,4,5.
 
 **Q8+ feature.** On Q3 and below, scaling-law γ=1.5 on weight precision says
 the spinor's 1-bit correction is washed out by W-matrix quantization noise;
@@ -102,6 +108,11 @@ make test-sqfree  # Sqfree + spinor path (PyTorch, 69 tests)
    is already normalised by 1/√p.
 2. **Möbius reorder + unreorder = identity**. Error exactly 0.
 3. **3-bit floor on any band**. 2-bit is catastrophic. Never go below 3.
+   Specifically: 2-bit on the *first* bands (which quantise the highest-energy
+   VHT2 coefficients) kills PPL on Qwen3-8B (~270–430 vs baseline ~8.7). 2-bit
+   on *tail* bands after a 3+ anchor is survivable but still Pareto-dominated
+   by the 5-band 5/4/4/4/5 and 3/3/3/3/3 torus-aligned sqfree defaults
+   (`v1.06` ran the full 10-band sweep; see `logs/qwen3_band_anchor_*.log`).
 4. **V vectors get flat quantization** (no banding) in self-attention. In
    cross-attention both K and V get matching banded allocation.
 5. **K gets Möbius reorder, V does not (self-attention). Both get reorder
@@ -142,6 +153,17 @@ separately and needs RenderDoc on the target GPU.
   torus-aligned 5-band allocation where edge bands (DC + high-freq structural
   anchors) get more bits than the middle interpolation bands, matching the
   variance profile of the Knight-ranked skeleton.
+
+- **10-band is not a winning topology**, despite v1.03's infrastructure
+  (`SP_MAX_BANDS=16`, `sp_band_span`, `tools/sp_auto_bands.py`,
+  `SHANNON_PRIME_DUMP_VILENKIN`) supporting it. Measured on Qwen3-8B Q8 at
+  ctx=4096 chunks=8: 10×3 uniform PPL=11.83, 10×2 uniform PPL=428.78
+  (catastrophic), 10×(4,4,4,4,4,3,3,3,3,3) PPL=10.08 — all Pareto-dominated
+  by the 5-band 5/4/4/4/5 (PPL 8.81) and 3/3/3/3/3 (PPL 8.83) defaults.
+  Band-boundary cost on the Knight skeleton exceeds per-band granularity
+  gain once you cross 5 bands. The 10-band support in the code is valid
+  infrastructure (needed for future research + hd=256 pad_dim=330 where the
+  spectrum has more resolvable structure), not a recommended config.
 
 - **3-bit residual** is the Shannon saturation point. The μ-inversion residual
   distribution has ~8 meaningful quantization levels. Measured:
@@ -284,7 +306,13 @@ When `SQFREE=1`:
 |--------|-----|--------|-------------|
 | MOBIUS default 5/5/5/5/5 | 7.31 | 0.999 | 2.6× |
 | K+μ+3bit+spinor 5/4/4/4/5 | 7.30 | 0.988 | 2.8× |
-| K+μ+3bit+spinor 3/3/3/3/3 | 7.32 | 0.972 | 3.3× |
+| ~~K+μ+3bit+spinor 3/3/3/3/3~~ | ~~7.32~~ | ~~0.972~~ | ~~3.3×~~ |
+
+> The 3/3/3/3/3 row above was an artifact of a pre-v1.03 bug where
+> `sp_sqfree_cache_init` silently remapped K_BITS to the 5,4,4,4,5 default.
+> Post-v1.03, true 3/3/3/3/3 on the Knight skeleton is catastrophic (PPL
+> ~16–43 on Qwen3-8B at ctx=2048 chunks=2). The effective sqfree Pareto
+> winner is 5,4,4,4,5 at 2.8×.
 
 ### Scaling law fit
 All 9 calibration points within ±20% of K = 4700.

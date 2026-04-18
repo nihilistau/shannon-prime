@@ -401,6 +401,13 @@ int sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
     sp_band_config_init(&sc->k_bands, sc->mask.sk_k, k_nb, k_bits);
     sp_band_config_init(&sc->v_bands, sc->mask.sk_k, v_nb, v_bits);
 
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime SQFREE] K band bits (%d bands): ", k_nb);
+        for (int i = 0; i < k_nb; i++) fprintf(stderr, "%d%s", k_bits[i], i < k_nb - 1 ? "," : "\n");
+        fprintf(stderr, "[Shannon-Prime SQFREE] sk_k=%d pad_dim=%d n_res=%d\n",
+                sc->mask.sk_k, sc->pad_dim, sc->mask.n_res);
+    }
+
     // Allocate compressed storage
     int n_slots = cfg->n_layers * cfg->n_heads_kv;
     int k_bytes_per_pos = sc->k_bands.total_bytes
