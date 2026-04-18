@@ -127,6 +127,15 @@ int sp_vulkan_check_device(const sp_vulkan_cache_t *cc);
 // Returns 0 on success, negative on Vulkan / device error.
 int sp_vulkan_diag_vht2_forward(sp_vulkan_cache_t *cc, float *inout, int hd);
 
+// Diagnostic: run GPU band_quantize + band_dequantize round-trip on `in`
+// (hd floats) using the band-config layout implied by the cache. Writes
+// the reconstructed vector to `out`. Used to isolate quant-shader
+// correctness from the VHT2/Möbius stages.
+//   which = 0 -> use cc->k_bands
+//   which = 1 -> use cc->v_bands
+int sp_vulkan_diag_band_roundtrip(sp_vulkan_cache_t *cc, int which,
+                                   const float *in, float *out, int hd);
+
 #ifdef __cplusplus
 }
 #endif

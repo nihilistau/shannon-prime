@@ -578,6 +578,49 @@ int sp_vulkan_diag_vht2_forward(sp_vulkan_cache_t *cc, float *inout, int hd) {
     return vk_vht2_forward_gpu(cc, inout, hd);
 }
 
+int sp_vulkan_diag_band_roundtrip(sp_vulkan_cache_t *cc, int which,
+                                   const float *in, float *out, int hd) {
+    sp_vk_impl_t *vk = &cc->vk;
+    const sp_band_config_t *bc = (which == 0) ? &cc->k_bands : &cc->v_bands;
+    (void)hd;
+
+    // Forward: write input to buf_b (quantiser reads buf_b by convention),
+    // dispatch band_quantize → buf_quant, then band_dequantize → buf_a.
+    memcpy(vk->map_b, in, (size_t)cc->config.head_dim * sizeof(float));
+
+    struct bq_pc qpc; bq_fill_push(bc, &qpc);
+
+    VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_OK(vkBeginCommandBuffer(vk->cmd_buf, &bi));
+
+    vkCmdBindPipeline(vk->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_bquant);
+    vkCmdBindDescriptorSets(vk->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            vk->pl_2, 0, 1, &vk->ds_quant_b_to_quant, 0, NULL);
+    vkCmdPushConstants(vk->cmd_buf, vk->pl_2, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(qpc), &qpc);
+    vkCmdDispatch(vk->cmd_buf, 1, 1, 1);
+
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        NULL, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT };
+    vkCmdPipelineBarrier(vk->cmd_buf,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+
+    vkCmdBindPipeline(vk->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_bdequant);
+    vkCmdBindDescriptorSets(vk->cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            vk->pl_2, 0, 1, &vk->ds_dequant_quant_to_a, 0, NULL);
+    vkCmdPushConstants(vk->cmd_buf, vk->pl_2, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(qpc), &qpc);
+    vkCmdDispatch(vk->cmd_buf, 1, 1, 1);
+
+    VK_OK(vkEndCommandBuffer(vk->cmd_buf));
+    if (vk_submit_and_wait(vk) != 0) return -1;
+
+    memcpy(out, vk->map_a, (size_t)cc->config.head_dim * sizeof(float));
+    return 0;
+}
+
 int vk_vht2_forward_gpu(sp_vulkan_cache_t *cc, float *inout, int hd) {
     sp_vk_impl_t *vk = &cc->vk;
     memcpy(vk->map_a, inout, (size_t)hd * sizeof(float));

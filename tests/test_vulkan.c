@@ -138,6 +138,33 @@ int main(void) {
                        max_err, sum_err / hd, corr);
             }
             free(cpu); free(gpu);
+
+            // Band-quant round-trip diagnostic — run band_quantize followed
+            // by band_dequantize on GPU without VHT2/Möbius, for both the K
+            // band config (4-band 5,5,4,3) and the V band config (1-band 3).
+            // Localises whether the 0.63 V correlation is in the quant
+            // shaders themselves or in the surrounding dispatch plumbing.
+            for (int which = 0; which < 2; which++) {
+                float *qin  = (float *)malloc(hd * sizeof(float));
+                float *qout = (float *)malloc(hd * sizeof(float));
+                for (int i = 0; i < hd; i++) {
+                    qin[i]  = (float)rand() / (float)RAND_MAX - 0.5f;
+                    qout[i] = 0.0f;
+                }
+                int rc = sp_vulkan_diag_band_roundtrip(cc, which, qin, qout, hd);
+                if (rc == 0) {
+                    double max_err = 0.0;
+                    for (int i = 0; i < hd; i++) {
+                        double e = fabs((double)qin[i] - (double)qout[i]);
+                        if (e > max_err) max_err = e;
+                    }
+                    float corr = sp_correlation_f32(qin, qout, hd);
+                    printf("  band_roundtrip %s: max_err=%.4f corr=%.4f\n",
+                           which == 0 ? "K (4 bands 5,5,4,3)" : "V (1 band 3-bit)",
+                           max_err, corr);
+                }
+                free(qin); free(qout);
+            }
         }
 
         free(k_orig); free(k_recon);
