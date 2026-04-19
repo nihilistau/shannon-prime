@@ -762,6 +762,13 @@ typedef struct {
     bool     reset_recommended;
     double   calib_p3_sum;
     int      calib_n;
+    // Warm-up gate: while n_samples < warmup_samples, the EMA is
+    // still being seeded (one sample sets it to `ratio` alone, which
+    // for lossy compression is nowhere near 1.0). Suppressing
+    // reset_recommended during this window kills a runaway where
+    // every reset zeros the EMA and the next sample immediately
+    // re-triggers. Default 32 gives ~2 half-lives at alpha=0.05.
+    int      warmup_samples;
 } sp_ricci_sentinel_t;
 
 int  sp_ricci_init(sp_ricci_sentinel_t *rs, const sp_band_config_t *band_cfg,

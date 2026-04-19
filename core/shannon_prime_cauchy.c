@@ -56,6 +56,10 @@ int sp_ricci_init(sp_ricci_sentinel_t *rs, const sp_band_config_t *band_cfg,
 
     rs->calibrated = false;
     rs->reset_recommended = false;
+    // Warm-up gate: 32 samples of EMA bedding in before any reset can
+    // be recommended. Stops the runaway where ricci_reset zeros the
+    // EMA and the very next sample immediately re-fires.
+    rs->warmup_samples = 32;
     return 0;
 }
 
@@ -104,7 +108,7 @@ bool sp_ricci_check(sp_ricci_sentinel_t *rs,
     double e = compute_p3_energy(rs, vht2_coeffs, hd);
     double ratio = e / rs->p3_energy_calibrated;
 
-    // EMA update
+    // EMA update — always runs so the EMA converges during warm-up.
     if (rs->n_samples == 0) {
         rs->p3_ema = ratio;
     } else {
@@ -112,7 +116,19 @@ bool sp_ricci_check(sp_ricci_sentinel_t *rs,
     }
     rs->n_samples++;
 
-    // Check threshold
+    // Warm-up gate: suppress reset_recommended until the EMA has
+    // bedded in. One-sample EMA is essentially the ratio itself —
+    // for lossy compression that's nowhere near 1.0, so an
+    // un-gated check re-fires on the very next sample after every
+    // reset (runaway). With warmup_samples=32 at alpha=0.05, the
+    // EMA is weighted ~80% toward the running mean by the time
+    // the gate opens.
+    if (rs->n_samples <= rs->warmup_samples) {
+        rs->reset_recommended = false;
+        return false;
+    }
+
+    // Threshold check (post-warm-up).
     double drift = fabs(1.0 - rs->p3_ema);
     rs->reset_recommended = (drift > rs->metric_criticality);
     return rs->reset_recommended;
@@ -353,7 +369,7 @@ void sp_cauchy_init(sp_cauchy_ctrl_t *cc, int mode, int fixed_n,
     cc->mode           = mode;
     cc->fixed_n        = (fixed_n > 0) ? fixed_n : 512;
     cc->partial_window = 64;  // default: re-accumulate last 64 tokens
-    cc->last_reset_pos = 0;
+    cc->last_reset_pos = -999999;  // allow first reset immediately
     cc->total_resets   = 0;
     cc->ricci          = ricci;
     cc->mertens        = mertens;
@@ -361,6 +377,17 @@ void sp_cauchy_init(sp_cauchy_ctrl_t *cc, int mode, int fixed_n,
 
 int sp_cauchy_check(sp_cauchy_ctrl_t *cc, int pos) {
     if (cc->mode == 0) return 0;  // off
+
+    // Cooldown gate: no reset within `partial_window` positions of
+    // the last one. Without this the Mertens lookahead (which fires
+    // within 32 steps of every scheduled position, at average gap 16)
+    // plus Ricci drift after EMA zero produce runaway resets —
+    // measured 115 resets in a 510-token chunk, each re-prefill
+    // taking ~5s. Cooldown guarantees resets fire at least
+    // partial_window positions apart, independent of trigger source.
+    if (pos - cc->last_reset_pos < cc->partial_window) {
+        return 0;
+    }
 
     // Mode 1: fixed-N
     if (cc->mode == 1) {
