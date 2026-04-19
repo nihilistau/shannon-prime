@@ -365,6 +365,98 @@ __global__ void kernel_scatter(const float *in, const int *idx,
     if (i < n) out[idx[i]] = in[i];
 }
 
+// Batched scatter: each vec v scatters its own [sk_k] input into its own
+// [pad_dim] slab of output. idx[] is shared across all vecs (same mask).
+// One block per vec, threads cooperate across the sk_k indices.
+__global__ void kernel_scatter_batch(const float *in_base,  int in_stride,
+                                     const int *idx,
+                                     float *out_base,        int out_stride,
+                                     int sk_k,               int n_vecs)
+{
+    int v = blockIdx.x;
+    if (v >= n_vecs) return;
+    const float *in  = in_base  + (size_t)v * in_stride;
+    float       *out = out_base + (size_t)v * out_stride;
+    for (int k = threadIdx.x; k < sk_k; k += blockDim.x) {
+        out[idx[k]] = in[k];
+    }
+}
+
+// Batched reconstruct: coeff[residual_idx[r]] = pred[r] + dev[r] per vec.
+// in_base/dev_base are [n_vecs * n_res], coeff_base is [n_vecs * pad_dim].
+__global__ void kernel_reconstruct_residual_batch(
+    const float *pred_base, const float *dev_base,
+    const int *residual_idx, float *coeff_base,
+    int n_res, int pd, int n_vecs)
+{
+    int v = blockIdx.x;
+    if (v >= n_vecs) return;
+    const float *pred  = pred_base  + (size_t)v * n_res;
+    const float *dev   = dev_base   + (size_t)v * n_res;
+    float       *coeff = coeff_base + (size_t)v * pd;
+    for (int r = threadIdx.x; r < n_res; r += blockDim.x) {
+        coeff[residual_idx[r]] = pred[r] + dev[r];
+    }
+}
+
+// Batched dequantize: per-vec mag drives the step size. levels_base is
+// [n_vecs * n_res], d_mag_base is [n_vecs], dev_base is [n_vecs * n_res].
+__global__ void kernel_dequantize_residual_batch(
+    const uint8_t *levels_base, int n_res, int bits,
+    const float *d_mag_base, float *dev_base, int n_vecs)
+{
+    int v = blockIdx.x;
+    if (v >= n_vecs) return;
+    int   L      = 1 << bits;
+    float center = 0.5f * (float)(L - 1);
+    float mag    = d_mag_base[v];
+    float sat    = mag * (float)bits;
+    float step   = (L > 1) ? (2.0f * sat / (float)(L - 1)) : 0.0f;
+    const uint8_t *levels = levels_base + (size_t)v * n_res;
+    float         *dev    = dev_base    + (size_t)v * n_res;
+    for (int r = threadIdx.x; r < n_res; r += blockDim.x) {
+        dev[r] = (((float)levels[r]) - center) * step;
+    }
+}
+
+// Batched bit-unpack: each vec's packed bytes at a strided offset into
+// the cache slot. One block per vec (so indexing is sequential within
+// a vec's bit stream), threads within the block cooperate over n_res
+// residual positions.
+__global__ void kernel_unpack_levels_batch(
+    const uint8_t *cache_base, int bytes_per_pos,
+    int offset_in_slot, int n_res, int bits,
+    uint8_t *levels_base, int packed_bytes, int n_vecs)
+{
+    int v = blockIdx.x;
+    if (v >= n_vecs) return;
+    const uint8_t *packed = cache_base + (size_t)v * bytes_per_pos + offset_in_slot;
+    uint8_t       *out    = levels_base + (size_t)v * n_res;
+    const uint32_t mask_bits = (1u << bits) - 1u;
+    for (int r = threadIdx.x; r < n_res; r += blockDim.x) {
+        int bit_off = r * bits;
+        uint32_t w = (uint32_t)packed[bit_off / 8] >> (bit_off % 8);
+        if ((bit_off % 8) + bits > 8 && (bit_off / 8 + 1) < packed_bytes) {
+            w |= ((uint32_t)packed[bit_off / 8 + 1]) << (8 - (bit_off % 8));
+        }
+        out[r] = (uint8_t)(w & mask_bits);
+    }
+}
+
+// Gather mag fp32 from each slot's mag offset into a contiguous [n_vecs] array.
+__global__ void kernel_gather_mag_batch(
+    const uint8_t *cache_base, int bytes_per_pos,
+    int mag_offset_in_slot, float *d_mag_out, int n_vecs)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_vecs) return;
+    const uint8_t *src = cache_base + (size_t)v * bytes_per_pos + mag_offset_in_slot;
+    // mag is 4 aligned bytes — memcpy preserves alignment semantics
+    float m;
+    memcpy(&m, src, 4);
+    d_mag_out[v] = m;
+}
+
 // Fused: dev[i] = coeff[residual_idx[i]] - pred[i]. MVP (no spinor).
 // Used only on the write path.
 __global__ void kernel_residual_deviation_mvp(
@@ -597,13 +689,16 @@ int sp_cuda_sqfree_cache_init(sp_cuda_sqfree_cache_t *cc,
     cudaMemsetAsync(cc->d_v_cache, 0, v_total, (cudaStream_t)stream);
 
     // Scratch buffers.
-    cudaMalloc(&cc->d_pad_scratch,   (size_t)pad_dim * sizeof(float));
-    cudaMalloc(&cc->d_coeff_scratch, (size_t)pad_dim * sizeof(float));
-    cudaMalloc(&cc->d_skel_scratch,  (size_t)cc->sk_k * sizeof(float));
-    cudaMalloc(&cc->d_pred_scratch,  (size_t)cc->n_res * sizeof(float));
-    cudaMalloc(&cc->d_dev_scratch,   (size_t)cc->n_res * sizeof(float));
-    cudaMalloc(&cc->d_levels_scratch,(size_t)cc->n_res);
-    cudaMalloc(&cc->d_mag_scratch,   sizeof(float));
+    // Scratch sized for batched reads: the batch path processes up to
+    // max_seq_len positions in one pass so each per-vec scratch needs
+    // n_pos slots. Total ~1.5 MB for pad_dim=154, max_seq=1032 — negligible.
+    cudaMalloc(&cc->d_pad_scratch,   (size_t)pad_dim * max_seq_len * sizeof(float));
+    cudaMalloc(&cc->d_coeff_scratch, (size_t)pad_dim * max_seq_len * sizeof(float));
+    cudaMalloc(&cc->d_skel_scratch,  (size_t)cc->sk_k * max_seq_len * sizeof(float));
+    cudaMalloc(&cc->d_pred_scratch,  (size_t)cc->n_res * max_seq_len * sizeof(float));
+    cudaMalloc(&cc->d_dev_scratch,   (size_t)cc->n_res * max_seq_len * sizeof(float));
+    cudaMalloc(&cc->d_levels_scratch,(size_t)cc->n_res * max_seq_len);
+    cudaMalloc(&cc->d_mag_scratch,   (size_t)max_seq_len * sizeof(float));
 
     fprintf(stderr,
         "[sp-cuda-sqfree] init: hd=%d pad_dim=%d sk_k=%d n_res=%d n_terms=%d "
@@ -794,6 +889,123 @@ static void sp_cuda_sqfree_read_one(const sp_cuda_sqfree_cache_t *cc,
     // 9. Sqfree unpad → d_vec_out
     kernel_sqfree_unpad<<<1, 256, 0, s>>>(cc->d_coeff_scratch,
                                            d_vec_out, hd, pd, 1);
+}
+
+// Internal batched read: reads n_pos contiguous positions for one
+// (layer, head) in a single-per-step kernel dispatch series.
+// Same output format as per-vec read but the entire range is
+// processed in parallel — cuts kernel launch count from ~9*n_pos
+// to ~9 total, which is the step-3 kernel-launch-overhead fix.
+static void sp_cuda_sqfree_read_batch_one(
+    const sp_cuda_sqfree_cache_t *cc,
+    int layer, int head, int start_pos, int n_pos,
+    float *d_out,                    // [n_pos * head_dim] contiguous
+    const sp_band_config_t *bc,
+    const uint8_t *d_cache, int bytes_per_pos)
+{
+    if (n_pos <= 0) return;
+    const int hd    = cc->config.head_dim;
+    const int pd    = cc->pad_dim;
+    const int sk_k  = cc->sk_k;
+    const int n_res = cc->n_res;
+    cudaStream_t s  = (cudaStream_t)cc->stream;
+
+    int slot = layer * cc->config.n_heads_kv + head;
+    const uint8_t *src_base = d_cache
+                            + (size_t)slot * cc->max_seq_len * bytes_per_pos
+                            + (size_t)start_pos * bytes_per_pos;
+
+    // 1. Repack skeleton bytes.
+    //
+    // Each slot's layout is [total_bytes skeleton][4 mag][res_bytes residual]
+    // so stride between vecs = bytes_per_pos, not total_bytes — which is
+    // what sp_cuda_band_dequantize's n_vecs loop assumes. Repack the
+    // contiguous [n_pos][total_bytes] view into d_pad_scratch (reused as
+    // a byte buffer, unused at this stage of the pipeline) via a strided
+    // memcpy, then run the existing batched dequantize kernel.
+    uint8_t *d_skel_bytes = (uint8_t *)cc->d_pad_scratch;
+    cudaMemcpy2DAsync(d_skel_bytes,    (size_t)bc->total_bytes,
+                      src_base,        (size_t)bytes_per_pos,
+                      (size_t)bc->total_bytes, (size_t)n_pos,
+                      cudaMemcpyDeviceToDevice, s);
+
+    // Dequantize all n_pos skeletons in one batch (existing kernel
+    // already takes n_vecs). Input: contiguous [n_pos * total_bytes];
+    // output: [n_pos * sk_k] contiguous fp32.
+    sp_cuda_band_dequantize(d_skel_bytes, cc->d_skel_scratch, bc, n_pos, s);
+
+    // 2. Zero per-vec coeff slabs + scatter skeletons in.
+    cudaMemsetAsync(cc->d_coeff_scratch, 0,
+                    (size_t)pd * n_pos * sizeof(float), s);
+    kernel_scatter_batch<<<n_pos, 128, 0, s>>>(
+        cc->d_skel_scratch, sk_k,
+        cc->d_skeleton_idx,
+        cc->d_coeff_scratch, pd,
+        sk_k, n_pos);
+
+    if (n_res > 0) {
+        // 3. Möbius predict — kernel_mobius_predict takes n_vecs, batches.
+        sp_cuda_mobius_predict(cc->d_skel_scratch,
+                                (float *)cc->d_pred_scratch,
+                                cc->d_csr_offsets, cc->d_csr_skel_slot,
+                                cc->d_csr_mu_sign,
+                                sk_k, n_res, n_pos, s);
+
+        // 4. Gather mag values from each slot into d_mag_scratch[n_pos].
+        {
+            int blk = 128;
+            int grid = (n_pos + blk - 1) / blk;
+            kernel_gather_mag_batch<<<grid, blk, 0, s>>>(
+                src_base, bytes_per_pos, bc->total_bytes,
+                cc->d_mag_scratch, n_pos);
+        }
+
+        // 5. Unpack residual levels for all n_pos in one batched dispatch.
+        int res_bytes = (n_res * cc->residual_bits + 7) / 8;
+        kernel_unpack_levels_batch<<<n_pos, 64, 0, s>>>(
+            src_base, bytes_per_pos, bc->total_bytes + 4,
+            n_res, cc->residual_bits,
+            (uint8_t *)cc->d_levels_scratch, res_bytes, n_pos);
+
+        // 6. Dequantize levels → deviation, batched per-vec mag.
+        kernel_dequantize_residual_batch<<<n_pos, 128, 0, s>>>(
+            cc->d_levels_scratch, n_res, cc->residual_bits,
+            cc->d_mag_scratch, (float *)cc->d_dev_scratch, n_pos);
+
+        // 7. coeff[residual_idx[r]] = pred[r] + dev[r] per vec.
+        kernel_reconstruct_residual_batch<<<n_pos, 128, 0, s>>>(
+            cc->d_pred_scratch, (const float *)cc->d_dev_scratch,
+            cc->d_residual_idx, cc->d_coeff_scratch,
+            n_res, pd, n_pos);
+    }
+
+    // 8. Vilenkin inverse on all n_pos vecs.
+    sp_cuda_vilenkin_inplace(cc->d_coeff_scratch, pd, n_pos,
+                              cc->d_vilenkin_factors, cc->n_factors, s);
+
+    // 9. Sqfree unpad each vec — kernel_sqfree_unpad takes n_vecs.
+    kernel_sqfree_unpad<<<n_pos, 256, 0, s>>>(
+        cc->d_coeff_scratch, d_out, hd, pd, n_pos);
+}
+
+void sp_cuda_sqfree_read_k_batch(const sp_cuda_sqfree_cache_t *cc,
+                                  int layer, int head,
+                                  int start_pos, int n_pos,
+                                  float *d_k_out) {
+    sp_cuda_sqfree_read_batch_one(cc, layer, head, start_pos, n_pos,
+                                    d_k_out, &cc->k_bands,
+                                    (const uint8_t *)cc->d_k_cache,
+                                    cc->bytes_per_pos_k);
+}
+
+void sp_cuda_sqfree_read_v_batch(const sp_cuda_sqfree_cache_t *cc,
+                                  int layer, int head,
+                                  int start_pos, int n_pos,
+                                  float *d_v_out) {
+    sp_cuda_sqfree_read_batch_one(cc, layer, head, start_pos, n_pos,
+                                    d_v_out, &cc->v_bands,
+                                    (const uint8_t *)cc->d_v_cache,
+                                    cc->bytes_per_pos_v);
 }
 
 // Public single-vector API. Ship-path style: one (layer, head, pos) at a time.

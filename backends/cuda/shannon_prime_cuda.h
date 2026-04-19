@@ -214,6 +214,20 @@ void sp_cuda_sqfree_read_v(const sp_cuda_sqfree_cache_t *cc,
                             int layer, int head, int pos,
                             float *d_v_out);
 
+// Batched read: process n_pos contiguous positions for one
+// (layer, head) in a single kernel-dispatch series. Output layout
+// is [n_pos × head_dim] contiguous (vec-major). ~9 total kernel
+// launches vs ~9*n_pos for the per-vec path — the step-3
+// kernel-launch-overhead fix.
+void sp_cuda_sqfree_read_k_batch(const sp_cuda_sqfree_cache_t *cc,
+                                  int layer, int head,
+                                  int start_pos, int n_pos,
+                                  float *d_k_out);
+void sp_cuda_sqfree_read_v_batch(const sp_cuda_sqfree_cache_t *cc,
+                                  int layer, int head,
+                                  int start_pos, int n_pos,
+                                  float *d_v_out);
+
 #ifdef __cplusplus
 }
 #endif
