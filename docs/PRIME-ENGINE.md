@@ -66,7 +66,11 @@ compression penalty per doubling of model size, so results from
 | 6a    | `perplexity` (baseline + `--cache` decode-chain) | ✓ |
 | 6b    | `cache_ppl` — baseline PPL + K/V correlation + scaling term | ✓ |
 | 6c    | Sidecar auto-load (`<model>.sp_freq_factors.bin`) | ✓ |
-| 7     | CUDA / Vulkan backend, release packaging | planned |
+| 6d    | Cauchy decode-chain reset (Mertens-only default) | ✓ (see [CAUCHY-RESET.md](CAUCHY-RESET.md)) |
+| 7a    | CUDA weight offload + forward (`SP_ENGINE_BACKEND=gpu`) | ✓ |
+| 7b    | GPU-resident ship cache (compressed K/V in VRAM) | ✓ |
+| 7c    | GPU-resident sqfree cache + batched read + Knight-mask sync | infrastructure ✓ / real-model PPL validating |
+| 7d    | Vulkan backend, release packaging | planned |
 
 ## Why a separate engine — the four-bug case
 

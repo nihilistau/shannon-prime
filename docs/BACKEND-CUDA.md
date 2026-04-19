@@ -38,6 +38,8 @@ GPU Memory Layout
 
 **`kernel_band_dequantize_simple`:** Inverse of quantize. Unpacks bit-packed integers, scales by fp16 scale factor. If a band's fp16 scale round-trips to a non-finite value (the real origin of the cascading NaN previously handled by the blanket output guard), the kernel zeros that band — the only surviving guard, and it lives at the root cause. Same `head_dim`-anchored iteration as the quantize kernel.
 
+**Sqfree batched read kernels (`shannon_prime_sqfree.cu`).** `sp_cuda_sqfree_read_k_batch` / `_v_batch` process n_pos positions per (layer, head) in a single-per-step kernel dispatch series: `scatter_batch`, `reconstruct_residual_batch`, `dequantize_residual_batch`, `unpack_levels_batch`, `gather_mag_batch`. About 9 launches instead of 9 × n_pos. One caveat: the sqfree cache slot layout is `[total_bytes skeleton][4 mag][res_bytes]` (stride `bytes_per_pos > total_bytes`), while `sp_cuda_band_dequantize` assumes contiguous `total_bytes` strides across n_vecs. A `cudaMemcpy2DAsync` repacks the skeleton bytes into a contiguous buffer (reusing `d_pad_scratch`) before the band dequantise — without it, K_corr collapses from 0.94 to 0.04 on synthetic data.
+
 ## Building
 
 Requires NVIDIA CUDA Toolkit (nvcc):
@@ -57,19 +59,31 @@ Supported architectures: sm_70 (Volta), sm_75 (Turing), sm_80 (Ampere), sm_86 (G
 ```c
 #include "backends/cuda/shannon_prime_cuda.h"
 
-// Init cache on GPU
+// Ship-path cache (4-band K, flat-3 V, power-of-2 hd):
 sp_cuda_cache_t cc;
 sp_cuda_cache_init(&cc, &cfg, max_seq_len, cuda_stream);
 
-// Single-vector operations (decode)
+// Single-vector (decode hot path)
 sp_cuda_write_k(&cc, layer, head, pos, d_k_vec);
 sp_cuda_read_k(&cc, layer, head, pos, d_k_out);
 
-// Batch operations (prefill)
+// Batched (prefill; also the decode read path, with n_pos = kv_len)
 sp_cuda_write_k_batch(&cc, layer, head, start_pos, n_pos, d_k_matrix);
 sp_cuda_read_k_batch(&cc, layer, head, start_pos, n_pos, d_k_out_matrix);
 
-// All pointers are device pointers — no host↔device transfers
+// Sqfree cache (Knight skeleton + residual + Möbius predictor):
+sp_cuda_sqfree_cache_t sc;
+sp_cuda_sqfree_cache_init(&sc, &cfg, max_seq_len, /*residual_bits=*/3,
+                          /*use_spinor=*/0, cuda_stream);
+
+// Per-position write (decode)
+sp_cuda_sqfree_write_k(&sc, layer, head, pos, d_k_vec);
+
+// Batched read — processes all n_pos positions per (layer, head)
+// in ~9 kernel launches instead of 9 × n_pos.
+sp_cuda_sqfree_read_k_batch(&sc, layer, head, start_pos, n_pos, d_k_out);
+
+// All pointers are device pointers — no host↔device transfers.
 ```
 
 ## Memory Overhead

@@ -133,6 +133,7 @@ shannon-prime-repos/                  ← parent dir holding all three
 | [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md) | shannon-prime-engine sibling: stages 3–5, KvCache, PrimePE-RoPE-ALiBi |
 | [docs/TOOLS.md](docs/TOOLS.md) | Command-line tools: benchmark, freq injection, weight compression |
 | [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) | llama.cpp: hook points, API, env vars, GQA support |
+| [docs/CAUCHY-RESET.md](docs/CAUCHY-RESET.md) | Decode-chain causal stability: zeta-derived Mertens schedule + optional Ricci sentinel, CLI flags, measured recovery |
 | [docs/INTEGRATION-COMFYUI.md](docs/INTEGRATION-COMFYUI.md) | ComfyUI: Wan 2.1/2.2 MoE, expert switching, linear wrapper |
 | [docs/BACKEND-CUDA.md](docs/BACKEND-CUDA.md) | CUDA kernels, memory layout, building |
 | [docs/BACKEND-VULKAN.md](docs/BACKEND-VULKAN.md) | Vulkan compute shaders, standalone vs shared device |
