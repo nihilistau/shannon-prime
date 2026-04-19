@@ -971,6 +971,32 @@ static void free_vulkan(sp_vk_impl_t *vk) {
 
 #endif // SHANNON_PRIME_VULKAN_ENABLED
 
+// ----------------------------------------------------------------------------
+// Diagnostic stubs for builds without the Vulkan SDK.
+//
+// The public diag wrappers (sp_vulkan_diag_vht2_forward /
+// sp_vulkan_diag_band_roundtrip) are declared unconditionally in the header
+// and called by test_vulkan.c under a runtime env-var gate
+// (SHANNON_PRIME_VULKAN_FORCE_GPU=1). Without the SDK the GPU-path
+// definitions are #ifdef'd out, so these stubs exist so that test-vulkan
+// links on every box. The runtime gate keeps them unreachable in the
+// default test path; asking for FORCE_GPU on a no-SDK build surfaces a
+// clear "SDK not compiled in" rather than a link error.
+// ----------------------------------------------------------------------------
+#ifndef SHANNON_PRIME_VULKAN_ENABLED
+int sp_vulkan_diag_vht2_forward(sp_vulkan_cache_t *cc, float *inout, int hd) {
+    (void)cc; (void)inout; (void)hd;
+    fprintf(stderr, "[sp-vulkan] diag_vht2_forward: Vulkan SDK not compiled in\n");
+    return -1;
+}
+int sp_vulkan_diag_band_roundtrip(sp_vulkan_cache_t *cc, int which,
+                                   const float *in, float *out, int hd) {
+    (void)cc; (void)which; (void)in; (void)out; (void)hd;
+    fprintf(stderr, "[sp-vulkan] diag_band_roundtrip: Vulkan SDK not compiled in\n");
+    return -1;
+}
+#endif // !SHANNON_PRIME_VULKAN_ENABLED
+
 // ============================================================================
 // Public API
 // ============================================================================
