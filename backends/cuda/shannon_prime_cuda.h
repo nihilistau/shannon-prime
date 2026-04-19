@@ -144,6 +144,76 @@ float sp_cuda_correlation(const float *d_a, const float *d_b,
 // Print GPU memory usage
 void sp_cuda_print_memory(const sp_cuda_cache_t *cc);
 
+// ============================================================================
+// Sqfree GPU cache (step 3 MVP — no spinor yet)
+// ============================================================================
+//
+// GPU-resident variant of sp_sqfree_cache_t. Compressed K/V blocks live
+// in VRAM; compress/decompress pipelines (sqfree_pad → Vilenkin →
+// Knight extract → band quantize + Möbius predict + residual quantize)
+// run as CUDA kernels. Spinor sheet bit storage is deferred (full scope
+// in docs/STEP3-GPU-SQFREE-CACHE.md).
+
+typedef struct {
+    sp_config_t     config;
+    int             pad_dim;
+    int             sk_k;
+    int             n_res;
+    int             n_terms;
+    int             residual_bits;
+    int             use_spinor;
+    int             use_skel_mobius;    // unused in MVP
+
+    sp_band_config_t k_bands;
+    sp_band_config_t v_bands;
+
+    int            *d_skeleton_idx;
+    int            *d_residual_idx;
+    int            *d_csr_offsets;
+    int            *d_csr_skel_slot;
+    int            *d_csr_mu_sign;   // int32 on GPU (converted from int8_t on init)
+
+    int            *d_vilenkin_factors;
+    int             n_factors;
+
+    unsigned char  *d_k_cache;
+    unsigned char  *d_v_cache;
+    int             bytes_per_pos_k;
+    int             bytes_per_pos_v;
+    int             max_seq_len;
+    int             n_slots;
+
+    float          *d_pad_scratch;
+    float          *d_coeff_scratch;
+    float          *d_skel_scratch;
+    float          *d_pred_scratch;
+    float          *d_dev_scratch;
+    unsigned char  *d_levels_scratch;
+    float          *d_mag_scratch;
+    void           *stream;
+} sp_cuda_sqfree_cache_t;
+
+int  sp_cuda_sqfree_cache_init(sp_cuda_sqfree_cache_t *cc,
+                                const sp_config_t *cfg,
+                                int max_seq_len,
+                                int residual_bits,
+                                int use_spinor,
+                                void *stream);
+void sp_cuda_sqfree_cache_free(sp_cuda_sqfree_cache_t *cc);
+
+void sp_cuda_sqfree_write_k(sp_cuda_sqfree_cache_t *cc,
+                             int layer, int head, int pos,
+                             const float *d_k_vec);
+void sp_cuda_sqfree_write_v(sp_cuda_sqfree_cache_t *cc,
+                             int layer, int head, int pos,
+                             const float *d_v_vec);
+void sp_cuda_sqfree_read_k(const sp_cuda_sqfree_cache_t *cc,
+                            int layer, int head, int pos,
+                            float *d_k_out);
+void sp_cuda_sqfree_read_v(const sp_cuda_sqfree_cache_t *cc,
+                            int layer, int head, int pos,
+                            float *d_v_out);
+
 #ifdef __cplusplus
 }
 #endif

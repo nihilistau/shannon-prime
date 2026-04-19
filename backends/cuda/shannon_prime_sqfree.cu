@@ -333,6 +333,497 @@ void sp_cuda_spinor_extract(const float *d_actual, const float *d_pred,
     );
 }
 
-#ifdef __cplusplus
+}  // extern "C" (closes the block opened near the top of this file)
+
+// ============================================================================
+// Step-3-MVP additions: kernels and cache wrapper for GPU-resident sqfree
+// compress/decompress. No spinor support (deferred — see
+// docs/STEP3-GPU-SQFREE-CACHE.md "Full scope").
+// ============================================================================
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "shannon_prime_cuda.h"
+#include "../../core/shannon_prime.h"
+
+// ── helper kernels ────────────────────────────────────────────────
+
+// Gather: out[i] = in[idx[i]] for i in [0, n)
+__global__ void kernel_gather(const float *in, const int *idx,
+                              float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[idx[i]];
 }
-#endif
+
+// Scatter: out[idx[i]] = in[i]. Caller must zero `out` first if it needs
+// untouched positions to be 0 (trivial via cudaMemsetAsync before launch).
+__global__ void kernel_scatter(const float *in, const int *idx,
+                               float *out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[idx[i]] = in[i];
+}
+
+// Fused: dev[i] = coeff[residual_idx[i]] - pred[i]. MVP (no spinor).
+// Used only on the write path.
+__global__ void kernel_residual_deviation_mvp(
+    const float *coeff, const int *residual_idx,
+    const float *pred, float *dev, int n_res)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_res) {
+        float actual = coeff[residual_idx[i]];
+        dev[i] = actual - pred[i];
+    }
+}
+
+// Read-path reconstruction: coeff[residual_idx[i]] = pred[i] + dev[i].
+// Used on the read path to scatter reconstructed residual positions
+// back into the coefficient vector. MVP (no spinor).
+__global__ void kernel_reconstruct_residual_mvp(
+    const float *pred, const float *dev,
+    const int *residual_idx, float *coeff, int n_res)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_res) {
+        coeff[residual_idx[i]] = pred[i] + dev[i];
+    }
+}
+
+// Single-block reduction: mag = mean(|dev[i]|) over n_res elements.
+// One block, up to 256 threads. Writes mag (single fp32) to d_mag.
+__global__ void kernel_mean_abs(const float *dev, int n_res, float *d_mag) {
+    __shared__ float smem[256];
+    int tid = threadIdx.x;
+    float local = 0.0f;
+    for (int i = tid; i < n_res; i += blockDim.x) local += fabsf(dev[i]);
+    smem[tid] = local;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] += smem[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) {
+        float mag = smem[0] / (float)n_res;
+        if (mag < 1e-12f) mag = 1e-12f;
+        *d_mag = mag;
+    }
+}
+
+// Residual quantize: levels[i] = clamp(round(dev[i] / mag * (L-1)/2 + (L-1)/2), 0, L-1)
+// Matches sp_quantize_residual in core/shannon_prime_sqfree.c: centered
+// encoding so 0 lands at level (L-1)/2, ±mag lands at extremes.
+__global__ void kernel_quantize_residual(
+    const float *dev, int n_res, int bits, const float *d_mag,
+    uint8_t *levels)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_res) {
+        int   L       = 1 << bits;
+        float mag     = *d_mag;
+        float half    = 0.5f * (float)(L - 1);
+        float scale_v = (mag > 0.0f) ? (float)(L - 1) * 0.5f / mag : 0.0f;
+        float f       = dev[i] * scale_v + half;
+        int   q       = (int)(f + copysignf(0.5f, f - half));  // roundf-ish
+        if (q < 0)        q = 0;
+        if (q > L - 1)    q = L - 1;
+        levels[i] = (uint8_t)q;
+    }
+}
+
+// Residual dequantize: dev[i] = ((levels[i] - (L-1)/2) * 2 / (L-1)) * mag
+__global__ void kernel_dequantize_residual(
+    const uint8_t *levels, int n_res, int bits, const float *d_mag,
+    float *dev)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n_res) {
+        int   L     = 1 << bits;
+        float mag   = *d_mag;
+        float half  = 0.5f * (float)(L - 1);
+        float step  = (L > 1) ? (2.0f * mag / (float)(L - 1)) : 0.0f;
+        dev[i] = (((float)levels[i]) - half) * step;
+    }
+}
+
+// Level packing (LSB-first, matches sp_sqfree_compress_one layout).
+// Single thread per block — cheap serialization, matches CPU exactly.
+__global__ void kernel_pack_levels(const uint8_t *levels, int n_res,
+                                    int bits, uint8_t *packed,
+                                    int packed_bytes) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    for (int i = 0; i < packed_bytes; ++i) packed[i] = 0;
+    for (int i = 0; i < n_res; ++i) {
+        int bit_off = i * bits;
+        packed[bit_off / 8] |= (uint8_t)(levels[i] << (bit_off % 8));
+        if ((bit_off % 8) + bits > 8 && (bit_off / 8 + 1) < packed_bytes) {
+            packed[bit_off / 8 + 1] |= (uint8_t)(levels[i] >> (8 - (bit_off % 8)));
+        }
+    }
+}
+
+__global__ void kernel_unpack_levels(const uint8_t *packed, int n_res,
+                                      int bits, uint8_t *levels,
+                                      int packed_bytes) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t mask_bits = (1u << bits) - 1u;
+    for (int i = 0; i < n_res; ++i) {
+        int bit_off = i * bits;
+        uint32_t w = (uint32_t)packed[bit_off / 8] >> (bit_off % 8);
+        if ((bit_off % 8) + bits > 8 && (bit_off / 8 + 1) < packed_bytes) {
+            w |= ((uint32_t)packed[bit_off / 8 + 1]) << (8 - (bit_off % 8));
+        }
+        levels[i] = (uint8_t)(w & mask_bits);
+    }
+}
+
+// ── sp_cuda_sqfree_cache_t wrapper ────────────────────────────────
+
+extern "C" {
+
+int sp_cuda_sqfree_cache_init(sp_cuda_sqfree_cache_t *cc,
+                               const sp_config_t *cfg,
+                               int max_seq_len,
+                               int residual_bits,
+                               int use_spinor,
+                               void *stream)
+{
+    memset(cc, 0, sizeof(*cc));
+    memcpy(&cc->config, cfg, sizeof(sp_config_t));
+    cc->max_seq_len   = max_seq_len;
+    cc->residual_bits = residual_bits;
+    cc->use_spinor    = use_spinor;      // MVP path passes 0; stored for layout
+    cc->stream        = stream;
+
+    // Pad dimension is derived from head_dim.
+    int pad_dim = sp_sqfree_pad_dim(cfg->head_dim);
+    cc->pad_dim = pad_dim;
+
+    // Build Knight mask on host (L/2 skeleton, squarefree-first when no
+    // calibration variance is available yet).
+    sp_knight_mask_t host_mask;
+    if (sp_knight_mask_init(&host_mask, pad_dim, pad_dim / 2, NULL) != 0) {
+        fprintf(stderr, "[sp-cuda-sqfree] knight_mask_init failed\n");
+        return -1;
+    }
+    cc->sk_k     = host_mask.sk_k;
+    cc->n_res    = host_mask.n_res;
+    cc->n_terms  = host_mask.n_terms;
+
+    // Band configs operate on the skeleton (sk_k), not pad_dim.
+    int default_k_bits[5] = {5, 4, 4, 4, 5};
+    int default_v_bits[5] = {5, 4, 4, 4, 5};
+    int k_nb = (cfg->k_n_bands > 0 && cfg->k_n_bands <= SP_MAX_BANDS) ? cfg->k_n_bands : 5;
+    int v_nb = (cfg->v_n_bands > 0 && cfg->v_n_bands <= SP_MAX_BANDS) ? cfg->v_n_bands : 5;
+    int k_bits[SP_MAX_BANDS];
+    int v_bits[SP_MAX_BANDS];
+    for (int i = 0; i < k_nb; ++i) k_bits[i] = (cfg->k_band_bits[i] > 0) ? cfg->k_band_bits[i] : default_k_bits[i % 5];
+    for (int i = 0; i < v_nb; ++i) v_bits[i] = (cfg->v_band_bits[i] > 0) ? cfg->v_band_bits[i] : default_v_bits[i % 5];
+    sp_band_config_init(&cc->k_bands, cc->sk_k, k_nb, k_bits);
+    sp_band_config_init(&cc->v_bands, cc->sk_k, v_nb, v_bits);
+
+    // Upload mask arrays.
+    cudaMalloc(&cc->d_skeleton_idx, (size_t)cc->sk_k  * sizeof(int));
+    cudaMalloc(&cc->d_residual_idx, (size_t)cc->n_res * sizeof(int));
+    cudaMalloc(&cc->d_csr_offsets,  (size_t)(cc->n_res + 1) * sizeof(int));
+    cudaMalloc(&cc->d_csr_skel_slot,(size_t)cc->n_terms * sizeof(int));
+    // The CUDA mobius_predict kernel takes int32 signs (see
+    // kernel_mobius_predict above). Convert from the CPU's int8_t
+    // representation to int32 before upload.
+    cudaMalloc(&cc->d_csr_mu_sign,  (size_t)cc->n_terms * sizeof(int));
+    cudaMemcpy(cc->d_skeleton_idx, host_mask.skeleton_idx,
+               (size_t)cc->sk_k * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(cc->d_residual_idx, host_mask.residual_idx,
+               (size_t)cc->n_res * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(cc->d_csr_offsets, host_mask.csr_offsets,
+               (size_t)(cc->n_res + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(cc->d_csr_skel_slot, host_mask.csr_skel_slot,
+               (size_t)cc->n_terms * sizeof(int), cudaMemcpyHostToDevice);
+    {
+        int *signs_i32 = (int *)malloc((size_t)cc->n_terms * sizeof(int));
+        if (!signs_i32) {
+            fprintf(stderr, "[sp-cuda-sqfree] signs malloc failed\n");
+            sp_knight_mask_free(&host_mask);
+            return -1;
+        }
+        for (int i = 0; i < cc->n_terms; ++i) {
+            signs_i32[i] = (int)host_mask.csr_mu_sign[i];
+        }
+        cudaMemcpy(cc->d_csr_mu_sign, signs_i32,
+                   (size_t)cc->n_terms * sizeof(int), cudaMemcpyHostToDevice);
+        free(signs_i32);
+    }
+    sp_knight_mask_free(&host_mask);
+
+    // Vilenkin factor list for the staged kernel.
+    int factors[16];
+    int nf = 0;
+    {
+        int residue = pad_dim;
+        const int primes[] = {2, 3, 5, 7, 11};
+        for (unsigned p = 0; p < sizeof(primes) / sizeof(primes[0]); ++p) {
+            while (residue % primes[p] == 0) {
+                factors[nf++] = primes[p];
+                residue /= primes[p];
+            }
+        }
+        if (residue != 1) {
+            fprintf(stderr, "[sp-cuda-sqfree] pad_dim %d doesn't factor over "
+                            "{2,3,5,7,11}; cache init failed\n", pad_dim);
+            return -1;
+        }
+    }
+    cc->n_factors = nf;
+    cudaMalloc(&cc->d_vilenkin_factors, (size_t)nf * sizeof(int));
+    cudaMemcpy(cc->d_vilenkin_factors, factors,
+               (size_t)nf * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Compressed storage layout.
+    int res_bytes   = (cc->n_res * cc->residual_bits + 7) / 8;
+    int sheet_bytes = use_spinor ? ((cc->n_res + 7) / 8) : 0;
+    cc->bytes_per_pos_k = cc->k_bands.total_bytes + 4 + res_bytes + sheet_bytes;
+    cc->bytes_per_pos_v = cc->v_bands.total_bytes + 4 + res_bytes + sheet_bytes;
+    cc->n_slots = cfg->n_layers * cfg->n_heads_kv;
+
+    size_t k_total = (size_t)cc->n_slots * max_seq_len * cc->bytes_per_pos_k;
+    size_t v_total = (size_t)cc->n_slots * max_seq_len * cc->bytes_per_pos_v;
+    cudaMalloc(&cc->d_k_cache, k_total);
+    cudaMalloc(&cc->d_v_cache, v_total);
+    cudaMemsetAsync(cc->d_k_cache, 0, k_total, (cudaStream_t)stream);
+    cudaMemsetAsync(cc->d_v_cache, 0, v_total, (cudaStream_t)stream);
+
+    // Scratch buffers.
+    cudaMalloc(&cc->d_pad_scratch,   (size_t)pad_dim * sizeof(float));
+    cudaMalloc(&cc->d_coeff_scratch, (size_t)pad_dim * sizeof(float));
+    cudaMalloc(&cc->d_skel_scratch,  (size_t)cc->sk_k * sizeof(float));
+    cudaMalloc(&cc->d_pred_scratch,  (size_t)cc->n_res * sizeof(float));
+    cudaMalloc(&cc->d_dev_scratch,   (size_t)cc->n_res * sizeof(float));
+    cudaMalloc(&cc->d_levels_scratch,(size_t)cc->n_res);
+    cudaMalloc(&cc->d_mag_scratch,   sizeof(float));
+
+    fprintf(stderr,
+        "[sp-cuda-sqfree] init: hd=%d pad_dim=%d sk_k=%d n_res=%d n_terms=%d "
+        "res_bits=%d spinor=%d bytes_per_pos k=%d v=%d total=%.2f MB\n",
+        cfg->head_dim, pad_dim, cc->sk_k, cc->n_res, cc->n_terms,
+        residual_bits, use_spinor, cc->bytes_per_pos_k, cc->bytes_per_pos_v,
+        (k_total + v_total) / (1024.0 * 1024.0));
+    return 0;
+}
+
+void sp_cuda_sqfree_cache_free(sp_cuda_sqfree_cache_t *cc) {
+    if (!cc) return;
+    if (cc->d_skeleton_idx)    cudaFree(cc->d_skeleton_idx);
+    if (cc->d_residual_idx)    cudaFree(cc->d_residual_idx);
+    if (cc->d_csr_offsets)     cudaFree(cc->d_csr_offsets);
+    if (cc->d_csr_skel_slot)   cudaFree(cc->d_csr_skel_slot);
+    if (cc->d_csr_mu_sign)     cudaFree(cc->d_csr_mu_sign);
+    if (cc->d_vilenkin_factors)cudaFree(cc->d_vilenkin_factors);
+    if (cc->d_k_cache)         cudaFree(cc->d_k_cache);
+    if (cc->d_v_cache)         cudaFree(cc->d_v_cache);
+    if (cc->d_pad_scratch)     cudaFree(cc->d_pad_scratch);
+    if (cc->d_coeff_scratch)   cudaFree(cc->d_coeff_scratch);
+    if (cc->d_skel_scratch)    cudaFree(cc->d_skel_scratch);
+    if (cc->d_pred_scratch)    cudaFree(cc->d_pred_scratch);
+    if (cc->d_dev_scratch)     cudaFree(cc->d_dev_scratch);
+    if (cc->d_levels_scratch)  cudaFree(cc->d_levels_scratch);
+    if (cc->d_mag_scratch)     cudaFree(cc->d_mag_scratch);
+    memset(cc, 0, sizeof(*cc));
+}
+
+// Internal write: compresses one (layer, head, pos) into dest slot using
+// band config `bc`. Runs entirely on the cache's CUDA stream.
+static void sp_cuda_sqfree_write_one(sp_cuda_sqfree_cache_t *cc,
+                                      int layer, int head, int pos,
+                                      const float *d_vec,
+                                      const sp_band_config_t *bc,
+                                      uint8_t *d_cache,
+                                      int bytes_per_pos)
+{
+    const int hd      = cc->config.head_dim;
+    const int pd      = cc->pad_dim;
+    const int sk_k    = cc->sk_k;
+    const int n_res   = cc->n_res;
+    cudaStream_t s    = (cudaStream_t)cc->stream;
+
+    // 1. Sqfree pad → d_pad_scratch
+    kernel_sqfree_pad<<<1, 256, 0, s>>>(d_vec, cc->d_pad_scratch, hd, pd, 1);
+
+    // 2. Vilenkin forward on pad_scratch
+    cudaMemcpyAsync(cc->d_coeff_scratch, cc->d_pad_scratch,
+                    (size_t)pd * sizeof(float),
+                    cudaMemcpyDeviceToDevice, s);
+    sp_cuda_vilenkin_inplace(cc->d_coeff_scratch, pd, 1,
+                              cc->d_vilenkin_factors, cc->n_factors, s);
+
+    // 3. Gather skeleton → d_skel_scratch
+    {
+        int blk = 128;
+        int grid = (sk_k + blk - 1) / blk;
+        kernel_gather<<<grid, blk, 0, s>>>(
+            cc->d_coeff_scratch, cc->d_skeleton_idx,
+            cc->d_skel_scratch, sk_k);
+    }
+
+    // 4. Band-quantize skeleton directly into the slot head.
+    int slot = layer * cc->config.n_heads_kv + head;
+    uint8_t *dest = d_cache + (size_t)slot * cc->max_seq_len * bytes_per_pos
+                           + (size_t)pos * bytes_per_pos;
+    sp_cuda_band_quantize(cc->d_skel_scratch, dest, bc, 1, s);
+
+    if (n_res == 0) return;
+
+    // 5. Möbius predict residual
+    sp_cuda_mobius_predict(cc->d_skel_scratch, cc->d_pred_scratch,
+                            cc->d_csr_offsets, cc->d_csr_skel_slot,
+                            cc->d_csr_mu_sign,
+                            sk_k, n_res, 1, s);
+
+    // 6. Deviation: dev[i] = coeff[residual_idx[i]] - pred[i]
+    {
+        int blk = 128;
+        int grid = (n_res + blk - 1) / blk;
+        kernel_residual_deviation_mvp<<<grid, blk, 0, s>>>(
+            cc->d_coeff_scratch, cc->d_residual_idx,
+            cc->d_pred_scratch, cc->d_dev_scratch, n_res);
+    }
+
+    // 7. mag = mean(|dev|)
+    kernel_mean_abs<<<1, 256, 0, s>>>(cc->d_dev_scratch, n_res,
+                                       cc->d_mag_scratch);
+    // Copy mag fp32 into the slot right after skeleton bytes.
+    cudaMemcpyAsync(dest + bc->total_bytes, cc->d_mag_scratch, 4,
+                    cudaMemcpyDeviceToDevice, s);
+
+    // 8. Quantize residual into levels
+    {
+        int blk = 128;
+        int grid = (n_res + blk - 1) / blk;
+        kernel_quantize_residual<<<grid, blk, 0, s>>>(
+            cc->d_dev_scratch, n_res, cc->residual_bits,
+            cc->d_mag_scratch, cc->d_levels_scratch);
+    }
+
+    // 9. Pack levels into the slot (LSB-first matches CPU layout)
+    int res_bytes = (n_res * cc->residual_bits + 7) / 8;
+    kernel_pack_levels<<<1, 1, 0, s>>>(
+        cc->d_levels_scratch, n_res, cc->residual_bits,
+        dest + bc->total_bytes + 4, res_bytes);
+
+    // Spinor deferred — `use_spinor` is 0 on MVP path.
+    (void)cc->use_spinor;
+}
+
+// Internal read: decompresses one (layer, head, pos) slot into d_vec_out
+// using band config `bc`.
+static void sp_cuda_sqfree_read_one(const sp_cuda_sqfree_cache_t *cc,
+                                     int layer, int head, int pos,
+                                     float *d_vec_out,
+                                     const sp_band_config_t *bc,
+                                     const uint8_t *d_cache,
+                                     int bytes_per_pos)
+{
+    const int hd    = cc->config.head_dim;
+    const int pd    = cc->pad_dim;
+    const int sk_k  = cc->sk_k;
+    const int n_res = cc->n_res;
+    cudaStream_t s  = (cudaStream_t)cc->stream;
+
+    int slot = layer * cc->config.n_heads_kv + head;
+    const uint8_t *src = d_cache + (size_t)slot * cc->max_seq_len * bytes_per_pos
+                                 + (size_t)pos * bytes_per_pos;
+
+    // 1. Dequantize skeleton → d_skel_scratch
+    sp_cuda_band_dequantize(src, cc->d_skel_scratch, bc, 1, s);
+
+    // 2. Zero coeff scratch + scatter skeleton back in
+    cudaMemsetAsync(cc->d_coeff_scratch, 0, (size_t)pd * sizeof(float), s);
+    {
+        int blk = 128;
+        int grid = (sk_k + blk - 1) / blk;
+        kernel_scatter<<<grid, blk, 0, s>>>(
+            cc->d_skel_scratch, cc->d_skeleton_idx,
+            cc->d_coeff_scratch, sk_k);
+    }
+
+    if (n_res > 0) {
+        // 3. Möbius predict
+        sp_cuda_mobius_predict(cc->d_skel_scratch,
+                                (float *)cc->d_pred_scratch,
+                                cc->d_csr_offsets, cc->d_csr_skel_slot,
+                                cc->d_csr_mu_sign,
+                                sk_k, n_res, 1, s);
+
+        // 4. Read mag from slot
+        cudaMemcpyAsync((void *)cc->d_mag_scratch,
+                        src + bc->total_bytes, 4,
+                        cudaMemcpyDeviceToDevice, s);
+
+        // 5. Unpack levels
+        int res_bytes = (n_res * cc->residual_bits + 7) / 8;
+        kernel_unpack_levels<<<1, 1, 0, s>>>(
+            src + bc->total_bytes + 4, n_res, cc->residual_bits,
+            (uint8_t *)cc->d_levels_scratch, res_bytes);
+
+        // 6. Dequantize levels → deviation
+        {
+            int blk = 128;
+            int grid = (n_res + blk - 1) / blk;
+            kernel_dequantize_residual<<<grid, blk, 0, s>>>(
+                cc->d_levels_scratch, n_res, cc->residual_bits,
+                cc->d_mag_scratch, (float *)cc->d_dev_scratch);
+        }
+
+        // 7. coeff[residual_idx[i]] = pred[i] + dev[i]
+        {
+            int blk = 128;
+            int grid = (n_res + blk - 1) / blk;
+            kernel_reconstruct_residual_mvp<<<grid, blk, 0, s>>>(
+                cc->d_pred_scratch, (const float *)cc->d_dev_scratch,
+                cc->d_residual_idx, cc->d_coeff_scratch, n_res);
+        }
+    }
+
+    // 8. Vilenkin inverse (= forward; self-inverse)
+    sp_cuda_vilenkin_inplace(cc->d_coeff_scratch, pd, 1,
+                              cc->d_vilenkin_factors, cc->n_factors, s);
+
+    // 9. Sqfree unpad → d_vec_out
+    kernel_sqfree_unpad<<<1, 256, 0, s>>>(cc->d_coeff_scratch,
+                                           d_vec_out, hd, pd, 1);
+}
+
+// Public single-vector API. Ship-path style: one (layer, head, pos) at a time.
+void sp_cuda_sqfree_write_k(sp_cuda_sqfree_cache_t *cc,
+                             int layer, int head, int pos,
+                             const float *d_k_vec) {
+    sp_cuda_sqfree_write_one(cc, layer, head, pos, d_k_vec,
+                              &cc->k_bands, (uint8_t *)cc->d_k_cache,
+                              cc->bytes_per_pos_k);
+}
+
+void sp_cuda_sqfree_write_v(sp_cuda_sqfree_cache_t *cc,
+                             int layer, int head, int pos,
+                             const float *d_v_vec) {
+    sp_cuda_sqfree_write_one(cc, layer, head, pos, d_v_vec,
+                              &cc->v_bands, (uint8_t *)cc->d_v_cache,
+                              cc->bytes_per_pos_v);
+}
+
+void sp_cuda_sqfree_read_k(const sp_cuda_sqfree_cache_t *cc,
+                            int layer, int head, int pos,
+                            float *d_k_out) {
+    sp_cuda_sqfree_read_one(cc, layer, head, pos, d_k_out,
+                             &cc->k_bands, (uint8_t *)cc->d_k_cache,
+                             cc->bytes_per_pos_k);
+}
+
+void sp_cuda_sqfree_read_v(const sp_cuda_sqfree_cache_t *cc,
+                            int layer, int head, int pos,
+                            float *d_v_out) {
+    sp_cuda_sqfree_read_one(cc, layer, head, pos, d_v_out,
+                             &cc->v_bands, (uint8_t *)cc->d_v_cache,
+                             cc->bytes_per_pos_v);
+}
+
+}  // extern "C"
