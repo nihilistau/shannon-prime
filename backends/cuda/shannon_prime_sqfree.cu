@@ -411,39 +411,42 @@ __global__ void kernel_mean_abs(const float *dev, int n_res, float *d_mag) {
     }
 }
 
-// Residual quantize: levels[i] = clamp(round(dev[i] / mag * (L-1)/2 + (L-1)/2), 0, L-1)
-// Matches sp_quantize_residual in core/shannon_prime_sqfree.c: centered
-// encoding so 0 lands at level (L-1)/2, ±mag lands at extremes.
+// Residual quantize — MUST match sp_quantize_residual in
+// core/shannon_prime_sqfree.c exactly. Saturation is `mag * bits`,
+// step = 2*sat/(L-1), level = round-half-up(val/step + center).
 __global__ void kernel_quantize_residual(
     const float *dev, int n_res, int bits, const float *d_mag,
     uint8_t *levels)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_res) {
-        int   L       = 1 << bits;
-        float mag     = *d_mag;
-        float half    = 0.5f * (float)(L - 1);
-        float scale_v = (mag > 0.0f) ? (float)(L - 1) * 0.5f / mag : 0.0f;
-        float f       = dev[i] * scale_v + half;
-        int   q       = (int)(f + copysignf(0.5f, f - half));  // roundf-ish
-        if (q < 0)        q = 0;
-        if (q > L - 1)    q = L - 1;
-        levels[i] = (uint8_t)q;
+        int   L        = 1 << bits;
+        float mag      = *d_mag;
+        float center   = 0.5f * (float)(L - 1);
+        float sat      = (mag > 1e-12f) ? (mag * (float)bits) : 1e-12f;
+        float step     = (2.0f * sat) / (float)(L - 1);
+        float inv_step = 1.0f / step;
+        float q_f      = dev[i] * inv_step + center;
+        int   level    = (int)(q_f + 0.5f);   // matches CPU exactly
+        if (level < 0)     level = 0;
+        if (level >= L)    level = L - 1;
+        levels[i] = (uint8_t)level;
     }
 }
 
-// Residual dequantize: dev[i] = ((levels[i] - (L-1)/2) * 2 / (L-1)) * mag
+// Residual dequantize — mirrors sp_dequantize_residual exactly.
 __global__ void kernel_dequantize_residual(
     const uint8_t *levels, int n_res, int bits, const float *d_mag,
     float *dev)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_res) {
-        int   L     = 1 << bits;
-        float mag   = *d_mag;
-        float half  = 0.5f * (float)(L - 1);
-        float step  = (L > 1) ? (2.0f * mag / (float)(L - 1)) : 0.0f;
-        dev[i] = (((float)levels[i]) - half) * step;
+        int   L      = 1 << bits;
+        float mag    = *d_mag;
+        float center = 0.5f * (float)(L - 1);
+        float sat    = mag * (float)bits;
+        float step   = (L > 1) ? (2.0f * sat / (float)(L - 1)) : 0.0f;
+        dev[i] = (((float)levels[i]) - center) * step;
     }
 }
 
