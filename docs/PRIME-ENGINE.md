@@ -192,9 +192,33 @@ tractable:
 | Qwen3-8B-Q8 | baseline (no cache) | 18.05 | — | — |
 | **Qwen3-8B-Q8** | **ship cache** | **18.14** | **+0.5%** | 15 min CPU / 23 min GPU† |
 
-† Qwen3-8B's 16.6 GiB of weights don't fit in 12 GiB VRAM — paging
-to shared memory kills the GPU speedup. A bigger card, per-layer
-offload, or Q4-range quants lift that limit.
+† **Not a VRAM spill.** `Qwen3-8B-Q8_0.gguf` is 8.2 GiB on disk
+and fits 12 GiB VRAM cleanly. The slowdown is architectural: the
+SP cache currently lives in host memory, so every decode step
+reads past K/V out, uploads `2 × n_layer = 64` tensors to the GPU
+via `ggml_backend_tensor_set`, runs attention, pulls new K/V
+back to host, re-compresses. On 32-layer Qwen3-8B with hd=128 /
+n_kv=8 that's tens of MB of host↔device PCIe per token — the GPU
+becomes PCIe-bound instead of compute-bound. CPU has no PCIe so
+the cost is zero there. Dolphin-1B (22 layers, smaller hd/n_kv)
+stays within the PCIe budget, which is why the 11× speedup shows
+up at 1B.
+
+Two-step fix in progress in `shannon-prime-engine`:
+
+1. **Batched memcpy** — concat per-layer past K and past V into
+   two contiguous uploads per decode step (64 → 2 cudaMemcpys).
+   Reduces the PCIe-launch portion; data volume unchanged.
+2. **GPU-resident SP cache (the real goal)** — keep compressed
+   K/V blocks in VRAM and run the VHT2 + band quant / dequant on
+   CUDA directly. Kernels already exist in
+   `backends/cuda/shannon_prime_cuda.cu`. This eliminates the
+   per-token host↔device round-trip entirely.
+
+The Qwen3 row's wall-time column will be re-measured after each
+step lands; until then the 23-min figure reflects the pre-fix
+(host-side-cache) regime. **The PPL column is unaffected** —
+compression quality is independent of where the cache lives.
 
 ### What the 1B measurements tell us about scaling
 
