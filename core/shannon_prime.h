@@ -732,6 +732,102 @@ void sp_shadow_read_v_batch (const sp_shadow_cache_t *sc,
                              float *v_out);
 
 // ============================================================================
+// Ricci Sentinel — reactive p=3 energy drift monitor
+// ============================================================================
+//
+// The p=3 spectral band energy is a scalar proxy for metric structural
+// integrity. If p=3 energy drifts from its calibrated baseline, the
+// compression errors are becoming "timelike" (aligned with the information
+// flow) rather than "spacelike" (orthogonal). The metric is developing a
+// Cauchy horizon — a boundary beyond which the compressed past no longer
+// determines the correct future.
+//
+// The sentinel tracks an exponential moving average of the ratio:
+//   p3_ratio = current_p3_energy / calibrated_p3_energy
+//
+// When |1 - p3_ratio| exceeds the metric_criticality threshold, a Cauchy
+// reset is recommended. The threshold is model-size-dependent:
+//   small models (1B):  0.05  (fragile metric, narrow residual stream)
+//   large models (8B+): 0.15  (robust metric, strong skip geodesics)
+
+typedef struct {
+    int      p3_band_offset;
+    int      p3_band_size;
+    double   p3_energy_calibrated;
+    bool     calibrated;
+    double   p3_ema;
+    double   ema_alpha;
+    int      n_samples;
+    double   metric_criticality;
+    bool     reset_recommended;
+    double   calib_p3_sum;
+    int      calib_n;
+} sp_ricci_sentinel_t;
+
+int  sp_ricci_init(sp_ricci_sentinel_t *rs, const sp_band_config_t *band_cfg,
+                   float params_b);
+void sp_ricci_calibrate_feed(sp_ricci_sentinel_t *rs,
+                             const float *vht2_coeffs, int hd);
+void sp_ricci_calibrate_end(sp_ricci_sentinel_t *rs);
+bool sp_ricci_check(sp_ricci_sentinel_t *rs,
+                    const float *vht2_coeffs, int hd);
+void sp_ricci_reset(sp_ricci_sentinel_t *rs);
+double sp_ricci_drift(const sp_ricci_sentinel_t *rs);
+
+// ============================================================================
+// Mertens Oracle — zeta-guided proactive reset scheduling
+// ============================================================================
+//
+// M(n) = Σ_{k=1}^{n} μ(k) tracks the squarefree/non-squarefree balance.
+// Its spectral decomposition via zeta zeros creates oscillations whose
+// half-period at typical context scales (n ~ 256-2048) is 200-500 tokens,
+// matching empirically-observed optimal reset windows.
+
+#define SP_MERTENS_MAX_ZEROS    50
+#define SP_MERTENS_MAX_SCHEDULE 1024
+
+typedef struct {
+    int      n_zeros;
+    double   gamma[SP_MERTENS_MAX_ZEROS];
+    int      n_schedule;
+    int      schedule[SP_MERTENS_MAX_SCHEDULE];
+    float    risk[SP_MERTENS_MAX_SCHEDULE];
+    int      max_ctx;
+    int      schedule_idx;
+} sp_mertens_oracle_t;
+
+int    sp_mertens_init(sp_mertens_oracle_t *mo, int max_ctx);
+float  sp_mertens_risk(const sp_mertens_oracle_t *mo, int pos);
+int    sp_mertens_next_risk(const sp_mertens_oracle_t *mo,
+                            int current_pos, int lookahead);
+void   sp_mertens_advance(sp_mertens_oracle_t *mo, int pos);
+double sp_mertens_eval(const sp_mertens_oracle_t *mo, int n);
+
+// ============================================================================
+// Cauchy Reset — manifold re-anchoring
+// ============================================================================
+//
+// sp_cauchy_check returns: 0 = no reset, 1 = full reset recommended,
+// 2 = partial reset OK (hierarchical only; for shadow/sqfree treat as 1).
+
+typedef struct {
+    int      mode;              // 0=off, 1=fixed-N, 2=dynamic (Ricci+Mertens)
+    int      fixed_n;
+    int      partial_window;
+    int      last_reset_pos;
+    int      total_resets;
+    sp_ricci_sentinel_t  *ricci;
+    sp_mertens_oracle_t  *mertens;
+} sp_cauchy_ctrl_t;
+
+void sp_cauchy_init(sp_cauchy_ctrl_t *cc, int mode, int fixed_n,
+                    sp_ricci_sentinel_t *ricci,
+                    sp_mertens_oracle_t *mertens);
+int  sp_cauchy_check(sp_cauchy_ctrl_t *cc, int pos);
+void sp_cauchy_record_reset(sp_cauchy_ctrl_t *cc, int pos);
+void sp_cauchy_print_stats(const sp_cauchy_ctrl_t *cc);
+
+// ============================================================================
 // Diagnostics
 // ============================================================================
 
