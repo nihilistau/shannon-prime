@@ -196,16 +196,25 @@ memory. Combined, the Qwen3-8B wall time drops from 23 min to
 | **GPU + GPU cache** | **19.29** | **+6.4%** | **1m28s** |
 
 **Known PPL delta between paths (host 18.64 vs GPU 19.29 =
-+0.65 PPL).** Both caches round-trip K with mean K_corr=0.9925 on
-synthetic data (measured via `kv_smoke`), but CPU and GPU VHT2
-produce numerically-close-but-not-bit-identical coefficients
-(different fp32 accumulation order across 7 butterfly stages). On
-real decode chains this drift compounds slightly more on GPU.
-CPU-domain calibration applied to GPU coefficients doesn't help —
-empirically regresses PPL to 19.50 (opt in via
-`SHANNON_PRIME_SYNC_CALIB_TO_GPU=1` for diagnosis). Proper fix is
-GPU-domain calibration (accumulate variance from GPU VHT2 output);
-tracked as follow-up.
++0.65 PPL), decomposes cleanly into two independent issues:**
+
+1. *Base kernel drift (+0.40 PPL).* Measured with calibration
+   disabled on both paths (`SHANNON_PRIME_NO_CALIBRATE=1`): host
+   cache 18.89 vs GPU cache 19.29. The irreducible numerical
+   difference between CPU and GPU compress/decompress kernels.
+   Likely CPU matrix-form VHT2 vs GPU pair-butterfly VHT2
+   accumulation compounding over 7 stages.
+
+2. *Asymmetric calibration effect (+0.25 PPL).* Same calibration
+   math gives host -0.25 but GPU +0.21 PPL. Independent of
+   calibration domain — GPU-domain variance accumulation yields
+   bit-identical `var_order` to CPU on synthetic data (K_corr
+   parity 0.9925 / 0.9804) but still regresses Qwen3 PPL the same
+   +0.21. Likely a scale-rounding interaction with variance-ranked
+   band assignments; not yet pinned.
+
+Default `SHANNON_PRIME_SYNC_CALIB_TO_GPU=0`; both issues tracked
+for future diagnosis.
 
 **Dolphin-1B-Q8 four-way** (pre-GPU-resident-cache measurements;
 sqfree and hierarchical paths still run host-side on GPU):
