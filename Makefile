@@ -10,9 +10,10 @@ NVCC       = nvcc
 NVCC_ARCH  = -arch=sm_75
 NVCC_FLAGS = -O2 $(NVCC_ARCH)
 
-CORE_SRC   = core/shannon_prime.c
-SQFREE_SRC = core/shannon_prime_sqfree.c
-CORE_HDR   = core/shannon_prime.h
+CORE_SRC       = core/shannon_prime.c
+SQFREE_SRC     = core/shannon_prime_sqfree.c
+MODELPACK_SRC  = core/shannon_prime_modelpack.c
+CORE_HDR       = core/shannon_prime.h core/shannon_prime_modelpack.h
 ADRENO_SRC = backends/adreno/shannon_prime_adreno.c
 VULKAN_SRC = backends/vulkan/shannon_prime_vulkan.c
 CUDA_SRC   = backends/cuda/shannon_prime_cuda.cu
@@ -41,14 +42,18 @@ else
 endif
 
 .PHONY: all test test-core test-torch test-adreno test-vulkan test-cuda \
-        test-integration test-comfyui test-sqfree test-all clean
+        test-integration test-comfyui test-sqfree test-modelpack test-all clean
 
 all: test-all
 
 # ── C backends ───────────────────────────────────────────────────
-build/test_core: tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+build/test_core: tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(MODELPACK_SRC) $(CORE_HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(MODELPACK_SRC) $(LDFLAGS)
+
+build/test_modelpack: tests/test_modelpack.c $(CORE_SRC) $(MODELPACK_SRC) $(CORE_HDR)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/test_modelpack.c $(CORE_SRC) $(MODELPACK_SRC) $(LDFLAGS)
 
 build/test_adreno: tests/test_adreno.c $(ADRENO_SRC) $(CORE_SRC)
 	@mkdir -p build
@@ -75,6 +80,10 @@ build/test_integration: tests/test_integration.c $(LLAMA_SRC) $(CORE_SRC)
 test-core: build/test_core
 	@echo "── Core math (31 tests) ──"
 	@./build/test_core
+
+test-modelpack: build/test_modelpack
+	@echo "── Model-pack registry ──"
+	@./build/test_modelpack
 
 test-adreno: build/test_adreno
 	@echo "── Adreno/ARM backend (14 tests) ──"
