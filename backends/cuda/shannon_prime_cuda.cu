@@ -162,7 +162,12 @@ __global__ void kernel_band_quantize_simple(
         float scale = (amax > 0.0f) ? amax / (float)max_val : 0.0f;
         float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
 
-        // Store scale as fp16
+        // Store scale as fp16 (IEEE round-to-nearest-even via CUDA's
+        // __float2half). The CPU core's sp_f32_to_f16 truncates the
+        // lower 13 mantissa bits (no rounding) — less accurate, and
+        // attempting to match it here regressed PPL vs baseline. Keep
+        // the more accurate rounding here; the CPU/GPU PPL delta is
+        // tracked separately in memory as a known ship-path difference.
         __half scale_h = __float2half(scale);
         unsigned short scale_bits;
         memcpy(&scale_bits, &scale_h, sizeof(unsigned short));
