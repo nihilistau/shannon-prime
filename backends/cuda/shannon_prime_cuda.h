@@ -190,6 +190,11 @@ typedef struct {
     float          *d_dev_scratch;
     unsigned char  *d_levels_scratch;
     float          *d_mag_scratch;
+    // Spinor scratches. Always allocated so use_spinor can be selected at
+    // runtime without reallocating the cache. Sizes are tiny compared to
+    // d_{k,v}_cache; cost is a few hundred KB at pad_dim=154, max_seq=1k.
+    float          *d_actual_scratch;   // [n_res * max_seq_len]  fp32
+    unsigned char  *d_sheet_scratch;    // [max_seq_len * ((n_res+7)/8)]
     void           *stream;
 } sp_cuda_sqfree_cache_t;
 

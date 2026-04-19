@@ -247,7 +247,8 @@ __global__ void kernel_spinor_extract(
 
 __global__ void kernel_spinor_reconstruct(
     float       *coeffs,       // [n_vecs × pad_dim] — output coefficient vector
-    const float *skel_vals,    // [n_vecs × sk_k] — dequantized skeleton
+    const float *skel_vals,    // [n_vecs × sk_k] — (unused; kept for signature
+                               //   parity with a possible fused variant)
     const float *deviation,    // [n_vecs × n_res] — dequantized residual
     const float *pred,         // [n_vecs × n_res] — Möbius predictions (recomputed)
     const uint8_t *sheet_packed,// [n_vecs × (n_res+7)/8]
@@ -258,23 +259,26 @@ __global__ void kernel_spinor_reconstruct(
     int          n_vecs,
     int          use_spinor
 ) {
+    (void)skel_vals; (void)sk_k;
     int vec_idx = blockIdx.x;
-    int res_i   = threadIdx.x;
-    if (vec_idx >= n_vecs || res_i >= n_res) return;
+    if (vec_idx >= n_vecs) return;
 
-    float p = pred[vec_idx * n_res + res_i];
+    // Strided loop so blockDim.x < n_res still covers every residual position
+    // (matches kernel_reconstruct_residual_batch's convention).
+    int sheet_stride = (n_res + 7) / 8;
+    for (int res_i = threadIdx.x; res_i < n_res; res_i += blockDim.x) {
+        float p = pred[vec_idx * n_res + res_i];
 
-    // Apply spinor sign flip
-    if (use_spinor) {
-        int byte_idx = vec_idx * ((n_res + 7) / 8) + res_i / 8;
-        uint8_t byte_val = sheet_packed[byte_idx];
-        if (byte_val & (1 << (res_i % 8))) {
-            p = -p;
+        if (use_spinor) {
+            uint8_t byte_val = sheet_packed[vec_idx * sheet_stride + res_i / 8];
+            if (byte_val & (1u << (res_i % 8))) {
+                p = -p;
+            }
         }
-    }
 
-    float val = p + deviation[vec_idx * n_res + res_i];
-    coeffs[vec_idx * pad_dim + residual_idx[res_i]] = val;
+        float val = p + deviation[vec_idx * n_res + res_i];
+        coeffs[vec_idx * pad_dim + residual_idx[res_i]] = val;
+    }
 }
 
 // ============================================================================
@@ -699,6 +703,15 @@ int sp_cuda_sqfree_cache_init(sp_cuda_sqfree_cache_t *cc,
     cudaMalloc(&cc->d_dev_scratch,   (size_t)cc->n_res * max_seq_len * sizeof(float));
     cudaMalloc(&cc->d_levels_scratch,(size_t)cc->n_res * max_seq_len);
     cudaMalloc(&cc->d_mag_scratch,   (size_t)max_seq_len * sizeof(float));
+    // Spinor scratches (always allocated; kernel paths gate on use_spinor).
+    // Sized for n_pos up to max_seq_len to cover batch read reconstruction.
+    {
+        int sheet_bytes_per_vec = (cc->n_res + 7) / 8;
+        cudaMalloc(&cc->d_actual_scratch,
+                   (size_t)cc->n_res * max_seq_len * sizeof(float));
+        cudaMalloc(&cc->d_sheet_scratch,
+                   (size_t)sheet_bytes_per_vec * max_seq_len);
+    }
 
     fprintf(stderr,
         "[sp-cuda-sqfree] init: hd=%d pad_dim=%d sk_k=%d n_res=%d n_terms=%d "
@@ -726,6 +739,8 @@ void sp_cuda_sqfree_cache_free(sp_cuda_sqfree_cache_t *cc) {
     if (cc->d_dev_scratch)     cudaFree(cc->d_dev_scratch);
     if (cc->d_levels_scratch)  cudaFree(cc->d_levels_scratch);
     if (cc->d_mag_scratch)     cudaFree(cc->d_mag_scratch);
+    if (cc->d_actual_scratch)  cudaFree(cc->d_actual_scratch);
+    if (cc->d_sheet_scratch)   cudaFree(cc->d_sheet_scratch);
     memset(cc, 0, sizeof(*cc));
 }
 
@@ -777,8 +792,25 @@ static void sp_cuda_sqfree_write_one(sp_cuda_sqfree_cache_t *cc,
                             cc->d_csr_mu_sign,
                             sk_k, n_res, 1, s);
 
-    // 6. Deviation: dev[i] = coeff[residual_idx[i]] - pred[i]
-    {
+    // 6. Deviation.
+    //   No-spinor path: dev[i] = coeff[residual_idx[i]] - pred[i]
+    //   Spinor path   : gather actual = coeff[residual_idx[:]], then
+    //                   dev[i] = (|a-p| <= |a+p|) ? a-p : a+p
+    //                   and pack the sheet-choice bit per residual.
+    if (cc->use_spinor) {
+        // 6a. Gather actual residual coefficients into d_actual_scratch.
+        {
+            int blk = 128;
+            int grid = (n_res + blk - 1) / blk;
+            kernel_gather<<<grid, blk, 0, s>>>(
+                cc->d_coeff_scratch, cc->d_residual_idx,
+                cc->d_actual_scratch, n_res);
+        }
+        // 6b. spinor_extract writes winning deviation + packed sheet bits.
+        sp_cuda_spinor_extract(cc->d_actual_scratch, cc->d_pred_scratch,
+                                cc->d_dev_scratch, cc->d_sheet_scratch,
+                                n_res, 1, s);
+    } else {
         int blk = 128;
         int grid = (n_res + blk - 1) / blk;
         kernel_residual_deviation_mvp<<<grid, blk, 0, s>>>(
@@ -808,8 +840,15 @@ static void sp_cuda_sqfree_write_one(sp_cuda_sqfree_cache_t *cc,
         cc->d_levels_scratch, n_res, cc->residual_bits,
         dest + bc->total_bytes + 4, res_bytes);
 
-    // Spinor deferred — `use_spinor` is 0 on MVP path.
-    (void)cc->use_spinor;
+    // 10. Spinor sheet bytes sit immediately after the packed residual in
+    //     the slot (see cache_init: sheet_bytes = (n_res+7)/8 when
+    //     use_spinor=1, and bytes_per_pos reserves that tail region).
+    if (cc->use_spinor) {
+        int sheet_bytes = (n_res + 7) / 8;
+        cudaMemcpyAsync(dest + bc->total_bytes + 4 + res_bytes,
+                        cc->d_sheet_scratch, (size_t)sheet_bytes,
+                        cudaMemcpyDeviceToDevice, s);
+    }
 }
 
 // Internal read: decompresses one (layer, head, pos) slot into d_vec_out
@@ -872,8 +911,26 @@ static void sp_cuda_sqfree_read_one(const sp_cuda_sqfree_cache_t *cc,
                 cc->d_mag_scratch, (float *)cc->d_dev_scratch);
         }
 
-        // 7. coeff[residual_idx[i]] = pred[i] + dev[i]
-        {
+        // 7. Reconstruct residual positions.
+        //   No-spinor: coeff[residual_idx[i]] = pred[i] + dev[i]
+        //   Spinor   : load sheet bits from slot, flip pred sign where
+        //              bit set, then scatter pred+dev into coeff.
+        if (cc->use_spinor) {
+            int sheet_bytes = (n_res + 7) / 8;
+            cudaMemcpyAsync(cc->d_sheet_scratch,
+                            src + bc->total_bytes + 4 + res_bytes,
+                            (size_t)sheet_bytes,
+                            cudaMemcpyDeviceToDevice, s);
+            int block = (n_res < 256) ? n_res : 256;
+            kernel_spinor_reconstruct<<<1, block, 0, s>>>(
+                cc->d_coeff_scratch,
+                /*skel_vals*/ NULL,
+                (const float *)cc->d_dev_scratch,
+                cc->d_pred_scratch,
+                cc->d_sheet_scratch,
+                cc->d_residual_idx,
+                pd, sk_k, n_res, /*n_vecs*/ 1, /*use_spinor*/ 1);
+        } else {
             int blk = 128;
             int grid = (n_res + blk - 1) / blk;
             kernel_reconstruct_residual_mvp<<<grid, blk, 0, s>>>(
@@ -972,11 +1029,33 @@ static void sp_cuda_sqfree_read_batch_one(
             cc->d_levels_scratch, n_res, cc->residual_bits,
             cc->d_mag_scratch, (float *)cc->d_dev_scratch, n_pos);
 
-        // 7. coeff[residual_idx[r]] = pred[r] + dev[r] per vec.
-        kernel_reconstruct_residual_batch<<<n_pos, 128, 0, s>>>(
-            cc->d_pred_scratch, (const float *)cc->d_dev_scratch,
-            cc->d_residual_idx, cc->d_coeff_scratch,
-            n_res, pd, n_pos);
+        // 7. Reconstruct residual positions across all n_pos vectors.
+        //   No-spinor: per-vec scatter of pred + dev into coeff.
+        //   Spinor   : strided memcpy2D of sheet bytes (sheet_bytes per vec
+        //              at stride bytes_per_pos) into d_sheet_scratch, then
+        //              kernel_spinor_reconstruct batched over n_pos.
+        if (cc->use_spinor) {
+            int sheet_bytes = (n_res + 7) / 8;
+            cudaMemcpy2DAsync(cc->d_sheet_scratch, (size_t)sheet_bytes,
+                              src_base + bc->total_bytes + 4 + res_bytes,
+                              (size_t)bytes_per_pos,
+                              (size_t)sheet_bytes, (size_t)n_pos,
+                              cudaMemcpyDeviceToDevice, s);
+            int block = (n_res < 256) ? n_res : 256;
+            kernel_spinor_reconstruct<<<n_pos, block, 0, s>>>(
+                cc->d_coeff_scratch,
+                /*skel_vals*/ NULL,
+                (const float *)cc->d_dev_scratch,
+                cc->d_pred_scratch,
+                cc->d_sheet_scratch,
+                cc->d_residual_idx,
+                pd, sk_k, n_res, n_pos, /*use_spinor*/ 1);
+        } else {
+            kernel_reconstruct_residual_batch<<<n_pos, 128, 0, s>>>(
+                cc->d_pred_scratch, (const float *)cc->d_dev_scratch,
+                cc->d_residual_idx, cc->d_coeff_scratch,
+                n_res, pd, n_pos);
+        }
     }
 
     // 8. Vilenkin inverse on all n_pos vecs.
