@@ -44,7 +44,7 @@ decision. Every row should list the exact git SHAs for both
 | 2026-04-20 | qwen3     | sqfree      | Qwen3-8B-Q8_0.gguf                 | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8 (ch3) |  9.8035    | 57.82         | +48.0  | 490 %        | ≤10 %   | **FAIL** | KnackAU  |
 | 2026-04-20 | qwen3     | sqfree+spinor+cauchy2 | Qwen3-8B-Q8_0.gguf       | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8 (aborted pre-chunk 1) | 9.8035 | —      | —      | —            | ≤15 %   | **PARTIAL** (run didn't complete) | KnackAU |
 | 2026-04-21 | llama-3   | ship        | Dolphin3.0-Llama3.2-1B.Q8_0.gguf   | (not recorded)         | `bbac74f`   | `9446574`  | 2048 / 8     | 11.6150      | 12.5629       | +0.948 |  8.16 %      | ≤5 %    | **FAIL** (1B regime — scaling law dominates) | KnackAU |
-| 2026-04-21 | phi3      | ship        | Phi-3.1-mini-4k-instruct-Q8_0.gguf | (not recorded)         | `b1db3e9`   | `9446574`+OI1 | 2048 / 8 |  5.0297      |  5.1523       | +0.123 |  2.44 %      | ≤5 %    | **PASS** — flipped to `SP_PRESET_CALIBRATED`. Engine SHA is pre-commit; fused-QKV + packed-SwiGLU loader+forward (OI1) lands in the same commit sequence as this row. | KnackAU |
+| 2026-04-21 | phi3      | ship        | Phi-3.1-mini-4k-instruct-Q8_0.gguf | (not recorded)         | `b1db3e9`   | `acf9d7e`  | 2048 / 8     |  5.0297      |  5.1523       | +0.123 |  2.44 %      | ≤5 %    | **PASS** — flipped to `SP_PRESET_CALIBRATED`. Engine SHA `acf9d7e` = OI1 fused-QKV + packed-SwiGLU loader+forward + `build_block_decode` packed-FFN crash fix + dbrx tokenizer allow. | KnackAU |
 
 Supporting logs for every row above live under
 `archive/eval/logs/` on the maintainer's machine (the `archive/` tree is
