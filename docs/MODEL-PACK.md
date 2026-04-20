@@ -75,34 +75,68 @@ Rationale:
 
 A preset earns `SP_PRESET_CALIBRATED` after a PPL-drift measurement on a
 reference checkpoint shows the compressed cache matches baseline within
-budget.
+budget. **Drift is measured through chained decode** (`perplexity --cache`),
+not forward_full. `cache_ppl` is a fast K/V round-trip diagnostic — it
+reports K_corr/V_corr but its PPL column is baseline PPL, not the drift
+number. Do not use `cache_ppl` PPL for promotion.
 
 ```bash
-# 1. Baseline PPL (no compression)
+# 1. Baseline PPL (forward_full, no cache, no compression)
 sp-engine perplexity \
     --model <ref.gguf> \
     --ctx 2048 --chunks 8 \
     data/wiki.raw | tee baseline.ppl
 
-# 2. Compressed PPL with the candidate preset
-SHANNON_PRIME_K_BITS=<preset.k_bits> \
-SHANNON_PRIME_V_BITS=<preset.v_bits> \
-SHANNON_PRIME_RESIDUAL_BITS=<preset.residual_bits> \
-sp-engine cache_ppl \
+# 2. Compressed PPL with the candidate preset, auto-resolved from arch.
+#    --model-preset auto applies the registry entry for this model's
+#    arch_name. Drop --sqfree/--spinor/--hierarchical to measure the
+#    ship-path drift; add them to measure the aggressive path.
+SP_ENGINE_BACKEND=gpu sp-engine perplexity --cache \
     --model <ref.gguf> \
-    --sqfree [--spinor] \
+    --model-preset auto \
+    [--sqfree [--spinor] | --hierarchical] \
     --ctx 2048 --chunks 8 \
     data/wiki.raw | tee candidate.ppl
 
-# 3. Accept if drift is within budget
+# 3. Drift = PPL(candidate) − PPL(baseline). Accept if within budget:
 #    Ship:          abs(ΔPPL) <= 0.05
 #    Sqfree:        abs(ΔPPL) <= 0.10
 #    Sqfree+spinor: abs(ΔPPL) <= 0.15
+#    Hierarchical:  abs(ΔPPL) <= 0.15  (9% skeleton, same tolerance as sqfree+spinor)
 ```
+
+**Overriding a preset for a sweep.** Explicit CLI flags beat the preset —
+the layering is `defaults < preset < env vars < CLI flags` (see *Layering*
+above). So to sweep bit allocations on top of `auto`:
+
+```bash
+sp-engine perplexity --cache --model-preset auto \
+    --k-bits 5,4,4,3 --v-bits 3 --residual-bits 3 \
+    --sqfree --model <ref.gguf> --ctx 2048 --chunks 8 data/wiki.raw
+```
+
+**Long-context stability.** Decode-chain error accumulates; the Cauchy
+reset system (see [CAUCHY-RESET.md](CAUCHY-RESET.md)) is how ctx ≥ 2k is
+held honest. For promotion at long context, layer `--cauchy-mode 2` on
+top of the candidate run — the shipping default (Mertens-only) is
+measured-zero-cost on real workloads.
 
 When a preset passes, flip its `.status` to `SP_PRESET_CALIBRATED`, update
 the `.notes` line with the reference checkpoint SHA + PPL drift, and note
 the promotion in the changelog.
+
+### Current calibration status (2026-04-20)
+
+| Preset      | Status        | Reference checkpoint | Measured ship drift |
+|-------------|---------------|----------------------|---------------------|
+| qwen3       | PROVISIONAL   | Qwen3-8B-Q8_0.gguf   | +0.50 PPL @ 4.06× (ctx=2048, chunks=8, wiki.test.raw) |
+| qwen3-moe   | PROVISIONAL   | —                    | not yet run |
+| gemma3      | PROVISIONAL   | —                    | not yet run |
+| llama-3     | PROVISIONAL   | Dolphin-1B-Q8        | +13.7% @ 3.76× (1B regime — dominated by scaling law, not preset quality) |
+
+The qwen3 ship number is at the edge of the 0.05 ship budget — the
+preset is shippable but doesn't have headroom. See `archive/eval/
+CALIBRATION_FINDINGS.md` (local, untracked) for the run-by-run log.
 
 ## Roadmap
 

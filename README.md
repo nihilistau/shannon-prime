@@ -66,6 +66,28 @@ Pads hd → next sqfree multiple (64 → 66, 128 → 154, 256 → 330) so the
 Möbius predictor gets r = 0.40–0.58 (vs ≈ 0 on pure power-of-2). Gated on
 `SHANNON_PRIME_SQFREE=1`; auto-enabled with `SHANNON_PRIME_SPINOR=1`.
 
+### Hierarchical Vilenkin predictor (opt-in, maximum skeleton reduction)
+```
+Write: raw KV → sqfree_pad → Vilenkin transform → keep low-prime subgroup
+       (e.g. Z/2Z × Z/7Z = 14 / 154 coeffs ≈ 9%) → band-quant skeleton
+       → ridge-predict the 140 high-prime refinement coeffs per (layer,head)
+       → residual quant (2-bit) → Store
+Read:  Load skeleton + residual → dequant skeleton → linear-predict
+       refinement from skeleton → add residual → inverse Vilenkin → KV
+```
+Requires calibration — a prefill of ≥24 tokens per slot fits the per-(layer×head)
+ridge regression map, persisted on the `KvCache`. Emits a warning below that
+threshold. Selected with `--hierarchical` on the engine; `--hier-level`,
+`--hier-res-bits`, and `--hier-skel-bits` tune the skeleton / predictor balance.
+
+### Decode-chain causal stability (Cauchy reset)
+Long decode chains accumulate per-step reconstruction error. The Cauchy
+reset system — a Mertens zeta-schedule with an optional Ricci drift
+sentinel — detects the drift and refreshes the cache with a re-prefill from
+ground-truth tokens. Zero measured cost in the shipping default
+(Mertens-only), bounds cache error for ctx ≥ 2k. Detailed design in
+[docs/CAUCHY-RESET.md](docs/CAUCHY-RESET.md).
+
 ## Project Structure
 
 The math core lives in this repo. Two sibling repos depend on it
@@ -147,8 +169,16 @@ shannon-prime-repos/                  ← parent dir holding all three
 ```bash
 git clone --recursive https://github.com/nihilistau/shannon-prime-engine
 cd shannon-prime-engine
+
+# CPU build
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+
+# CUDA build (optional)
+cmake -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DSP_ENGINE_WITH_CUDA=ON -DGGML_CUDA=ON \
+      -DCMAKE_CUDA_ARCHITECTURES=75    # 75=2060/T4, 86=30-series, 89=40-series
+cmake --build build-cuda
 
 # Sanity: per-layer K correlation on real RoPE'd K, ship vs sqfree.
 ./build/bin/sp-engine prefill --model dolphin_1b.gguf "The quick brown fox"
@@ -156,9 +186,21 @@ cmake --build build
 
 # Greedy generation through the optimised single-token decode + cache.
 ./build/bin/sp-engine chat --model dolphin_1b.gguf --n-predict 16 "The quick brown fox"
-./build/bin/sp-engine chat --sqfree --spinor --model dolphin_1b.gguf --n-predict 16 "..."
+
+# Drift measurement: compressed PPL − baseline PPL on wikitext.
+# --model-preset auto resolves arch → preset from the model-pack registry.
+SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine perplexity --cache \
+    --model qwen3-8b-q8.gguf --model-preset auto \
+    --ctx 2048 --chunks 8 data/wiki.test.raw
+
+# Long-context decode-chain stability via Cauchy reset (Mertens schedule):
+SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine perplexity --cache \
+    --model qwen3-8b-q8.gguf --cauchy-mode 2 \
+    --ctx 4096 --chunks 8 data/wiki.test.raw
 ```
 Full verb list and stage status in [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md).
+Model-pack presets for auto-resolution: [docs/MODEL-PACK.md](docs/MODEL-PACK.md).
+Cauchy design + ablation: [docs/CAUCHY-RESET.md](docs/CAUCHY-RESET.md).
 
 ### llama.cpp — ship path
 ```bash
@@ -253,9 +295,9 @@ Use as a pre-bench filter — skip configs with predicted ΔPPL > 5%.
 | Sqfree+spinor | 69 | Knight CSR, residual quant, spinor no-regress, scaling law |
 | **Total** | **187/188** | *(1 known synthetic-K flake — see CLAUDE.md)* |
 
-## Environment Variables
+## Settings reference
 
-### Ship path
+### llama.cpp hook — ship path (env vars)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SHANNON_PRIME_ENABLED` | 0 | Enable the VHT2 shadow cache |
@@ -264,13 +306,43 @@ Use as a pre-bench filter — skip configs with predicted ΔPPL > 5%.
 | `SHANNON_PRIME_MOBIUS` | 1 | Möbius squarefree-first reorder (K only) |
 | `SHANNON_PRIME_VERBOSE` | 0 | Print config + init |
 
-### Sqfree+spinor (opt-in)
+### llama.cpp hook — sqfree+spinor (opt-in env vars)
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SHANNON_PRIME_SQFREE` | 0 | Enable sqfree prime-Hartley basis (pads hd) |
 | `SHANNON_PRIME_SPINOR` | 0 | Enable SU(2) sheet bit (auto-enables SQFREE) |
 | `SHANNON_PRIME_RESIDUAL_BITS` | 3 | Residual depth (1–4; 3 is the Pareto point) |
 | `SHANNON_PRIME_SK_FRAC` | 0.75 | Skeleton fraction of pad_dim |
+
+### shannon-prime-engine — runtime env vars
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `SP_ENGINE_BACKEND` | *(unset)* | `gpu` / `cuda` / `vulkan` — route forward + weights + cache through the named GPU backend. Unset = CPU (mmap weights). |
+| `SHANNON_PRIME_GPU_CACHE` | 1 | When backend is GPU, route `KvCache` to the GPU-resident path (`create_gpu`). Set `0` for the host-cache A/B diagnostic. |
+| `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | Upload calibrated variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache after `calibrate_end`. Measured +0.21 PPL asymmetric regression on Qwen3-8B ship; keep off unless investigating. |
+| `SHANNON_PRIME_SQFREE_NO_BATCH` | 0 | Fall back to per-vec sqfree GPU read (diagnostic — batched path is correct on kv_smoke, real-model PPL still validating). |
+| `SHANNON_PRIME_NO_CALIBRATE` | 0 | Skip auto-calibration — for A/B against a static mask on the same run. |
+| `SP_CALIBRATE` | 0 | Force the `prefill` CLI verb to calibrate before writing. |
+| `SP_DEBUG_DECODE` | 0 | Print per-layer K/X correlation vs `forward_full` at each decode step. |
+
+### shannon-prime-engine — CLI flags (shared across kv_smoke / prefill / chat / perplexity / cache_ppl)
+| Flag | Effect |
+|------|--------|
+| *(none)* | **Ship path** — VHT2 + Möbius + 4-band banded quant. |
+| `--sqfree` | Sqfree prime-Hartley + Knight skeleton (L/2) + 3-bit residual. |
+| `--sqfree --spinor` | Adds SU(2) sheet-bit correction (+0.008–0.010 K_corr). |
+| `--hierarchical` | Hierarchical Vilenkin predictor, 9% skeleton + calibrated ridge map + 2-bit residual. |
+| `--model-preset auto\|off\|<name>` | Apply model-pack overlay (`auto` resolves from arch; see docs/MODEL-PACK.md). |
+| `--k-bits CSV` / `--v-bits CSV` | Per-band bit allocation override. |
+| `--residual-bits N` | Sqfree residual depth (1–4, default 3). |
+| `--hier-level N` / `--hier-res-bits N` / `--hier-skel-bits CSV` | Hierarchical tuning knobs. |
+| `--no-mobius` | Disable Möbius reorder (ship path). |
+| `--ctx N` / `--chunks N` | Per-chunk context + number of chunks for perplexity/cache_ppl. |
+| `--cache` | (perplexity verb) Run decode-chain through the compressed cache — this is the drift measurement. |
+| `--cauchy-mode N` | 0 = off, 1 = fixed-N, 2 = dynamic Mertens (shipping default when enabled). |
+| `--cauchy-fixed-n N` / `--cauchy-cooldown N` / `--cauchy-warmup N` | Cauchy schedule knobs (default 512 / 64 / 64). |
+| `--cauchy-use-ricci` / `--cauchy-ricci-only` / `--cauchy-mertens-only` | Opt-in Ricci sentinel / ablation gates. |
+| `--pe-mode standard\|primepe\|primepe_alibi\|alibi` + `--pe-alpha F` + `--pe-tier 0\|1` | PrimePE-RoPE-ALiBi positional-encoding family. |
 
 ## License
 
