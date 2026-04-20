@@ -47,8 +47,11 @@ an explicit user setting can override.
 
 ## Current registry (shannon-prime v1.17+)
 
-All seven entries ship at `SP_PRESET_PROVISIONAL` — the numbers are reasoned
-guesses, not validated against PPL on a reference checkpoint. See *Promotion
+Seven entries ship in the registry. One — `phi3` — is currently
+`SP_PRESET_CALIBRATED` (see calibration status table below and the ledger
+at [MODEL-PACK-CALIBRATION.md](MODEL-PACK-CALIBRATION.md)). The remaining
+six ship at `SP_PRESET_PROVISIONAL` — the numbers are reasoned guesses,
+not validated against PPL on a reference checkpoint. See *Promotion
 recipe* below for the validation workflow.
 
 | name        | arch match   | K bits          | V bits          | res | spinor |
