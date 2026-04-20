@@ -154,7 +154,7 @@ the promotion in the changelog.
 | gemma4      | PROVISIONAL   | gemma-4-31B-it-Q4_K_M.gguf (on disk)  | not yet run |
 | gemma3      | PROVISIONAL   | —                                  | not yet run |
 | phi3        | PROVISIONAL   | phi-4-Q4_K_M.gguf, Phi-3.1-mini-128k-instruct-Q4_K_M.gguf (on disk) | not yet run |
-| llama-3     | PROVISIONAL   | Dolphin-1B-Q8                      | +13.7% @ 3.76× (1B regime — dominated by scaling law, not preset quality) |
+| llama-3     | PROVISIONAL   | Dolphin3.0-Llama3.2-1B-Q8          | +0.95 PPL / +8.16% @ 3.76× (ctx=2048, chunks=8, wiki.test.raw). 1B regime — dominated by scaling law; ship-path budget will likely pass at ≥8B on the same corpus (cf. qwen3 row). |
 
 The qwen3 ship number is at the edge of the 0.05 ship budget — the
 preset is shippable but doesn't have headroom. See

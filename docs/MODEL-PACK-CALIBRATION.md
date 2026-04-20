@@ -43,6 +43,7 @@ decision. Every row should list the exact git SHAs for both
 | 2026-04-20 | qwen3     | ship        | Qwen3-8B-Q8_0.gguf                 | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8     |  9.8035      | 10.3076       | +0.504 |  5.14 %      | ≤5 %    | **FAIL** (edge, +0.14 pp over budget) | KnackAU |
 | 2026-04-20 | qwen3     | sqfree      | Qwen3-8B-Q8_0.gguf                 | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8 (ch3) |  9.8035    | 57.82         | +48.0  | 490 %        | ≤10 %   | **FAIL** | KnackAU  |
 | 2026-04-20 | qwen3     | sqfree+spinor+cauchy2 | Qwen3-8B-Q8_0.gguf       | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8 (aborted pre-chunk 1) | 9.8035 | —      | —      | —            | ≤15 %   | **PARTIAL** (run didn't complete) | KnackAU |
+| 2026-04-21 | llama-3   | ship        | Dolphin3.0-Llama3.2-1B.Q8_0.gguf   | (not recorded)         | `bbac74f`   | `9446574`  | 2048 / 8     | 11.6150      | 12.5629       | +0.948 |  8.16 %      | ≤5 %    | **FAIL** (1B regime — scaling law dominates) | KnackAU |
 
 Supporting logs for every row above live under
 `archive/eval/logs/` on the maintainer's machine (the `archive/` tree is
