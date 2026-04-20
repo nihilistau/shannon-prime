@@ -144,13 +144,14 @@ static const sp_model_preset_t g_presets[] = {
     // ── Phi 3 / Phi 3.1 / Phi 4 (all ship arch="phi3" in GGUF) ────────
     // Microsoft's phi-4 GGUF still carries general.architecture="phi3"
     // (verified on lmstudio-community/phi-4-Q4_K_M.gguf). Dense GQA
-    // attention with a Llama-like band profile. Provisional numbers
-    // mirror llama-3 as the conservative default; a dedicated
-    // calibration pass can diverge once PPL drift is measured.
+    // attention with a Llama-like band profile. Calibrated 2026-04-21
+    // on Phi-3.1-mini-4k-Q8_0 at ctx=2048 chunks=8: baseline PPL 5.0297,
+    // ship PPL 5.1523, drift +2.44% (≤5% ship budget). Ledger row in
+    // shannon-prime/docs/MODEL-PACK-CALIBRATION.md.
     {
         .name              = "phi3",
         .arch_pattern      = "phi3",
-        .notes             = "Phi 3.x and Phi 4 (all ship arch=phi3); llama-3-like band profile until calibrated",
+        .notes             = "Phi 3.x and Phi 4 (all ship arch=phi3); ship +2.44% drift on Phi-3.1-mini-Q8 2026-04-21",
         .head_dim_hint     = 0,
         .min_n_layer       = 1,
         .min_n_head_kv     = 1,
@@ -162,7 +163,7 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = false,
         .recommend_spinor  = false,
-        .status            = SP_PRESET_PROVISIONAL,
+        .status            = SP_PRESET_CALIBRATED,
     },
 
     // ── Llama 3 / 3.1 / 3.2 / 3.3 ──────────────────────────────────────

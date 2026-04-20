@@ -153,7 +153,7 @@ the promotion in the changelog.
 | qwen3       | PROVISIONAL   | Qwen3-8B-Q8_0.gguf                 | +0.50 PPL @ 4.06× (ctx=2048, chunks=8, wiki.test.raw) |
 | gemma4      | PROVISIONAL   | gemma-4-31B-it-Q4_K_M.gguf (on disk)  | not yet run |
 | gemma3      | PROVISIONAL   | —                                  | not yet run |
-| phi3        | PROVISIONAL   | phi-4-Q4_K_M.gguf, Phi-3.1-mini-128k-instruct-Q4_K_M.gguf (on disk) | not yet run |
+| phi3        | CALIBRATED (2026-04-21) | Phi-3.1-mini-4k-instruct-Q8_0.gguf | +0.123 PPL / +2.44 % @ 3.96× (ctx=2048, chunks=8, wiki.test.raw) |
 | llama-3     | PROVISIONAL   | Dolphin3.0-Llama3.2-1B-Q8          | +0.95 PPL / +8.16% @ 3.76× (ctx=2048, chunks=8, wiki.test.raw). 1B regime — dominated by scaling law; ship-path budget will likely pass at ≥8B on the same corpus (cf. qwen3 row). |
 
 The qwen3 ship number is at the edge of the 0.05 ship budget — the

@@ -44,6 +44,7 @@ decision. Every row should list the exact git SHAs for both
 | 2026-04-20 | qwen3     | sqfree      | Qwen3-8B-Q8_0.gguf                 | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8 (ch3) |  9.8035    | 57.82         | +48.0  | 490 %        | ≤10 %   | **FAIL** | KnackAU  |
 | 2026-04-20 | qwen3     | sqfree+spinor+cauchy2 | Qwen3-8B-Q8_0.gguf       | `60F232FBBDB88A36…`    | `aaa3374`   | `a105b99`  | 2048 / 8 (aborted pre-chunk 1) | 9.8035 | —      | —      | —            | ≤15 %   | **PARTIAL** (run didn't complete) | KnackAU |
 | 2026-04-21 | llama-3   | ship        | Dolphin3.0-Llama3.2-1B.Q8_0.gguf   | (not recorded)         | `bbac74f`   | `9446574`  | 2048 / 8     | 11.6150      | 12.5629       | +0.948 |  8.16 %      | ≤5 %    | **FAIL** (1B regime — scaling law dominates) | KnackAU |
+| 2026-04-21 | phi3      | ship        | Phi-3.1-mini-4k-instruct-Q8_0.gguf | (not recorded)         | `b1db3e9`   | `9446574`+OI1 | 2048 / 8 |  5.0297      |  5.1523       | +0.123 |  2.44 %      | ≤5 %    | **PASS** — flipped to `SP_PRESET_CALIBRATED`. Engine SHA is pre-commit; fused-QKV + packed-SwiGLU loader+forward (OI1) lands in the same commit sequence as this row. | KnackAU |
 
 Supporting logs for every row above live under
 `archive/eval/logs/` on the maintainer's machine (the `archive/` tree is
@@ -57,8 +58,8 @@ untracked and local-only — see the top-level workspace `.gitignore`).
 | qwen3-moe   | `PROVISIONAL`          | No reference checkpoint on disk. Will calibrate when one lands. |
 | qwen3       | `PROVISIONAL` (kept)   | Ship path misses the 5 % budget by 0.14 pp; sqfree catastrophic. Preset is still the best shipping default for Qwen3 dense — flipping to `CALIBRATED` would require either a bit-budget revision (doc work, not math) or a tighter preset that trades compression for fidelity. Until one of those lands the preset stays `PROVISIONAL`. |
 | gemma4      | `PROVISIONAL`          | Engine doesn't register `gemma4` arch yet (same story as gemma3 below); no forward graph, nothing to calibrate. |
-| gemma3      | `PROVISIONAL`          | `LlamaWeights: unsupported arch 'gemma3'` — task #25 filed; run blocked until that lands (gated behind SWA + final soft-cap support in the forward graph). |
-| phi3        | `PROVISIONAL`          | Two reference checkpoints on disk (phi-4-Q4_K_M, Phi-3.1-mini-128k-instruct-Q4_K_M). Planned next run — tracked as task #49. |
+| gemma3      | `PROVISIONAL`          | OI2 loader+forward (SWA + final soft-cap + sandwich norms + token-embd-scale) landed. Calibration blocked on an unrelated CUDA `getrows` limitation: `lmstudio-community/gemma-3-12b-it-Q3_K_L.gguf` ships a Q6_K `token_embd.weight` and the CUDA `getrows` kernel only dispatches on F16/F32/I32/BF16/Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 (vendor/ggml/src/ggml-cuda/getrows.cu). Unblocks via either a gemma3 GGUF with a non-K-quant embed, a CPU-backend run, or a patch to `getrows.cu` that adds a K-quant dispatch path. |
+| phi3        | `CALIBRATED` (2026-04-21) | Ship +2.44 % drift on Phi-3.1-mini-4k-Q8_0 at ctx=2048, chunks=8. OI1 fused-QKV + packed-SwiGLU loader+forward landed in engine + `build_block_decode` FFN fix. Phi-4-Q4_K_M checkpoint on disk is a future CPU-backend run (K-quant embed unsupported by CUDA getrows). |
 | llama-3     | `PROVISIONAL`          | 1B ship-path measurement is dominated by the model-scale regime (see CALIBRATION_FINDINGS §2). Re-measure at ≥ 7B before making a call — task #27. |
 
 ## When a preset passes
