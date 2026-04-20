@@ -157,8 +157,11 @@ the promotion in the changelog.
 | llama-3     | PROVISIONAL   | Dolphin-1B-Q8                      | +13.7% @ 3.76× (1B regime — dominated by scaling law, not preset quality) |
 
 The qwen3 ship number is at the edge of the 0.05 ship budget — the
-preset is shippable but doesn't have headroom. See `archive/eval/
-CALIBRATION_FINDINGS.md` (local, untracked) for the run-by-run log.
+preset is shippable but doesn't have headroom. See
+[MODEL-PACK-CALIBRATION.md](MODEL-PACK-CALIBRATION.md) for the
+append-only ledger (every promotion attempt, pass or fail) and
+`archive/eval/CALIBRATION_FINDINGS.md` (local, untracked) for the
+run-by-run log.
 
 ## Roadmap
 
@@ -166,8 +169,14 @@ CALIBRATION_FINDINGS.md` (local, untracked) for the run-by-run log.
   gpu-kv.patch`) currently hardcodes env-variable overrides onto shipping
   defaults. The next patch revision should call `sp_model_preset_resolve`
   against `hp.arch` after `sp_config_init` and before the env-var overlay.
-- **Engine CLI** — `sp-engine` will grow a `--model-preset auto|<name>|off`
-  flag. `auto` is the default for calibration builds once the registry has
-  at least one `CALIBRATED` entry; `off` stays the default until then.
-- **Calibration ledger** — `docs/MODEL-PACK-CALIBRATION.md` will append
-  one row per promotion (date, model, SHA, PPL drift, reviewer).
+- **Engine CLI** — `sp-engine --model-preset auto|<name>|off` landed in
+  `shannon-prime-engine` (commits around Phase 3 + env-var follow-up
+  `9446574`). Every verb that accepts a `Config` now reads
+  `SHANNON_PRIME_MODEL_PRESET` as well, so the layering documented
+  above is wired end-to-end. `off` remains the shipping default
+  until at least one preset is `SP_PRESET_CALIBRATED`.
+- **Calibration ledger** — [MODEL-PACK-CALIBRATION.md](MODEL-PACK-CALIBRATION.md)
+  is now the append-only log of every promotion attempt (pass or fail).
+  Each row carries date, model, GGUF SHA, SP + engine SHAs, drift vs
+  baseline, and reviewer. New calibration runs land as new rows — the
+  summary table in this doc is derived from the latest row per preset.
