@@ -47,27 +47,46 @@ an explicit user setting can override.
 
 ## Current registry (shannon-prime v1.17+)
 
-All four entries ship at `SP_PRESET_PROVISIONAL` — the numbers are reasoned
+All seven entries ship at `SP_PRESET_PROVISIONAL` — the numbers are reasoned
 guesses, not validated against PPL on a reference checkpoint. See *Promotion
 recipe* below for the validation workflow.
 
 | name        | arch match   | K bits          | V bits          | res | spinor |
 |-------------|--------------|-----------------|-----------------|-----|--------|
+| qwen3-next  | `qwen35moe`  | 5,4,4,4,4       | 4,4,4,4,4       | 3   | on     |
 | qwen3-moe   | `qwen3moe`   | 5,4,4,4,4       | 4,4,4,4,4       | 3   | on     |
 | qwen3       | `qwen3`      | 5,5,4,3         | 4,3             | 3   | off    |
+| gemma4      | `gemma4`     | 5,4,4,3         | 3               | 3   | off    |
 | gemma3      | `gemma3`     | 5,4,4,3         | 3               | 3   | off    |
+| phi3        | `phi3`       | 5,5,4,3         | 3               | 3   | off    |
 | llama-3     | `llama`      | 5,5,4,3         | 3               | 3   | off    |
 
 Rationale:
 
-- **qwen3-moe** — MoE expert routing produces denser K/V activations; more K
-  bands preserve mid-band energy, uniform V bands because no single band
-  dominates, spinor recommended because the sheet-bit recovery shows its
-  biggest gains when the mid-band magnitude is substantial.
+- **qwen3-next** — Qwen3.6-35B-A3B (ships arch `qwen35moe`). Hybrid SSM+MoE
+  architecture with 40 layers: every 4th is full MoE attention and the rest
+  are Gated DeltaNet with recurrent state. The preset only affects the 10
+  attention layers (GDN layers contribute no K/V to the cache), but the
+  band profile is the same as qwen3-moe because the attention layers
+  themselves are still MoE-dense. **Must precede** `qwen3moe` and `qwen3`
+  in the registry — `strstr("qwen35moe", "qwen3")` matches at position 0,
+  so without this entry a Qwen3.6 model would silently adopt the dense
+  qwen3 preset.
+- **qwen3-moe** — original MoE variants (non-hybrid). Dense KV, high
+  mid-band energy; spinor recommended because the sheet-bit recovery
+  shows its biggest gains when the mid-band magnitude is substantial.
 - **qwen3** (dense) — similar to Llama-3 on K, but V empirically carries
   more energy, so two V bands instead of one.
+- **gemma4** — GGUFs ship a distinct arch string (`gemma4`, verified on
+  lmstudio-community/gemma-4-31B-it-Q4_K_M). Inherits gemma3's SWA band
+  profile until a dedicated calibration run lands; split out now so it
+  can diverge without a pattern migration.
 - **gemma3** — sliding-window attention puts more weight on the top K band;
   preserve K[0]=5 but drop K[1] a bit. V is flat 3-bit like Llama.
+- **phi3** — Phi 3 / 3.1 / 4 all ship `general.architecture="phi3"` in
+  GGUF (verified on lmstudio-community/phi-4-Q4_K_M and
+  Phi-3.1-mini-128k-instruct-Q4_K_M). Dense GQA with a Llama-like profile.
+  Provisional numbers mirror llama-3 as the conservative default.
 - **llama-3** — shipping defaults. The preset exists so matches are logged
   and the auto-adapts story is auditable.
 
@@ -125,14 +144,17 @@ When a preset passes, flip its `.status` to `SP_PRESET_CALIBRATED`, update
 the `.notes` line with the reference checkpoint SHA + PPL drift, and note
 the promotion in the changelog.
 
-### Current calibration status (2026-04-20)
+### Current calibration status (2026-04-21)
 
-| Preset      | Status        | Reference checkpoint | Measured ship drift |
-|-------------|---------------|----------------------|---------------------|
-| qwen3       | PROVISIONAL   | Qwen3-8B-Q8_0.gguf   | +0.50 PPL @ 4.06× (ctx=2048, chunks=8, wiki.test.raw) |
-| qwen3-moe   | PROVISIONAL   | —                    | not yet run |
-| gemma3      | PROVISIONAL   | —                    | not yet run |
-| llama-3     | PROVISIONAL   | Dolphin-1B-Q8        | +13.7% @ 3.76× (1B regime — dominated by scaling law, not preset quality) |
+| Preset      | Status        | Reference checkpoint               | Measured ship drift |
+|-------------|---------------|------------------------------------|---------------------|
+| qwen3-next  | PROVISIONAL   | Qwen3.6-35B-A3B-Q4_K_M.gguf (on disk) | not yet run |
+| qwen3-moe   | PROVISIONAL   | —                                  | not yet run |
+| qwen3       | PROVISIONAL   | Qwen3-8B-Q8_0.gguf                 | +0.50 PPL @ 4.06× (ctx=2048, chunks=8, wiki.test.raw) |
+| gemma4      | PROVISIONAL   | gemma-4-31B-it-Q4_K_M.gguf (on disk)  | not yet run |
+| gemma3      | PROVISIONAL   | —                                  | not yet run |
+| phi3        | PROVISIONAL   | phi-4-Q4_K_M.gguf, Phi-3.1-mini-128k-instruct-Q4_K_M.gguf (on disk) | not yet run |
+| llama-3     | PROVISIONAL   | Dolphin-1B-Q8                      | +13.7% @ 3.76× (1B regime — dominated by scaling law, not preset quality) |
 
 The qwen3 ship number is at the edge of the 0.05 ship budget — the
 preset is shippable but doesn't have headroom. See `archive/eval/

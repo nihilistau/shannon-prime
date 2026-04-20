@@ -29,9 +29,38 @@
 //   * First match wins — order presets from most-specific to most-general.
 
 static const sp_model_preset_t g_presets[] = {
-    // ── Qwen 3.6 MoE (and Qwen 3 MoE variants) ─────────────────────────
-    // Most-specific: wide MoE stacks, dense K/V heads, benefit most from
-    // sqfree + spinor because mid-band energy is the dominant contributor.
+    // ── Qwen 3.6 35B-A3B / Qwen3-Next (hybrid SSM+MoE) ────────────────
+    // Arch string is "qwen35moe". MUST come before "qwen3moe" and
+    // "qwen3" — strstr("qwen35moe", "qwen3moe") is NULL (the "5" breaks
+    // the substring), but strstr("qwen35moe", "qwen3") matches at pos 0,
+    // so without this entry a qwen35moe model would silently adopt the
+    // dense qwen3 preset. Qwen3.6 has 40 layers with only 10 full MoE
+    // attention layers (every 4th) — the rest are Gated DeltaNet with
+    // recurrent state, contributing no K/V to the cache at all. The
+    // preset therefore applies to a much smaller slice of layers than
+    // the qwen3-moe preset, but the band profile is the same: MoE
+    // dense-KV mid-band energy, spinor recommended.
+    {
+        .name              = "qwen3-next",
+        .arch_pattern      = "qwen35moe",
+        .notes             = "Qwen3.6 hybrid SSM+MoE; preset applies to the 10 full-attn layers (GDN layers have no KV)",
+        .head_dim_hint     = 0,
+        .min_n_layer       = 1,
+        .min_n_head_kv     = 1,
+        .k_n_bands         = 5,
+        .k_band_bits       = { 5, 4, 4, 4, 4 },
+        .v_n_bands         = 5,
+        .v_band_bits       = { 4, 4, 4, 4, 4 },
+        .residual_bits     = 3,
+        .use_mobius        = true,
+        .recommend_sqfree  = true,
+        .recommend_spinor  = true,
+        .status            = SP_PRESET_PROVISIONAL,
+    },
+
+    // ── Qwen 3 MoE (original MoE variants, non-hybrid) ─────────────────
+    // Wide MoE stacks, dense K/V heads, benefit most from sqfree +
+    // spinor because mid-band energy is the dominant contributor.
     {
         .name              = "qwen3-moe",
         .arch_pattern      = "qwen3moe",
@@ -69,7 +98,31 @@ static const sp_model_preset_t g_presets[] = {
         .status            = SP_PRESET_PROVISIONAL,
     },
 
-    // ── Gemma 3 (Gemma 4 reuses hparams layout; same preset until diverged) ─
+    // ── Gemma 4 (distinct arch string; reuses the gemma3 SWA band profile) ─
+    // GGUFs ship with arch "gemma4" (verified on gemma-4-31B-it-Q4_K_M).
+    // Until a dedicated calibration run exists the bit budget tracks
+    // gemma3's provisional numbers — same sliding-window attention
+    // pattern, same "preserve upper K band" intuition. Split out now so
+    // future calibration can diverge without a string-pattern migration.
+    {
+        .name              = "gemma4",
+        .arch_pattern      = "gemma4",
+        .notes             = "Gemma 4: inherits gemma3 SWA band profile until dedicated calibration lands",
+        .head_dim_hint     = 0,
+        .min_n_layer       = 1,
+        .min_n_head_kv     = 1,
+        .k_n_bands         = 4,
+        .k_band_bits       = { 5, 4, 4, 3 },
+        .v_n_bands         = 1,
+        .v_band_bits       = { 3 },
+        .residual_bits     = 3,
+        .use_mobius        = true,
+        .recommend_sqfree  = true,
+        .recommend_spinor  = false,
+        .status            = SP_PRESET_PROVISIONAL,
+    },
+
+    // ── Gemma 3 ────────────────────────────────────────────────────────
     {
         .name              = "gemma3",
         .arch_pattern      = "gemma3",
@@ -84,6 +137,30 @@ static const sp_model_preset_t g_presets[] = {
         .residual_bits     = 3,
         .use_mobius        = true,
         .recommend_sqfree  = true,
+        .recommend_spinor  = false,
+        .status            = SP_PRESET_PROVISIONAL,
+    },
+
+    // ── Phi 3 / Phi 3.1 / Phi 4 (all ship arch="phi3" in GGUF) ────────
+    // Microsoft's phi-4 GGUF still carries general.architecture="phi3"
+    // (verified on lmstudio-community/phi-4-Q4_K_M.gguf). Dense GQA
+    // attention with a Llama-like band profile. Provisional numbers
+    // mirror llama-3 as the conservative default; a dedicated
+    // calibration pass can diverge once PPL drift is measured.
+    {
+        .name              = "phi3",
+        .arch_pattern      = "phi3",
+        .notes             = "Phi 3.x and Phi 4 (all ship arch=phi3); llama-3-like band profile until calibrated",
+        .head_dim_hint     = 0,
+        .min_n_layer       = 1,
+        .min_n_head_kv     = 1,
+        .k_n_bands         = 4,
+        .k_band_bits       = { 5, 5, 4, 3 },
+        .v_n_bands         = 1,
+        .v_band_bits       = { 3 },
+        .residual_bits     = 3,
+        .use_mobius        = true,
+        .recommend_sqfree  = false,
         .recommend_spinor  = false,
         .status            = SP_PRESET_PROVISIONAL,
     },
