@@ -152,7 +152,7 @@ the promotion in the changelog.
 | qwen3-moe   | PROVISIONAL   | —                                  | not yet run |
 | qwen3       | PROVISIONAL   | Qwen3-8B-Q8_0.gguf                 | +0.50 PPL @ 4.06× (ctx=2048, chunks=8, wiki.test.raw) |
 | gemma4      | PROVISIONAL   | gemma-4-31B-it-Q4_K_M.gguf (on disk)  | not yet run |
-| gemma3      | PROVISIONAL   | —                                  | not yet run |
+| gemma3      | PROVISIONAL   | gemma-3-12b-it-Q3_K_L.gguf         | ship path FAIL (catastrophic chained-decode drift; `cache_ppl` path clean at K_corr=0.990, V_corr=0.960, PPL=6.79 vs baseline 6.79; see ledger 2026-04-21 row) |
 | phi3        | CALIBRATED (2026-04-21) | Phi-3.1-mini-4k-instruct-Q8_0.gguf | +0.123 PPL / +2.44 % @ 3.96× (ctx=2048, chunks=8, wiki.test.raw) |
 | llama-3     | PROVISIONAL   | Dolphin3.0-Llama3.2-1B-Q8          | +0.95 PPL / +8.16% @ 3.76× (ctx=2048, chunks=8, wiki.test.raw). 1B regime — dominated by scaling law; ship-path budget will likely pass at ≥8B on the same corpus (cf. qwen3 row). |
 
