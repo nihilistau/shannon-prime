@@ -12,10 +12,55 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// ============================================================================
+// FP16 Utilities
+// ============================================================================
+
+static inline float sp_f16_to_f32(uint16_t h) {
+    // IEEE 754 half-precision to single-precision
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            // Denormalized
+            exp = 1;
+            while (!(mant & 0x400)) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13); // Inf/NaN
+    } else {
+        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+    }
+    float result;
+    memcpy(&result, &f, sizeof(float));
+    return result;
+}
+
+static inline uint16_t sp_f32_to_f16(float val) {
+    uint32_t f;
+    memcpy(&f, &val, sizeof(uint32_t));
+    uint16_t sign = (f >> 16) & 0x8000;
+    int exp = ((f >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = f & 0x7FFFFF;
+    if (exp <= 0) {
+        return sign; // Flush to zero
+    } else if (exp >= 31) {
+        return sign | 0x7C00; // Inf
+    }
+    return sign | (exp << 10) | (mant >> 13);
+}
 
 // ============================================================================
 // Constants
@@ -507,7 +552,7 @@ typedef struct {
     // where t is the target index and s is the skeleton index.
     // NULL before calibration; set to fp32 after calibrate_end.
     // (Future: quantise to fp16 for storage efficiency.)
-    float  *W;                  // [n_target × n_skeleton] or NULL
+    uint16_t *W;                // [n_target × n_skeleton] or NULL
     bool    calibrated;         // true after successful calibrate_end
 
     // Calibration accumulators (transient, freed after calibrate_end)
@@ -799,11 +844,13 @@ typedef struct {
     int      n_schedule;
     int      schedule[SP_MERTENS_MAX_SCHEDULE];
     float    risk[SP_MERTENS_MAX_SCHEDULE];
+    float   *risk_cache;          // O(1) direct lookup map [max_ctx]
     int      max_ctx;
     int      schedule_idx;
 } sp_mertens_oracle_t;
 
 int    sp_mertens_init(sp_mertens_oracle_t *mo, int max_ctx);
+void   sp_mertens_free(sp_mertens_oracle_t *mo);   // releases risk_cache
 float  sp_mertens_risk(const sp_mertens_oracle_t *mo, int pos);
 int    sp_mertens_next_risk(const sp_mertens_oracle_t *mo,
                             int current_pos, int lookahead);

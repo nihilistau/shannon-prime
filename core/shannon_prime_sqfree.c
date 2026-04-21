@@ -76,10 +76,13 @@ void sp_sqfree_pad_f32(const float *in, int head_dim,
                        float *out, int pad_dim) {
     memcpy(out, in, head_dim * sizeof(float));
     if (pad_dim > head_dim) {
-        // Mean-fill tail
+        // Mean-fill tail. Precompute the reciprocal so the hot path is
+        // a multiply instead of a divide (identical result modulo IEEE
+        // rounding on the single 1/head_dim op).
         double sum = 0.0;
         for (int i = 0; i < head_dim; i++) sum += in[i];
-        float mean = (float)(sum / head_dim);
+        const double inv_hd = 1.0 / (double)head_dim;
+        float mean = (float)(sum * inv_hd);
         for (int i = head_dim; i < pad_dim; i++) out[i] = mean;
     }
 }
@@ -1123,6 +1126,9 @@ static int sp_solve_spd(double *A, double *B, int ns, int nt) {
 
 int sp_hier_calibrate_end(sp_hier_predictor_t *hp) {
     if (!hp->calibrating || hp->calib_n < 1) return -1;
+    if (hp->calib_n < 24) {
+        fprintf(stderr, "[Shannon-Prime HIER] WARNING: calibration needs >= 24 tokens (got %d). Ridge regression may underfit.\n", hp->calib_n);
+    }
     hp->calibrating = false;
 
     int ns = hp->n_skeleton;
@@ -1146,11 +1152,11 @@ int sp_hier_calibrate_end(sp_hier_predictor_t *hp) {
         }
     }
 
-    // Copy W to fp32
+    // Copy W to fp16
     free(hp->W);
-    hp->W = (float *)malloc((size_t)ns * nt * sizeof(float));
+    hp->W = (uint16_t *)malloc((size_t)ns * nt * sizeof(uint16_t));
     for (int i = 0; i < ns * nt; i++) {
-        hp->W[i] = (float)hp->calib_XtY[i];
+        hp->W[i] = sp_f32_to_f16((float)hp->calib_XtY[i]);
     }
 
     // Free accumulators
@@ -1181,16 +1187,21 @@ void sp_hier_predict(const sp_hier_predictor_t *hp,
         return;
     }
 
-    int ns = hp->n_skeleton;
-    int nt = hp->n_target;
+    const int ns = hp->n_skeleton;
+    const int nt = hp->n_target;
 
     // target[t] = Σ_s W[s * nt + t] · skeleton[s]
-    for (int t = 0; t < nt; t++) {
-        float sum = 0.0f;
-        for (int s = 0; s < ns; s++) {
-            sum += hp->W[s * nt + t] * skeleton_vals[s];
+    //
+    // Swapped outer from t→s so W's inner access becomes unit-stride
+    // (was stride = nt, cache-hostile) and fp16→fp32 conversion happens
+    // inside a sequential MADD loop the compiler can vectorise.
+    memset(target_out, 0, (size_t)nt * sizeof(float));
+    for (int s = 0; s < ns; s++) {
+        const float ks = skeleton_vals[s];
+        const uint16_t *Wrow = hp->W + (size_t)s * nt;
+        for (int t = 0; t < nt; t++) {
+            target_out[t] += sp_f16_to_f32(Wrow[t]) * ks;
         }
-        target_out[t] = sum;
     }
 }
 

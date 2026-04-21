@@ -306,14 +306,50 @@ int sp_mertens_init(sp_mertens_oracle_t *mo, int max_ctx) {
     if (m_cache) free(m_cache);
 
     mo->schedule_idx = 0;
+    
+    // Bake the explicit schedule into an O(1) bitmask/risk cache mapping
+    if (mo->max_ctx > 0) {
+        mo->risk_cache = (float *)calloc((size_t)(mo->max_ctx + 1), sizeof(float));
+        if (mo->risk_cache) {
+            for (int i = 0; i < mo->n_schedule; i++) {
+                int p = mo->schedule[i];
+                for (int diff = 0; diff <= 8; diff++) {
+                    float decay = 1.0f - (float)diff / 8.0f;
+                    float val = mo->risk[i] * decay;
+                    if (p + diff <= mo->max_ctx && val > mo->risk_cache[p + diff]) 
+                        mo->risk_cache[p + diff] = val;
+                    if (p - diff >= 0 && val > mo->risk_cache[p - diff]) 
+                        mo->risk_cache[p - diff] = val;
+                }
+            }
+        }
+    }
 
-    fprintf(stderr, "[sp-mertens] Initialized for ctx=%d: %d high-risk positions flagged\n",
-            max_ctx, mo->n_schedule);
+    fprintf(stderr, "[sp-mertens] Initialized for ctx=%d: %d high-risk positions flagged, O(1) risk cache %s (%d KB)\n",
+            max_ctx, mo->n_schedule,
+            mo->risk_cache ? "active" : "FALLBACK",
+            mo->risk_cache ? (int)((mo->max_ctx + 1) * sizeof(float) / 1024) : 0);
     return 0;
 }
 
+void sp_mertens_free(sp_mertens_oracle_t *mo) {
+    if (!mo) return;
+    if (mo->risk_cache) {
+        free(mo->risk_cache);
+        mo->risk_cache = NULL;
+    }
+    // The schedule / gamma arrays are inline storage inside the struct;
+    // zero the whole thing so a re-init on the same memory starts clean
+    // and so any dangling pointers bomb loudly rather than silently.
+    memset(mo, 0, sizeof(*mo));
+}
+
 float sp_mertens_risk(const sp_mertens_oracle_t *mo, int pos) {
-    // Binary search the schedule for the nearest flagged position
+    if (mo->risk_cache && pos >= 0 && pos <= mo->max_ctx) {
+        return mo->risk_cache[pos];
+    }
+    
+    // fallback to binary search if not mapped
     if (mo->n_schedule == 0) return 0.0f;
 
     int lo = 0, hi = mo->n_schedule - 1;

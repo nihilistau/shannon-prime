@@ -10,7 +10,7 @@ NVCC       = nvcc
 NVCC_ARCH  = -arch=sm_75
 NVCC_FLAGS = -O2 $(NVCC_ARCH)
 
-CORE_SRC       = core/shannon_prime.c
+CORE_SRC       = core/shannon_prime.c core/shannon_prime_cauchy.c
 SQFREE_SRC     = core/shannon_prime_sqfree.c
 MODELPACK_SRC  = core/shannon_prime_modelpack.c
 CORE_HDR       = core/shannon_prime.h core/shannon_prime_modelpack.h

@@ -25,45 +25,6 @@ static inline int sp_is_power_of_2(int n) {
     return n > 0 && (n & (n - 1)) == 0;
 }
 
-static inline float sp_f16_to_f32(uint16_t h) {
-    // IEEE 754 half-precision to single-precision
-    uint32_t sign = (uint32_t)(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    uint32_t f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign;
-        } else {
-            // Denormalized
-            exp = 1;
-            while (!(mant & 0x400)) { mant <<= 1; exp--; }
-            mant &= 0x3FF;
-            f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        f = sign | 0x7F800000 | (mant << 13); // Inf/NaN
-    } else {
-        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    float result;
-    memcpy(&result, &f, sizeof(float));
-    return result;
-}
-
-static inline uint16_t sp_f32_to_f16(float val) {
-    uint32_t f;
-    memcpy(&f, &val, sizeof(uint32_t));
-    uint16_t sign = (f >> 16) & 0x8000;
-    int exp = ((f >> 23) & 0xFF) - 127 + 15;
-    uint32_t mant = f & 0x7FFFFF;
-    if (exp <= 0) {
-        return sign; // Flush to zero
-    } else if (exp >= 31) {
-        return sign | 0x7C00; // Inf
-    }
-    return sign | (exp << 10) | (mant >> 13);
-}
 
 // ============================================================================
 // Config
@@ -162,19 +123,36 @@ void sp_vht2_forward_f32(float *data, int n) {
     for (int pi = 0; pi < _sp_vht2_n_primes; pi++) {
         int p = _sp_vht2_primes[pi];
         while (residue % p == 0) {
-            const float *H = _sp_hartley_kernel(p);
             const int block = p * stride;
-            for (int i = 0; i < n; i += block) {
-                for (int j = 0; j < stride; j++) {
-                    float in[SP_VHT2_MAX_P];
-                    for (int k = 0; k < p; k++) {
-                        in[k] = data[i + k * stride + j];
+            if (p == 2) {
+                // Specialised Walsh-Hadamard butterfly. H2 is {{s,s},{s,-s}}
+                // with s = 1/√2, so the generic matmul collapses to
+                // (x0+x1, x0-x1)·s. Compilers vectorise the j loop cleanly
+                // once the k/m reductions are elided — this is by far the
+                // dominant stage for power-of-2 head_dims.
+                const float s = 0.70710678118654752440f;
+                for (int i = 0; i < n; i += block) {
+                    for (int j = 0; j < stride; j++) {
+                        const float x0 = data[i + j];
+                        const float x1 = data[i + stride + j];
+                        data[i + j]          = (x0 + x1) * s;
+                        data[i + stride + j] = (x0 - x1) * s;
                     }
-                    for (int k = 0; k < p; k++) {
-                        float sum = 0.0f;
-                        const float *row = H + k * p;
-                        for (int m = 0; m < p; m++) sum += row[m] * in[m];
-                        data[i + k * stride + j] = sum;
+                }
+            } else {
+                const float *H = _sp_hartley_kernel(p);
+                for (int i = 0; i < n; i += block) {
+                    for (int j = 0; j < stride; j++) {
+                        float in[SP_VHT2_MAX_P];
+                        for (int k = 0; k < p; k++) {
+                            in[k] = data[i + k * stride + j];
+                        }
+                        for (int k = 0; k < p; k++) {
+                            float sum = 0.0f;
+                            const float *row = H + k * p;
+                            for (int m = 0; m < p; m++) sum += row[m] * in[m];
+                            data[i + k * stride + j] = sum;
+                        }
                     }
                 }
             }
