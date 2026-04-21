@@ -102,7 +102,7 @@ shannon-prime-repos/                  ← parent dir holding all three
 │   │   ├── shannon_prime.c           Knight mask CSR, residual, spinor, shadow cache
 │   │   └── shannon_prime_sqfree.c    Sqfree + spinor C implementation
 │   ├── backends/
-│   │   ├── cuda/                     NVIDIA GPU kernels
+│   │   ├── cuda/                     NVIDIA GPU kernels (incl. shannon_prime_hier.cu)
 │   │   ├── vulkan/                   Cross-platform GPU + GLSL shaders
 │   │   ├── torch/                    Pure PyTorch (31 + 69 sqfree tests)
 │   │   └── adreno/                   Qualcomm: NEON tiers, Hexagon HVX, big.LITTLE
@@ -132,7 +132,7 @@ shannon-prime-repos/                  ← parent dir holding all three
 │   │   ├── prime_pe.{h,cpp}          PrimePE-RoPE-ALiBi lattice math
 │   │   ├── kv_cache.{h,cpp}          Wrapper around sp_shadow_cache_t / sp_sqfree_cache_t
 │   │   └── cli/main.cpp              Verbs: info, encode, embed, logits, kv_smoke,
-│   │                                  prefill, chat
+│   │                                  prefill, chat, cache_ppl, perplexity
 │   └── CMakeLists.txt                CMake + Ninja, optional CUDA/Vulkan
 │
 ├── shannon-prime-llama/              ← SIBLING: llama.cpp post-decode hook
@@ -197,6 +197,12 @@ SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine perplexity --cache \
 SP_ENGINE_BACKEND=gpu ./build-cuda/bin/sp-engine perplexity --cache \
     --model qwen3-8b-q8.gguf --cauchy-mode 2 \
     --ctx 4096 --chunks 8 data/wiki.test.raw
+
+# Save compressed cache to disk after generation
+./build/bin/sp-engine chat --model qwen3-8b-q8.gguf --save-cache /tmp/session1 "Hello"
+
+# Resume from saved cache
+./build/bin/sp-engine chat --model qwen3-8b-q8.gguf --load-cache /tmp/session1 "Continue"
 ```
 Full verb list and stage status in [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md).
 Model-pack presets for auto-resolution: [docs/MODEL-PACK.md](docs/MODEL-PACK.md).
@@ -320,10 +326,14 @@ Use as a pre-bench filter — skip configs with predicted ΔPPL > 5%.
 |----------|---------|--------|
 | `SP_ENGINE_BACKEND` | *(unset)* | `gpu` / `cuda` / `vulkan` — route forward + weights + cache through the named GPU backend. Unset = CPU (mmap weights). |
 | `SHANNON_PRIME_GPU_CACHE` | 1 | When backend is GPU, route `KvCache` to the GPU-resident path (`create_gpu`). Set `0` for the host-cache A/B diagnostic. |
-| `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | Upload calibrated variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache after `calibrate_end`. Measured +0.21 PPL asymmetric regression on Qwen3-8B ship; keep off unless investigating. |
+| `SHANNON_PRIME_SYNC_CALIB_TO_GPU` | 0 | Upload calibrated variance-ranked mask (ship `d_mobius_order` + sqfree Knight CSR) to the GPU cache after `calibrate_end`. Measured +0.21 PPL asymmetric regression on Qwen3-8B ship; keep off unless investigating. **Note (2026-04-22):** the fp16 scale fix in band quantize (both CUDA and CPU now recompute `inv_scale` from the stored fp16 value) eliminates the quantize/dequantize asymmetry that variance-ranking amplified. The +0.21 PPL regression needs re-measurement with the fix applied. |
 | `SHANNON_PRIME_SQFREE_NO_BATCH` | 0 | Fall back to per-vec sqfree GPU read (diagnostic — batched path is correct on kv_smoke, real-model PPL still validating). |
 | `SHANNON_PRIME_NO_CALIBRATE` | 0 | Skip auto-calibration — for A/B against a static mask on the same run. |
 | `SP_CALIBRATE` | 0 | Force the `prefill` CLI verb to calibrate before writing. |
+| `SP_ENGINE_SAVE_CACHE` | *(unset)* | Prefix path for disk cache save. Per-layer files `{prefix}.L{n}.bin`; hier path also saves `{prefix}.hier_w.bin`. |
+| `SP_ENGINE_LOAD_CACHE` | *(unset)* | Prefix path for disk cache load. Resumes from a previously saved VHT2 v2 binary session. |
+| `SP_ENGINE_COLD_MB` | *(unset)* | Cold-storage pinned-RAM budget in MB. Enables hot/cold tiered eviction (GPU VRAM → CPU pinned RAM → disk). |
+| `SP_ENGINE_EVICT_KEEP` | *(unset)* | Keep N most-recent positions in GPU VRAM; older positions spill to cold storage. |
 | `SP_DEBUG_DECODE` | 0 | Print per-layer K/X correlation vs `forward_full` at each decode step. |
 
 ### shannon-prime-engine — CLI flags (shared across kv_smoke / prefill / chat / perplexity / cache_ppl)
@@ -343,6 +353,9 @@ Use as a pre-bench filter — skip configs with predicted ΔPPL > 5%.
 | `--cauchy-mode N` | 0 = off, 1 = fixed-N, 2 = dynamic Mertens (shipping default when enabled). |
 | `--cauchy-fixed-n N` / `--cauchy-cooldown N` / `--cauchy-warmup N` | Cauchy schedule knobs (default 512 / 64 / 64). |
 | `--cauchy-use-ricci` / `--cauchy-ricci-only` / `--cauchy-mertens-only` | Opt-in Ricci sentinel / ablation gates. |
+| `--save-cache <prefix>` / `--load-cache <prefix>` | Disk serialization. VHT2 v2 binary format with 64-byte header (magic `0x56485432`). Per-layer files `{prefix}.L{n}.bin`; hier path also writes `{prefix}.hier_w.bin`. |
+| `--cold` / `--cold-mb N` / `--evict-keep N` | Hot/cold tiered storage. GPU VRAM → CPU pinned RAM → disk. `--cold` enables, `--cold-mb` caps pinned RAM budget, `--evict-keep` keeps N recent positions in VRAM. Ring-buffer wrap-around for capped CPU allocation. |
+| `--n-gpu-layers N` | Partial GPU offload via `ggml_backend_sched_t` scheduler bridge. Offloads first N transformer blocks to GPU, rest stays CPU. Cross-backend copies handled transparently. 0 = all CPU. |
 | `--pe-mode standard\|primepe\|primepe_alibi\|alibi` + `--pe-alpha F` + `--pe-tier 0\|1` | PrimePE-RoPE-ALiBi positional-encoding family. |
 
 ## License

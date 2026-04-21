@@ -354,13 +354,18 @@ void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
 
         // Scale: maps [-amax, amax] to [-max_val, max_val]
         float scale = (amax > 0.0f) ? amax / (float)max_val : 0.0f;
-        float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
 
-        // Store scale as fp16
+        // Store scale as fp16, then recompute inv_scale from the stored
+        // fp16 value so quantize and dequantize use the same scale.
+        // Without this round-trip, sp_f32_to_f16 truncation creates a
+        // systematic asymmetry that variance-ranking amplifies in band 0.
         uint16_t scale_f16 = sp_f32_to_f16(scale);
         out[offset]     = scale_f16 & 0xFF;
         out[offset + 1] = (scale_f16 >> 8) & 0xFF;
         offset += 2;
+
+        float scale_stored = sp_f16_to_f32(scale_f16);
+        float inv_scale = (scale_stored > 0.0f) ? 1.0f / scale_stored : 0.0f;
 
         // Pack quantized values
         // We pack bits-wide signed integers in little-endian bit order
@@ -1022,4 +1027,478 @@ void sp_config_print(const sp_config_t *cfg) {
     fprintf(stderr, "\n");
 
     fprintf(stderr, "  Compression:  %.1f×\n", sp_compression_ratio(cfg));
+}
+
+// ============================================================================
+// Disk Serialization
+// ============================================================================
+
+#include <stdio.h>
+
+uint64_t sp_fnv1a_hash(const char *str, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)str[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Write 64-byte VHT2 v2 header
+static int sp_write_cache_header(FILE *f, int packed_stride, int n_pos,
+                                 int n_heads, int cache_type,
+                                 uint64_t model_hash) {
+    uint32_t hdr[16] = {0};
+    hdr[0] = SP_CACHE_MAGIC;
+    hdr[1] = SP_CACHE_VERSION;
+    hdr[2] = (uint32_t)packed_stride;
+    hdr[3] = (uint32_t)n_pos;
+    hdr[4] = (uint32_t)n_heads;
+    hdr[5] = (uint32_t)cache_type;
+    hdr[6] = (uint32_t)(model_hash & 0xFFFFFFFF);
+    hdr[7] = (uint32_t)(model_hash >> 32);
+    return (fwrite(hdr, sizeof(hdr), 1, f) == 1) ? 0 : -1;
+}
+
+// Read and validate 64-byte VHT2 v2 header
+static int sp_read_cache_header(FILE *f, int *packed_stride, int *n_pos,
+                                int *n_heads, int *cache_type,
+                                uint64_t expected_hash) {
+    uint32_t hdr[16] = {0};
+    if (fread(hdr, sizeof(hdr), 1, f) != 1)        return -1;
+    if (hdr[0] != SP_CACHE_MAGIC)                    return -1;
+    if (hdr[1] != SP_CACHE_VERSION)                  return -1;
+
+    *packed_stride = (int)hdr[2];
+    *n_pos         = (int)hdr[3];
+    *n_heads       = (int)hdr[4];
+    *cache_type    = (int)hdr[5];
+
+    if (expected_hash != 0) {
+        uint64_t disk_hash = (uint64_t)hdr[6] | ((uint64_t)hdr[7] << 32);
+        if (disk_hash != 0 && disk_hash != expected_hash) {
+            fprintf(stderr, "[sp-disk] model hash mismatch: disk=%llx expected=%llx\n",
+                    (unsigned long long)disk_hash,
+                    (unsigned long long)expected_hash);
+            // Warning only — non-blocking (same as Archimedes)
+        }
+    }
+    return 0;
+}
+
+// ── Shadow cache save/load ──────────────────────────────────────────
+
+int sp_shadow_cache_save(const sp_shadow_cache_t *sc,
+                         const char *prefix, int n_pos,
+                         uint64_t model_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int hd      = sc->config.head_dim;
+    const int n_layer = sc->config.n_layers;
+    const int n_head  = sc->config.n_heads_kv;
+    const int k_bytes = sc->k_bands.total_bytes;
+    const int v_bytes = sc->v_bands.total_bytes;
+
+    for (int il = 0; il < n_layer; il++) {
+        // Determine positions written for this layer
+        int layer_pos = (n_pos > 0) ? n_pos : (sc->seq_len ? sc->seq_len[il] : 0);
+        if (layer_pos <= 0) continue;
+
+        // Save K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) {
+                fprintf(stderr, "[sp-disk] cannot write %s\n", path);
+                return -1;
+            }
+            if (sp_write_cache_header(f, k_bytes, layer_pos, n_head, 0, model_hash) != 0) {
+                fclose(f); return -1;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *cache_ptr = sc->k_cache[slot];
+                for (int p = 0; p < layer_pos; p++) {
+                    if (fwrite(cache_ptr + (size_t)p * k_bytes, k_bytes, 1, f) != 1) {
+                        fclose(f); return -1;
+                    }
+                }
+            }
+            fclose(f);
+        }
+
+        // Save V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) {
+                fprintf(stderr, "[sp-disk] cannot write %s\n", path);
+                return -1;
+            }
+            if (sp_write_cache_header(f, v_bytes, layer_pos, n_head, 0, model_hash) != 0) {
+                fclose(f); return -1;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *cache_ptr = sc->v_cache[slot];
+                for (int p = 0; p < layer_pos; p++) {
+                    if (fwrite(cache_ptr + (size_t)p * v_bytes, v_bytes, 1, f) != 1) {
+                        fclose(f); return -1;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    return 0;
+}
+
+int sp_shadow_cache_load(sp_shadow_cache_t *sc,
+                         const char *prefix,
+                         uint64_t expected_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer = sc->config.n_layers;
+    const int n_head  = sc->config.n_heads_kv;
+    const int k_bytes = sc->k_bands.total_bytes;
+    const int v_bytes = sc->v_bands.total_bytes;
+    int max_loaded = 0;
+
+    for (int il = 0; il < n_layer; il++) {
+        // Load K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;  // Layer not on disk — skip
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+                fprintf(stderr, "[sp-disk] K layer %d: bad header in %s\n", il, path);
+                fclose(f); continue;
+            }
+            if (pstr != k_bytes) {
+                fprintf(stderr, "[sp-disk] K layer %d: stride mismatch (disk=%d expected=%d)\n",
+                        il, pstr, k_bytes);
+                fclose(f); continue;
+            }
+            if (n_hd != n_head) {
+                fprintf(stderr, "[sp-disk] K layer %d: head count mismatch (disk=%d expected=%d)\n",
+                        il, n_hd, n_head);
+                fclose(f); continue;
+            }
+
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                uint8_t *cache_ptr = sc->k_cache[slot];
+                for (int p = 0; p < n_pos; p++) {
+                    if (fread(cache_ptr + (size_t)p * k_bytes, k_bytes, 1, f) != 1) {
+                        fprintf(stderr, "[sp-disk] K layer %d head %d: read truncated at pos %d\n",
+                                il, ih, p);
+                        break;
+                    }
+                }
+            }
+            if (sc->seq_len) {
+                sc->seq_len[il] = n_pos;
+            }
+            if (n_pos > max_loaded) max_loaded = n_pos;
+            fclose(f);
+        }
+
+        // Load V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+                fprintf(stderr, "[sp-disk] V layer %d: bad header in %s\n", il, path);
+                fclose(f); continue;
+            }
+            if (pstr != v_bytes || n_hd != n_head) {
+                fprintf(stderr, "[sp-disk] V layer %d: config mismatch\n", il);
+                fclose(f); continue;
+            }
+
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                uint8_t *cache_ptr = sc->v_cache[slot];
+                for (int p = 0; p < n_pos; p++) {
+                    if (fread(cache_ptr + (size_t)p * v_bytes, v_bytes, 1, f) != 1) break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    return max_loaded;
+}
+
+// ── Sqfree cache save/load ──────────────────────────────────────────
+// Same binary format; packed_stride is per-position bytes from sqfree layout.
+
+int sp_sqfree_cache_save(const sp_sqfree_cache_t *sc,
+                         const char *prefix, int n_pos,
+                         uint64_t model_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer  = sc->config.head_dim > 0 ? sc->config.n_layers : 0;
+    const int n_head   = sc->config.n_heads_kv;
+    const int n_res    = sc->mask.n_residual;
+    // Per-position storage: banded skeleton + residual + magnitude + optional spinor
+    const int k_bytes  = sc->k_bands.total_bytes
+                       + (n_res * sc->residual_bits + 7) / 8
+                       + 4  // magnitude (float)
+                       + (sc->use_spinor ? (n_res + 7) / 8 : 0);
+    const int v_bytes  = k_bytes;  // Same layout for V
+
+    for (int il = 0; il < n_layer; il++) {
+        int layer_pos = (n_pos > 0) ? n_pos : 0;
+        if (layer_pos <= 0) continue;
+
+        // K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "[sp-disk] cannot write %s\n", path); return -1; }
+            sp_write_cache_header(f, k_bytes, layer_pos, n_head, 1, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *data = sc->k_cache[slot];
+                fwrite(data, (size_t)k_bytes * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+        // V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "[sp-disk] cannot write %s\n", path); return -1; }
+            sp_write_cache_header(f, v_bytes, layer_pos, n_head, 1, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *data = sc->v_cache[slot];
+                fwrite(data, (size_t)v_bytes * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+    }
+    return 0;
+}
+
+int sp_sqfree_cache_load(sp_sqfree_cache_t *sc,
+                         const char *prefix,
+                         uint64_t expected_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer = sc->config.n_layers;
+    const int n_head  = sc->config.n_heads_kv;
+    const int n_res   = sc->mask.n_residual;
+    const int k_bytes = sc->k_bands.total_bytes
+                      + (n_res * sc->residual_bits + 7) / 8
+                      + 4
+                      + (sc->use_spinor ? (n_res + 7) / 8 : 0);
+    int max_loaded = 0;
+
+    for (int il = 0; il < n_layer; il++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+
+        int pstr, n_pos, n_hd, ctype;
+        if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
+            || pstr != k_bytes || n_hd != n_head) {
+            fprintf(stderr, "[sp-disk] sqfree K layer %d: config mismatch\n", il);
+            fclose(f); continue;
+        }
+        for (int ih = 0; ih < n_head; ih++) {
+            int slot = il * n_head + ih;
+            fread(sc->k_cache[slot], (size_t)k_bytes * n_pos, 1, f);
+        }
+        if (n_pos > max_loaded) max_loaded = n_pos;
+        fclose(f);
+
+        // V
+        snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+        f = fopen(path, "rb");
+        if (!f) continue;
+        if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+            fclose(f); continue;
+        }
+        for (int ih = 0; ih < n_head; ih++) {
+            int slot = il * n_head + ih;
+            fread(sc->v_cache[slot], (size_t)pstr * n_pos, 1, f);
+        }
+        fclose(f);
+    }
+    return max_loaded;
+}
+
+// ── Hierarchical cache save/load ────────────────────────────────────
+// Saves: skeleton bands + residual per position, PLUS the W predictor matrices.
+// W matrices go in a separate file: {prefix}.hier_w.bin
+
+int sp_hier_cache_save(const sp_hier_cache_t *sc,
+                       const char *prefix, int n_pos,
+                       uint64_t model_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer   = sc->config.n_layers;
+    const int n_head    = sc->config.n_heads_kv;
+    const int k_bpp     = sc->k_bytes_per_pos;
+    const int v_bpp     = sc->v_bytes_per_pos;
+    const int n_target  = sc->predictors[0].n_target;
+    const int n_skel    = sc->predictors[0].n_skeleton;
+
+    for (int il = 0; il < n_layer; il++) {
+        int layer_pos = (n_pos > 0) ? n_pos : 0;
+        if (layer_pos <= 0) continue;
+
+        // K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) return -1;
+            sp_write_cache_header(f, k_bpp, layer_pos, n_head, 2, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fwrite(sc->k_cache[slot], (size_t)k_bpp * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+        // V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) return -1;
+            sp_write_cache_header(f, v_bpp, layer_pos, n_head, 2, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fwrite(sc->v_cache[slot], (size_t)v_bpp * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+    }
+
+    // Save W predictor matrices: one file for all slots
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.hier_w.bin", prefix);
+        FILE *f = fopen(path, "wb");
+        if (!f) return -1;
+
+        const int n_slots = n_layer * n_head;
+        // Header: magic + n_slots + n_skeleton + n_target
+        uint32_t whdr[4] = {SP_CACHE_MAGIC, (uint32_t)n_slots,
+                            (uint32_t)n_skel, (uint32_t)n_target};
+        fwrite(whdr, sizeof(whdr), 1, f);
+
+        // W matrices stored as fp16 (uint16_t), [n_target × n_skeleton] per slot
+        const size_t w_size = (size_t)n_target * n_skel * sizeof(uint16_t);
+        for (int s = 0; s < n_slots; s++) {
+            if (sc->predictors[s].W) {
+                fwrite(sc->predictors[s].W, w_size, 1, f);
+            } else {
+                // Uncalibrated slot — write zeros
+                uint16_t *zeros = (uint16_t *)calloc(w_size, 1);
+                fwrite(zeros, w_size, 1, f);
+                free(zeros);
+            }
+        }
+        fclose(f);
+    }
+
+    return 0;
+}
+
+int sp_hier_cache_load(sp_hier_cache_t *sc,
+                       const char *prefix,
+                       uint64_t expected_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer  = sc->config.n_layers;
+    const int n_head   = sc->config.n_heads_kv;
+    const int k_bpp    = sc->k_bytes_per_pos;
+    const int v_bpp    = sc->v_bytes_per_pos;
+    const int n_target = sc->predictors[0].n_target;
+    const int n_skel   = sc->predictors[0].n_skeleton;
+    int max_loaded = 0;
+
+    for (int il = 0; il < n_layer; il++) {
+        // K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
+                || pstr != k_bpp || n_hd != n_head) {
+                fclose(f); continue;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fread(sc->k_cache[slot], (size_t)k_bpp * n_pos, 1, f);
+            }
+            if (n_pos > max_loaded) max_loaded = n_pos;
+            fclose(f);
+        }
+        // V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
+                || pstr != v_bpp || n_hd != n_head) {
+                fclose(f); continue;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fread(sc->v_cache[slot], (size_t)v_bpp * n_pos, 1, f);
+            }
+            fclose(f);
+        }
+    }
+
+    // Load W predictor matrices
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.hier_w.bin", prefix);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            uint32_t whdr[4];
+            if (fread(whdr, sizeof(whdr), 1, f) == 1
+                && whdr[0] == SP_CACHE_MAGIC
+                && (int)whdr[2] == n_skel
+                && (int)whdr[3] == n_target) {
+
+                const int n_slots = n_layer * n_head;
+                const size_t w_size = (size_t)n_target * n_skel * sizeof(uint16_t);
+                for (int s = 0; s < n_slots && s < (int)whdr[1]; s++) {
+                    if (sc->predictors[s].W) {
+                        fread(sc->predictors[s].W, w_size, 1, f);
+                        sc->predictors[s].calibrated = true;
+                    } else {
+                        fseek(f, (long)w_size, SEEK_CUR);  // Skip uncalibrated
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    return max_loaded;
 }

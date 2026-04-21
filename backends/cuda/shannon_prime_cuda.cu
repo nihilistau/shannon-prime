@@ -160,20 +160,22 @@ __global__ void kernel_band_quantize_simple(
         }
 
         float scale = (amax > 0.0f) ? amax / (float)max_val : 0.0f;
-        float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
 
-        // Store scale as fp16 (IEEE round-to-nearest-even via CUDA's
-        // __float2half). The CPU core's sp_f32_to_f16 truncates the
-        // lower 13 mantissa bits (no rounding) — less accurate, and
-        // attempting to match it here regressed PPL vs baseline. Keep
-        // the more accurate rounding here; the CPU/GPU PPL delta is
-        // tracked separately in memory as a known ship-path difference.
+        // Store scale as fp16 first, then recompute inv_scale from the
+        // stored fp16 value. This eliminates the quantize/dequantize
+        // asymmetry: dequantize reads scale from fp16, so quantize must
+        // use the same (rounded) value. Without this, variance-ranked
+        // coefficients in band 0 (highest information) accumulate a
+        // systematic error that shows up as PPL regression.
         __half scale_h = __float2half(scale);
         unsigned short scale_bits;
         memcpy(&scale_bits, &scale_h, sizeof(unsigned short));
         out[offset]     = scale_bits & 0xFF;
         out[offset + 1] = (scale_bits >> 8) & 0xFF;
         offset += 2;
+
+        float scale_stored = __half2float(scale_h);
+        float inv_scale = (scale_stored > 0.0f) ? 1.0f / scale_stored : 0.0f;
 
         // Pack quantized values
         unsigned long long bit_buffer = 0;
@@ -671,6 +673,114 @@ void sp_cuda_print_memory(const sp_cuda_cache_t *cc) {
     fprintf(stderr, "  Baseline:   %.2f MB\n", baseline / (1024.0 * 1024.0));
     fprintf(stderr, "  Ratio:      %.1f×\n",
             (double)baseline / (double)(k_total + v_total));
+}
+
+// ============================================================================
+// Cold storage — tiered GPU ↔ CPU offload
+// ============================================================================
+
+void sp_cuda_d2h_async(void *dst_host, const void *src_device,
+                       int64_t n_bytes, void *stream) {
+    cudaMemcpyAsync(dst_host, src_device, (size_t)n_bytes,
+                    cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+}
+
+void sp_cuda_h2d_async(void *dst_device, const void *src_host,
+                       int64_t n_bytes, void *stream) {
+    cudaMemcpyAsync(dst_device, src_host, (size_t)n_bytes,
+                    cudaMemcpyHostToDevice, (cudaStream_t)stream);
+}
+
+int sp_cuda_cold_layer_init(sp_cuda_cold_layer_t *cl,
+                            int64_t cap_bytes,
+                            int packed_stride, int n_heads) {
+    if (!cl || cap_bytes <= 0 || packed_stride <= 0 || n_heads <= 0)
+        return -1;
+    memset(cl, 0, sizeof(*cl));
+
+    cudaError_t err = cudaHostAlloc(&cl->h_pinned, (size_t)cap_bytes,
+                                    cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[sp-cold] cudaHostAlloc failed (%lld bytes): %s\n",
+                (long long)cap_bytes, cudaGetErrorString(err));
+        return -1;
+    }
+    cl->capacity      = cap_bytes;
+    cl->packed_stride  = packed_stride;
+    cl->n_heads        = n_heads;
+    cl->write_head     = 0;
+    cl->oldest_pos     = -1;
+    cl->newest_pos     = -1;
+    cl->ring_mode      = false;
+    cl->initialized    = true;
+    return 0;
+}
+
+void sp_cuda_cold_layer_free(sp_cuda_cold_layer_t *cl) {
+    if (!cl) return;
+    if (cl->h_pinned) {
+        cudaFreeHost(cl->h_pinned);
+        cl->h_pinned = NULL;
+    }
+    cl->initialized = false;
+}
+
+int sp_cuda_cold_writeback(sp_cuda_cold_layer_t *cl,
+                           const void *d_packed,
+                           int start_pos, int n_pos,
+                           void *stream) {
+    if (!cl || !cl->initialized || !d_packed || n_pos <= 0) return -1;
+
+    const int64_t bytes_per_pos = (int64_t)cl->n_heads * cl->packed_stride;
+    const int64_t new_bytes     = (int64_t)n_pos * bytes_per_pos;
+    const int64_t src_offset    = (int64_t)start_pos * bytes_per_pos;
+
+    // Ring-buffer wrap check
+    if (cl->write_head + new_bytes > cl->capacity) {
+        cl->write_head = 0;
+        cl->ring_mode  = true;
+    }
+
+    sp_cuda_d2h_async(cl->h_pinned + cl->write_head,
+                      (const uint8_t*)d_packed + src_offset,
+                      new_bytes, stream);
+
+    cl->write_head += new_bytes;
+    cl->newest_pos  = start_pos + n_pos - 1;
+
+    if (cl->ring_mode) {
+        const int64_t max_positions = cl->capacity / bytes_per_pos;
+        cl->oldest_pos = cl->newest_pos - max_positions + 1;
+        if (cl->oldest_pos < 0) cl->oldest_pos = 0;
+    } else {
+        if (cl->oldest_pos < 0) cl->oldest_pos = 0;
+    }
+
+    return 0;
+}
+
+int sp_cuda_cold_restore(const sp_cuda_cold_layer_t *cl,
+                         void *d_packed,
+                         int n_pos,
+                         void *stream) {
+    if (!cl || !cl->initialized || !d_packed || n_pos <= 0) return -1;
+    if (cl->ring_mode) {
+        fprintf(stderr, "[sp-cold] restore from ring-mode buffer not supported "
+                "(non-linear layout)\n");
+        return -1;
+    }
+
+    const int64_t bytes_per_pos = (int64_t)cl->n_heads * cl->packed_stride;
+    const int64_t total_bytes   = (int64_t)n_pos * bytes_per_pos;
+
+    if (total_bytes > cl->capacity) {
+        fprintf(stderr, "[sp-cold] restore: requested %lld bytes > capacity %lld\n",
+                (long long)total_bytes, (long long)cl->capacity);
+        return -1;
+    }
+
+    sp_cuda_h2d_async(d_packed, cl->h_pinned, total_bytes, stream);
+    return 0;
 }
 
 } // extern "C"

@@ -903,6 +903,71 @@ float sp_compression_ratio(const sp_config_t *cfg);
 // Print config summary to stderr.
 void sp_config_print(const sp_config_t *cfg);
 
+// ============================================================================
+// Disk Serialization — save/load compressed cache to/from files
+// ============================================================================
+//
+// Binary format per layer file (compatible with Archimedes VHT2 v2):
+//   64-byte header: uint32_t[16]
+//     [0] magic 0x56485432 ("VHT2")  [1] version = 2
+//     [2] packed_stride (bytes/head)  [3] n_positions
+//     [4] n_heads                     [5] cache_type (0=shadow, 1=sqfree, 2=hier)
+//     [6] model_hash_lo              [7] model_hash_hi
+//     [8..15] reserved
+//   Followed by n_positions * n_heads * packed_stride bytes of compressed data.
+//
+// File naming: {prefix}.l{layer}.k.vht2, {prefix}.l{layer}.v.vht2
+//
+// Hot/cold store modes:
+//   SP_STORE_GPU_ONLY  — compressed data lives only in VRAM
+//   SP_STORE_DUAL      — GPU hot + CPU cold (default)
+//   SP_STORE_COLD_ONLY — CPU pinned only (no GPU copy)
+
+#define SP_CACHE_MAGIC    0x56485432u  // "VHT2"
+#define SP_CACHE_VERSION  2
+
+enum {
+    SP_STORE_GPU_ONLY  = 0,
+    SP_STORE_DUAL      = 1,
+    SP_STORE_COLD_ONLY = 2,
+};
+
+// Save compressed shadow cache to disk. One file per layer per K/V.
+// prefix: path prefix (e.g. "/tmp/model_cache" → /tmp/model_cache.l0.k.vht2)
+// n_pos: number of positions to save (0 = all written so far)
+// model_hash: optional FNV-1a of model path (0 = skip validation on load)
+// Returns 0 on success, -1 on error.
+int sp_shadow_cache_save(const sp_shadow_cache_t *sc,
+                         const char *prefix, int n_pos,
+                         uint64_t model_hash);
+
+// Load compressed shadow cache from disk. Overwrites current cache contents.
+// The cache must already be initialized with matching config (head_dim, bands, etc).
+// Returns number of positions loaded, or -1 on error.
+int sp_shadow_cache_load(sp_shadow_cache_t *sc,
+                         const char *prefix,
+                         uint64_t expected_hash);
+
+// Save/load for sqfree cache (same format, different packed_stride).
+int sp_sqfree_cache_save(const sp_sqfree_cache_t *sc,
+                         const char *prefix, int n_pos,
+                         uint64_t model_hash);
+int sp_sqfree_cache_load(sp_sqfree_cache_t *sc,
+                         const char *prefix,
+                         uint64_t expected_hash);
+
+// Save/load for hierarchical cache.
+// Hierarchical saves both skeleton bands AND the W predictor matrices.
+int sp_hier_cache_save(const sp_hier_cache_t *sc,
+                       const char *prefix, int n_pos,
+                       uint64_t model_hash);
+int sp_hier_cache_load(sp_hier_cache_t *sc,
+                       const char *prefix,
+                       uint64_t expected_hash);
+
+// Utility: compute FNV-1a hash of a string (for model_hash).
+uint64_t sp_fnv1a_hash(const char *str, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

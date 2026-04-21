@@ -51,7 +51,7 @@ spectral structure that underpins the Möbius predictor.
   known random-data edge case — real K vectors with RoPE hit 0.997+)
 - Core math validated: VHT2 self-inverse round-trip on power-of-2 and sqfree
   dims, Möbius function, banded quant, sqfree prime-Hartley, Knight CSR mask,
-  N-bit residual, spinor sheet bit, scaling law
+  N-bit residual, spinor sheet bit, scaling law, disk serialization round-trip
 - Production-validated on desktop (Qwen3-8B), mobile (Dolphin 1B / S22 Ultra),
   and video gen (Wan 2.2 TI2V-5B / ComfyUI)
 - Ship config: 3.4–3.8× KV compression at <1.25% PPL cost
@@ -163,6 +163,16 @@ All backends now run the literal VHT2 with 1/√p per stage (self-inverse, no
 the spectrum magnitudes invariant to the transform scale, so this cleanup is
 behaviour-neutral on the output side and simplifies cross-backend debugging.
 
+**FP16 scale fix (2026-04-22):** Both CUDA `kernel_band_quantize_simple` and
+CPU `sp_band_quantize` now recompute `inv_scale` from the stored fp16 scale
+value, eliminating the quantize/dequantize asymmetry that caused subtle
+round-trip errors when the fp32 scale differed from its fp16 representation.
+
+**Cold storage (CUDA):** `sp_cuda_cold_layer_t` provides ring-buffer GPU→CPU
+offload for least-recently-used cache layers, enabling KV caches larger than
+GPU memory. Controlled via `enable_cold_storage` / `cold_writeback` /
+`cold_restore` on the engine's KvCache.
+
 Vulkan compute is currently routed through the CPU staged VHT2 inside the
 host wrappers (`vk_compress_one` / `vk_decompress_one`) because the GPU
 dispatch hits `VK_ERROR_DEVICE_LOST` at the first `vkWaitForFences` on
@@ -250,10 +260,14 @@ print(f"Predicted: +{(ratio-1)*100:.2f}% PPL")  # +1.0%
 ```
 core/                      Backend-agnostic C: VHT2, Möbius, banded quant,
                            sqfree pad, Knight mask CSR, residual quant,
-                           spinor, shadow cache
+                           spinor, shadow cache, disk serialization
+                           (sp_shadow/sqfree/hier_cache_save/load,
+                            VHT2 v2 binary format SP_CACHE_MAGIC 0x56485432,
+                            sp_fnv1a_hash model validation)
 backends/
   cuda/                    NVIDIA GPU kernels (butterfly at p=2, band quant,
-                           Möbius CSR predict, spinor extract/reconstruct)
+                           Möbius CSR predict, spinor extract/reconstruct,
+                           hierarchical cache kernels, cold storage offload)
   vulkan/                  Vulkan compute shaders + CPU fallback
                            (vilenkin.comp, knight_predict.comp,
                             mobius_reorder.comp, band_quantize.comp)
@@ -274,6 +288,20 @@ tests/                     8 test suites
 docs/                      Full documentation
 ```
 
+### Engine Integration Surface (shannon-prime-engine)
+
+The engine consumes core + CUDA backend through these integration points:
+
+- **ForwardContext scheduler bridge**: `alloc_graph` / `compute_graph` —
+  allocates and dispatches the compressed KV forward pass as a graph node.
+- **KvCache disk I/O**: `save_to_disk` / `load_from_disk` — delegates to
+  `sp_shadow_cache_save/load`, `sp_sqfree_cache_save/load`,
+  `sp_hier_cache_save/load` in core (VHT2 v2 binary format).
+- **KvCache cold storage**: `enable_cold_storage` / `cold_writeback` /
+  `cold_restore` — drives `sp_cuda_cold_layer_t` ring-buffer offload.
+- **sp_cuda_hier_cache_t**: GPU-resident hierarchical prediction cache
+  used by the engine's multi-resolution attention path.
+
 ## Key Files
 
 | File | What It Does | Test Coverage |
@@ -285,6 +313,7 @@ docs/                      Full documentation
 | backends/torch/shannon_prime_sqfree.py | PyTorch sqfree+spinor path | test_sqfree.py |
 | backends/cuda/shannon_prime_cuda.cu | CUDA VHT2 p=2 butterfly + sqfree dispatch | test_cuda.c |
 | backends/cuda/shannon_prime_sqfree.cu | CUDA Vilenkin+spinor kernels | test_cuda.c (sqfree section) |
+| backends/cuda/shannon_prime_hier.cu | GPU-resident hierarchical cache (kernel_hier_predict, kernel_hier_deviation, kernel_residual_magnitude, kernel_quantize_residual); sp_cuda_hier_cache_t, sp_cuda_cold_layer_t ring-buffer GPU→CPU offload | test_cuda.c |
 | backends/vulkan/shannon_prime_vulkan.c | Vulkan + CPU fallback | test_vulkan.c |
 | backends/vulkan/shaders/vilenkin.comp | Vulkan VHT2 shader | test_vulkan.c |
 | backends/vulkan/shaders/knight_predict.comp | Vulkan CSR+spinor shader | test_vulkan.c |

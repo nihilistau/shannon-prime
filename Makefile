@@ -18,6 +18,7 @@ ADRENO_SRC = backends/adreno/shannon_prime_adreno.c
 VULKAN_SRC = backends/vulkan/shannon_prime_vulkan.c
 CUDA_SRC   = backends/cuda/shannon_prime_cuda.cu
 CUDA_SQFREE_SRC = backends/cuda/shannon_prime_sqfree.cu
+CUDA_HIER_SRC   = backends/cuda/shannon_prime_hier.cu
 LLAMA_SRC  = tools/shannon_prime_llama.c
 
 # ── Vulkan SDK (optional) ────────────────────────────────────────
@@ -68,9 +69,9 @@ build/test_vulkan: tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS) $(VULKAN_LIB)
 
-build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
 	@mkdir -p build
-	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
 
 build/test_integration: tests/test_integration.c $(LLAMA_SRC) $(CORE_SRC)
 	@mkdir -p build

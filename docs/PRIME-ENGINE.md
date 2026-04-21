@@ -71,6 +71,11 @@ compression penalty per doubling of model size, so results from
 | 7b    | GPU-resident ship cache (compressed K/V in VRAM) | ✓ |
 | 7c    | GPU-resident sqfree cache + batched read + Knight-mask sync | infrastructure ✓ / real-model PPL validating |
 | 7d    | Vulkan backend, release packaging | planned |
+| 8a    | Disk serialization (`save_to_disk` / `load_from_disk`, VHT2 v2 binary) | ✓ |
+| 8b    | Hot/cold tiered storage (GPU VRAM → CPU pinned RAM) | ✓ |
+| 8c    | Scheduler bridge (`ggml_backend_sched_t`, partial GPU offload) | ✓ |
+| 8d    | Hierarchical GPU path (CPU companion + GPU cache, W upload after calibrate) | ✓ |
+| 8e    | FP16 scale fix (CUDA + CPU `band_quantize` inv_scale from stored fp16) | ✓ |
 
 ## Why a separate engine — the four-bug case
 
@@ -257,6 +262,57 @@ against the same base GGUF without regenerating it.
 |---|---|---|
 | Dolphin-1B-Q8 | GGUF `rope_freqs.weight` (no sidecar) | 12.65 |
 | Dolphin-1B-Q8 | α=0.17 sidecar auto-loaded | **12.38 (−2.1%)** |
+
+### Disk serialization (stage 8a)
+
+`KvCache::save_to_disk(path)` and `KvCache::load_from_disk(path)`
+persist and restore a compressed cache in VHT2 v2 binary format.
+The call dispatches to the appropriate backend — shadow, sqfree, or
+hierarchical — each writing its own section of the binary.
+`ForwardContext::set_kv_pos()` restores the token position on
+reload so decode can resume mid-sequence without re-prefilling.
+
+### Hot/cold tiered storage (stage 8b)
+
+`KvCache::enable_cold_storage(cold_mb, evict_keep)` activates a
+two-tier layout: recent tokens stay hot in GPU VRAM while older
+tokens are evicted to CPU pinned RAM. `cold_writeback()` flushes
+evicted blocks to the cold tier; `cold_restore()` pulls them back
+when the attention window needs them. This lets long-context
+sessions exceed the GPU's VRAM budget without falling back to
+full host-side caching.
+
+### Scheduler bridge (stage 8c)
+
+When the external backend is GPU, `ForwardContext` now wraps a
+`ggml_backend_sched_t` rather than a single backend. The helpers
+`alloc_graph()` and `compute_graph()` route through the scheduler
+when one is present, falling back to single-backend dispatch
+otherwise. Partial GPU offload is exposed via `--n-gpu-layers N`:
+the first N transformer blocks run on GPU with the remainder on
+CPU, so models that do not fully fit in VRAM can still benefit
+from GPU acceleration on the layers that do.
+
+### Hierarchical GPU path (stage 8d)
+
+`KvCache::create_gpu` now respects `cfg.hierarchical`. When set,
+it creates a CPU companion cache alongside the GPU cache: the CPU
+side handles calibration (variance ranking, band assignment) while
+the GPU side holds the compressed K/V blocks. W matrices are
+uploaded to the GPU only after `calibrate_end()` completes, so
+calibration arithmetic stays in full CPU precision and the GPU
+path receives final, stable projection weights.
+
+### FP16 scale fix (stage 8e)
+
+Both the CUDA and CPU `band_quantize` paths had a latent precision
+bug: `inv_scale` was computed from the original float32 scale
+rather than from the fp16 value actually stored in the compressed
+block. After a store→load round-trip the decompressor used the
+stored fp16 scale, but the compressor had quantised against a
+slightly different value, introducing a systematic rounding bias.
+The fix recomputes `inv_scale` from the stored fp16 scale on both
+paths, closing the compress/decompress asymmetry.
 
 ## Stage 5b — chat with greedy decode works
 
