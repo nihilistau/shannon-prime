@@ -99,6 +99,16 @@ Shared across `perplexity --cache`, `cache_ppl`, and `chat`:
 |---|---|
 | `lib/shannon-prime/core/shannon_prime.h` | `sp_cauchy_ctrl_t`, `sp_ricci_sentinel_t`, `sp_mertens_oracle_t` structs |
 | `lib/shannon-prime/core/shannon_prime_cauchy.c` | Init, check, reset, cooldown logic |
+
+### Mertens oracle memory contract
+
+`sp_mertens_init` allocates a `float risk_cache[max_ctx+1]` bake of the
+schedule (decays around each flagged position to make `sp_mertens_risk`
+O(1) instead of the binary-search fallback). Callers MUST pair each
+`sp_mertens_init` with `sp_mertens_free(mo)` at teardown — the cache is
+otherwise leaked per oracle instance. The engine's `KvCache` destructor
+owns this call; downstream integrations that embed a mertens oracle
+directly must do the same.
 | `shannon-prime-engine/src/kv_cache.{h,cpp}` | `init_cauchy`, `cauchy_check`, `cauchy_set_cooldown`, `cauchy_record_reset` API |
 | `shannon-prime-engine/src/cli/main.cpp` | `perplexity --cache`, `cache_ppl`, `chat` flag parsing + decode-loop wire-up |
 

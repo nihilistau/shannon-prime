@@ -219,8 +219,9 @@ export SHANNON_PRIME_RESIDUAL_BITS=3
 export SHANNON_PRIME_K_BITS=5,4,4,4,5
 ./llama-server -m Qwen3-8B-Q8_0.gguf -c 32768
 ```
-Note: 3,3,3,3,3 on the Knight skeleton was retracted in v1.07
-(catastrophic post-fix); the effective Pareto point is 5,4,4,4,5.
+Note: 3,3,3,3,3 on the Knight skeleton was retracted in v1.03
+(catastrophic post-fix — see the longer note below the aggressive-path
+results table); the effective Pareto point is 5,4,4,4,5.
 
 ### ComfyUI (Wan 2.2 MoE)
 ```python
