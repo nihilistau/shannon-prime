@@ -1248,7 +1248,7 @@ int sp_sqfree_cache_save(const sp_sqfree_cache_t *sc,
 
     const int n_layer  = sc->config.head_dim > 0 ? sc->config.n_layers : 0;
     const int n_head   = sc->config.n_heads_kv;
-    const int n_res    = sc->mask.n_residual;
+    const int n_res    = sc->mask.n_res;
     // Per-position storage: banded skeleton + residual + magnitude + optional spinor
     const int k_bytes  = sc->k_bands.total_bytes
                        + (n_res * sc->residual_bits + 7) / 8
@@ -1299,7 +1299,7 @@ int sp_sqfree_cache_load(sp_sqfree_cache_t *sc,
 
     const int n_layer = sc->config.n_layers;
     const int n_head  = sc->config.n_heads_kv;
-    const int n_res   = sc->mask.n_residual;
+    const int n_res   = sc->mask.n_res;
     const int k_bytes = sc->k_bands.total_bytes
                       + (n_res * sc->residual_bits + 7) / 8
                       + 4
