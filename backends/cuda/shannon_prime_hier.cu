@@ -41,9 +41,9 @@
 #include "shannon_prime.h"
 
 // External declarations for shared kernels (defined in shannon_prime_sqfree.cu)
-extern void sp_cuda_vilenkin_inplace(float *d_data, int pad_dim, int n_vecs,
-                                      int *d_factors, int n_factors,
-                                      cudaStream_t stream);
+extern "C" void sp_cuda_vilenkin_inplace(float *d_data, int pad_dim, int n_vecs,
+                                          int *d_factors, int n_factors,
+                                          cudaStream_t stream);
 extern __global__ void kernel_sqfree_pad(const float *in, float *out,
                                           int hd, int pd, int n_vecs);
 extern __global__ void kernel_sqfree_unpad(const float *in, float *out,
