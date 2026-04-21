@@ -580,6 +580,12 @@ void sp_hier_predictor_free(sp_hier_predictor_t *hp);
 int  sp_hier_calibrate_begin(sp_hier_predictor_t *hp);
 void sp_hier_calibrate_feed(sp_hier_predictor_t *hp, const float *vilenkin_coeffs);
 int  sp_hier_calibrate_end(sp_hier_predictor_t *hp);
+// Sticky-EMA variant. Runs the full solve, then blends the fresh W with the
+// caller's snapshot of the previous W. keep_frac in [0,1]; W_prev NULL or
+// keep_frac <= 0 behave like sp_hier_calibrate_end. See implementation for
+// the usage contract.
+int  sp_hier_calibrate_end_blend(sp_hier_predictor_t *hp,
+                                 const uint16_t *W_prev, float keep_frac);
 
 // Predict targets from skeleton coefficients.
 // skeleton_vals: [n_skeleton] input
@@ -645,6 +651,9 @@ int  sp_hier_cache_calibrate_begin(sp_hier_cache_t *hc);
 void sp_hier_cache_calibrate_feed(sp_hier_cache_t *hc, int slot,
                                   const float *raw_vec);
 int  sp_hier_cache_calibrate_end(sp_hier_cache_t *hc);
+// Sticky-EMA variant: blends each slot's fresh-solve W with the previous W.
+// keep_frac in [0,1]; 0 is equivalent to sp_hier_cache_calibrate_end.
+int  sp_hier_cache_calibrate_end_ema(sp_hier_cache_t *hc, float keep_frac);
 
 // Write/read
 void sp_hier_cache_write_k(sp_hier_cache_t *hc,

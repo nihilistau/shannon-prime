@@ -1179,6 +1179,48 @@ int sp_hier_calibrate_end(sp_hier_predictor_t *hp) {
     return 0;
 }
 
+// Sticky-EMA variant: runs the full calibrate_end (Cholesky solve, new W),
+// then blends the fresh W with the caller-saved snapshot of the previous W:
+//
+//     W_out = keep_frac · W_prev  +  (1 − keep_frac) · W_fresh
+//
+// keep_frac ∈ [0, 1]:
+//   0.0 — identical to calibrate_end() (full replacement).
+//   1.0 — keep W_prev entirely (discards the new solve; use for testing).
+//   0.5 — balanced blend; useful when later chunks drift and you want the
+//         predictor to track slowly rather than snap to each chunk's local
+//         statistics.
+//
+// `W_prev` is the caller's copy of hp->W captured *before* calibrate_begin
+// was called for this chunk. Size = n_skeleton × n_target uint16_t. Pass
+// NULL to skip the blend (behaves like calibrate_end). The caller owns the
+// W_prev buffer; this function reads it and leaves it untouched.
+//
+// Decoupled from calibrate_end() rather than amending it so the plain
+// end() contract stays intact for consumers that don't care about EMA.
+int sp_hier_calibrate_end_blend(sp_hier_predictor_t *hp,
+                                 const uint16_t *W_prev, float keep_frac) {
+    int rc = sp_hier_calibrate_end(hp);
+    if (rc != 0) return rc;
+    if (!W_prev || keep_frac <= 0.0f) return 0;
+    if (keep_frac > 1.0f) keep_frac = 1.0f;
+
+    const float k = keep_frac;
+    const float m = 1.0f - keep_frac;
+    const int ns = hp->n_skeleton;
+    const int nt = hp->n_target;
+    for (int i = 0; i < ns * nt; i++) {
+        const float w_prev  = sp_f16_to_f32(W_prev[i]);
+        const float w_fresh = sp_f16_to_f32(hp->W[i]);
+        hp->W[i] = sp_f32_to_f16(k * w_prev + m * w_fresh);
+    }
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime HIER] EMA blend applied: keep_frac=%.3f\n",
+                (double)keep_frac);
+    }
+    return 0;
+}
+
 void sp_hier_predict(const sp_hier_predictor_t *hp,
                      const float *skeleton_vals, float *target_out) {
     if (!hp->W) {
@@ -1330,6 +1372,30 @@ int sp_hier_cache_calibrate_end(sp_hier_cache_t *hc) {
     int ok = 0;
     for (int s = 0; s < hc->n_slots; s++) {
         if (sp_hier_calibrate_end(&hc->predictors[s]) != 0) ok = -1;
+    }
+    return ok;
+}
+
+// Sticky-EMA end: snapshots each slot's existing W before the per-slot
+// solve, then blends. keep_frac in [0, 1]; 0 is identical to
+// sp_hier_cache_calibrate_end. Use for long-context hier recalibration
+// where you want the predictor to track chunk statistics slowly rather
+// than snap to each new chunk's local regression solution.
+int sp_hier_cache_calibrate_end_ema(sp_hier_cache_t *hc, float keep_frac) {
+    if (keep_frac <= 0.0f) return sp_hier_cache_calibrate_end(hc);
+    if (keep_frac > 1.0f)  keep_frac = 1.0f;
+
+    int ok = 0;
+    for (int s = 0; s < hc->n_slots; s++) {
+        sp_hier_predictor_t *hp = &hc->predictors[s];
+        uint16_t *W_snap = NULL;
+        if (hp->W) {
+            const size_t n = (size_t)hp->n_skeleton * (size_t)hp->n_target;
+            W_snap = (uint16_t *)malloc(n * sizeof(uint16_t));
+            if (W_snap) memcpy(W_snap, hp->W, n * sizeof(uint16_t));
+        }
+        if (sp_hier_calibrate_end_blend(hp, W_snap, keep_frac) != 0) ok = -1;
+        free(W_snap);
     }
     return ok;
 }
