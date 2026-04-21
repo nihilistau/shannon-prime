@@ -21,6 +21,7 @@
 // when the shadow cache lives on GPU (same as the ship CUDA path).
 
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <math.h>
 
 #ifndef M_PI
