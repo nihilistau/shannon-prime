@@ -47,7 +47,7 @@ extern "C" void sp_cuda_vilenkin_inplace(float *d_data, int pad_dim, int n_vecs,
 extern __global__ void kernel_sqfree_pad(const float *in, float *out,
                                           int hd, int pd, int n_vecs);
 extern __global__ void kernel_sqfree_unpad(const float *in, float *out,
-                                            int pd, int hd, int n_vecs);
+                                            int head_dim, int pad_dim, int n_vecs);
 extern __global__ void kernel_gather(const float *in, const int *idx,
                                       float *out, int n);
 extern __global__ void kernel_scatter(const float *in, const int *idx,
@@ -567,7 +567,7 @@ static void sp_cuda_hier_read_one(const sp_cuda_hier_cache_t *hc,
 
     // 8. Unpad → output
     kernel_sqfree_unpad<<<1, 256, 0, s>>>(
-        hc_mut->d_coeff_scratch, d_vec_out, pd, hd, 1);
+        hc_mut->d_coeff_scratch, d_vec_out, hd, pd, 1);
 }
 
 // ── Public write/read API ─────────────────────────────────────────────

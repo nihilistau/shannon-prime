@@ -134,12 +134,37 @@ void sp_cuda_band_dequantize(const void *d_input, float *d_output,
                              int n_vecs, void *stream);
 
 // ============================================================================
-// Diagnostics
+// Sqfree pipeline kernel launchers (exposed for testing / hier reuse)
 // ============================================================================
 
-// Compute correlation between two GPU vectors (returns on host)
-float sp_cuda_correlation(const float *d_a, const float *d_b,
-                          int n, void *stream);
+// In-place Vilenkin transform on a batch of padded vectors.
+// d_factors: staged prime factors on device, n_factors: count.
+void sp_cuda_vilenkin_inplace(float *d_data, int pad_dim, int n_vecs,
+                              int *d_factors, int n_factors,
+                              void *stream);
+
+// Pad head_dim → pad_dim (zero-fill) / unpad (truncate)
+void sp_cuda_sqfree_pad(const float *d_in, float *d_out,
+                        int head_dim, int pad_dim, int n_vecs,
+                        void *stream);
+
+// Möbius prediction: d_pred[i] = Σ_j CSR(mu,skel) * d_skel[j]
+void sp_cuda_mobius_predict(const float *d_skel, float *d_pred,
+                            const int *d_offsets, const int *d_slots,
+                            const int *d_signs,
+                            int sk_k, int n_res, int n_vecs,
+                            void *stream);
+
+// Spinor extraction: sign-bit sheet from actual vs predicted residuals.
+// d_deviation receives |actual-pred| with sign folded into d_sheet bits.
+void sp_cuda_spinor_extract(const float *d_actual, const float *d_pred,
+                            float *d_deviation, unsigned char *d_sheet,
+                            int n_res, int n_vecs,
+                            void *stream);
+
+// ============================================================================
+// Diagnostics
+// ============================================================================
 
 // Print GPU memory usage
 void sp_cuda_print_memory(const sp_cuda_cache_t *cc);

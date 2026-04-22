@@ -1093,7 +1093,6 @@ int sp_shadow_cache_save(const sp_shadow_cache_t *sc,
                          uint64_t model_hash) {
     if (!sc || !prefix) return -1;
 
-    const int hd      = sc->config.head_dim;
     const int n_layer = sc->config.n_layers;
     const int n_head  = sc->config.n_heads_kv;
     const int k_bytes = sc->k_bands.total_bytes;

@@ -265,7 +265,6 @@ int sp_mertens_init(sp_mertens_oracle_t *mo, int max_ctx) {
         }
     }
 
-    double prev_m = 0.0;
     for (int n = window + 1; n <= max_ctx && mo->n_schedule < SP_MERTENS_MAX_SCHEDULE;
          n += step) {
         double curr_m;
@@ -300,7 +299,6 @@ int sp_mertens_init(sp_mertens_oracle_t *mo, int max_ctx) {
             mo->n_schedule++;
         }
 
-        prev_m = curr_m;
     }
 
     if (m_cache) free(m_cache);
