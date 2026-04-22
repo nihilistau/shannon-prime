@@ -42,8 +42,8 @@ else
   SHADER_SPVS        =
 endif
 
-.PHONY: all test test-core test-torch test-adreno test-vulkan test-cuda \
-        test-cuda-advanced test-integration test-comfyui test-sqfree \
+.PHONY: all test test-core test-torch test-adreno test-vulkan test-vulkan-dualgpu \
+        test-cuda test-cuda-advanced test-integration test-comfyui test-sqfree \
         test-modelpack test-all clean
 
 all: test-all
@@ -69,6 +69,10 @@ $(SHADER_BUILD_DIR)/%.spv: $(SHADER_SRC_DIR)/%.comp
 build/test_vulkan: tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(SHADER_SPVS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS) $(VULKAN_LIB)
+
+build/test_vulkan_dualgpu: tests/test_vulkan_dualgpu.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(SHADER_SPVS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ tests/test_vulkan_dualgpu.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS) $(VULKAN_LIB)
 
 build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
 	@mkdir -p build
@@ -98,6 +102,10 @@ test-adreno: build/test_adreno
 test-vulkan: build/test_vulkan
 	@echo "── Vulkan backend (4 tests) ──"
 	@./build/test_vulkan
+
+test-vulkan-dualgpu: build/test_vulkan_dualgpu
+	@echo "── Vulkan dual-GPU (14 tests) ──"
+	@./build/test_vulkan_dualgpu
 
 test-cuda: build/test_cuda
 	@echo "── CUDA backend (7 tests) ──"

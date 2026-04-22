@@ -38,7 +38,7 @@ int main(void) {
         sp_config_init(&cfg, 128, 4, 2);
 
         sp_vulkan_cache_t *cc = NULL;
-        int rc = sp_vulkan_cache_init(&cc, &cfg, 1024, NULL, NULL);
+        int rc = sp_vulkan_cache_init(&cc, &cfg, 1024, NULL, NULL, 0);
         CHECK(rc == 0 && cc != NULL, "Init with CPU fallback succeeds");
 
         sp_vulkan_check_device(cc);

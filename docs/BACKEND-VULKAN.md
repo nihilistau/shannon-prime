@@ -92,13 +92,21 @@ gcc -O2 -o build/test_vulkan \
 
 ```c
 sp_vulkan_cache_t *cc;
-sp_vulkan_cache_init(&cc, &cfg, max_seq_len, NULL, NULL);
+sp_vulkan_cache_init(&cc, &cfg, max_seq_len, NULL, NULL, 0);  // gpu_index 0
 ```
 
-**Shared:** Uses the existing Vulkan device from llama.cpp's Vulkan backend or another inference engine. Zero overhead from device creation.
+**Multi-GPU (standalone):** Open a specific physical device by index. Enumerate with `vulkaninfo --summary` to see available GPUs.
 
 ```c
-sp_vulkan_cache_init(&cc, &cfg, max_seq_len, existing_vk_device, existing_vk_queue);
+sp_vulkan_cache_t *hot, *cold;
+sp_vulkan_cache_init(&hot,  &cfg, max_seq_len, NULL, NULL, 0);  // discrete GPU
+sp_vulkan_cache_init(&cold, &cfg, max_seq_len, NULL, NULL, 1);  // iGPU / second GPU
+```
+
+**Shared:** Uses the existing Vulkan device from llama.cpp's Vulkan backend or another inference engine. Zero overhead from device creation. `gpu_index` is ignored when a device is provided.
+
+```c
+sp_vulkan_cache_init(&cc, &cfg, max_seq_len, existing_vk_device, existing_vk_queue, 0);
 ```
 
 ## Buffer API

@@ -39,13 +39,16 @@ typedef struct sp_vulkan_cache_s sp_vulkan_cache_t;
 // Initialize Vulkan compute pipeline and allocate cache buffers.
 // vk_device, vk_queue: existing Vulkan device/queue from the inference engine.
 // If NULL, creates its own device (standalone mode).
+// gpu_index: which VkPhysicalDevice to use (0 = first, 1 = second, ...).
+//            Only used in standalone mode (vk_device == NULL).
 //
 // Returns 0 on success, -1 on failure.
 int sp_vulkan_cache_init(sp_vulkan_cache_t **cc,
                          const sp_config_t *cfg,
                          int max_seq_len,
                          void *vk_device,    // VkDevice or NULL
-                         void *vk_queue);    // VkQueue or NULL
+                         void *vk_queue,     // VkQueue or NULL
+                         int gpu_index);     // physical device index (standalone)
 
 void sp_vulkan_cache_free(sp_vulkan_cache_t *cc);
 

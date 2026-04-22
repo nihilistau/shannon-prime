@@ -310,7 +310,7 @@ static int vk_factor_small(int n, uint32_t *factors_out) {
 }
 
 static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
-                                 void *user_queue) {
+                                 void *user_queue, int gpu_index) {
     sp_vk_impl_t *vk = &cc->vk;
     memset(vk, 0, sizeof(*vk));
 
@@ -341,7 +341,19 @@ static int init_vulkan_pipelines(sp_vulkan_cache_t *cc, void *user_device,
         if (n_pd > 8) n_pd = 8;
         VkPhysicalDevice pds[8];
         vkEnumeratePhysicalDevices(vk->instance, &n_pd, pds);
-        vk->phys_device = pds[0];
+        if (gpu_index < 0 || (uint32_t)gpu_index >= n_pd) {
+            fprintf(stderr, "[sp-vulkan] gpu_index=%d out of range (have %u devices)\n",
+                    gpu_index, n_pd);
+            vkDestroyInstance(vk->instance, NULL);
+            vk->instance = VK_NULL_HANDLE;
+            return -1;
+        }
+        vk->phys_device = pds[gpu_index];
+        {
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(vk->phys_device, &props);
+            fprintf(stderr, "[sp-vulkan] using GPU %d: %s\n", gpu_index, props.deviceName);
+        }
         // Find a compute-capable queue family
         uint32_t n_qf = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(vk->phys_device, &n_qf, NULL);
@@ -1005,7 +1017,8 @@ int sp_vulkan_cache_init(sp_vulkan_cache_t **cc_out,
                          const sp_config_t *cfg,
                          int max_seq_len,
                          void *vk_device,
-                         void *vk_queue) {
+                         void *vk_queue,
+                         int gpu_index) {
     sp_vulkan_cache_t *cc = (sp_vulkan_cache_t *)calloc(1, sizeof(*cc));
     if (!cc) return -1;
 
@@ -1019,7 +1032,7 @@ int sp_vulkan_cache_init(sp_vulkan_cache_t **cc_out,
 
 #ifdef SHANNON_PRIME_VULKAN_ENABLED
     // Try GPU path — if no user device provided, create our own
-    if (init_vulkan_pipelines(cc, vk_device, vk_queue) == 0) {
+    if (init_vulkan_pipelines(cc, vk_device, vk_queue, gpu_index) == 0) {
         vk_ok = 1;
 
         // Determine slot blob format. force_gpu frozen at init time so a
@@ -1059,7 +1072,7 @@ int sp_vulkan_cache_init(sp_vulkan_cache_t **cc_out,
         }
     }
 #else
-    (void)vk_device; (void)vk_queue;
+    (void)vk_device; (void)vk_queue; (void)gpu_index;
 #endif
 
     if (!vk_ok) {
