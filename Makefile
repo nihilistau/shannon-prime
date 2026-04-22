@@ -43,7 +43,8 @@ else
 endif
 
 .PHONY: all test test-core test-torch test-adreno test-vulkan test-cuda \
-        test-integration test-comfyui test-sqfree test-modelpack test-all clean
+        test-cuda-advanced test-integration test-comfyui test-sqfree \
+        test-modelpack test-all clean
 
 all: test-all
 
@@ -73,6 +74,10 @@ build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SR
 	@mkdir -p build
 	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
 
+build/test_cuda_advanced: tests/test_cuda_advanced.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+	@mkdir -p build
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda_advanced.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
+
 build/test_integration: tests/test_integration.c $(LLAMA_SRC) $(CORE_SRC)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -o $@ tests/test_integration.c $(LLAMA_SRC) $(CORE_SRC) $(LDFLAGS)
@@ -97,6 +102,10 @@ test-vulkan: build/test_vulkan
 test-cuda: build/test_cuda
 	@echo "── CUDA backend (7 tests) ──"
 	@./build/test_cuda
+
+test-cuda-advanced: build/test_cuda_advanced
+	@echo "── CUDA advanced (sqfree/hier/cold/stress) ──"
+	@./build/test_cuda_advanced
 
 test-integration: build/test_integration
 	@echo "── llama.cpp integration (7 tests) ──"
