@@ -255,25 +255,33 @@ static void test_hier_gpu(void) {
     sp_config_t cfg;
     sp_config_init(&cfg, hd, n_layers, n_heads);
 
-    // Use CPU-side hier_cache to get structural metadata
+    // Use CPU-side hier_cache to get structural metadata.
+    // sp_hier_cache_init(hc, cfg, max_seq, hier_level, skel_n_bands, skel_band_bits, target_res_bits)
+    int skel_band_bits[] = {5, 5};
     sp_hier_cache_t hc_cpu;
-    int rc = sp_hier_cache_init(&hc_cpu, &cfg, max_seq, 4);
+    int rc = sp_hier_cache_init(&hc_cpu, &cfg, max_seq,
+                                 /*hier_level=*/0,
+                                 /*skel_n_bands=*/2, skel_band_bits,
+                                 /*target_res_bits=*/2);
     CHECK(rc == 0, "CPU hier_cache init");
     if (rc != 0) return;
 
     char msg[256];
+
+    // Extract structural metadata from the first predictor
+    sp_hier_predictor_t *hp0 = &hc_cpu.predictors[0];
 
     // Now init the GPU variant
     int n_slots = n_layers * n_heads;
     sp_cuda_hier_cache_t hc;
     rc = sp_cuda_hier_cache_init(&hc, &cfg,
                                   hc_cpu.pad_dim,
-                                  hc_cpu.n_skeleton,
-                                  hc_cpu.n_target,
-                                  hc_cpu.target_res_bits,
-                                  hc_cpu.skeleton_idx,
-                                  hc_cpu.target_idx,
-                                  &hc_cpu.skel_bands,
+                                  hp0->n_skeleton,
+                                  hp0->n_target,
+                                  hp0->target_res_bits,
+                                  hp0->skeleton_idx,
+                                  hp0->target_idx,
+                                  &hp0->skel_bands,
                                   max_seq, n_slots, NULL);
     snprintf(msg, sizeof(msg),
              "GPU hier init (pad=%d, skel=%d, target=%d)",
