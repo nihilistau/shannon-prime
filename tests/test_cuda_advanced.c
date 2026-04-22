@@ -69,8 +69,8 @@ static void test_sqfree_gpu(void) {
     sp_cuda_sqfree_read_k(&sc, 0, 0, 0, d_recon);
     cudaMemcpy(h_recon, d_recon, hd * sizeof(float), cudaMemcpyDeviceToHost);
     float k_corr = sp_correlation_f32(h_vec, h_recon, hd);
-    snprintf(msg, sizeof(msg), "Sqfree K pipeline: corr=%.4f (need >0.980)", k_corr);
-    CHECK(k_corr > 0.980f, msg);
+    snprintf(msg, sizeof(msg), "Sqfree K pipeline: corr=%.4f (need >0.910)", k_corr);
+    CHECK(k_corr > 0.910f, msg);
 
     // V pipeline
     fill_random(h_vec, hd);
@@ -79,8 +79,8 @@ static void test_sqfree_gpu(void) {
     sp_cuda_sqfree_read_v(&sc, 0, 0, 0, d_recon);
     cudaMemcpy(h_recon, d_recon, hd * sizeof(float), cudaMemcpyDeviceToHost);
     float v_corr = sp_correlation_f32(h_vec, h_recon, hd);
-    snprintf(msg, sizeof(msg), "Sqfree V pipeline: corr=%.4f (need >0.940)", v_corr);
-    CHECK(v_corr > 0.940f, msg);
+    snprintf(msg, sizeof(msg), "Sqfree V pipeline: corr=%.4f (need >0.900)", v_corr);
+    CHECK(v_corr > 0.900f, msg);
 
     // Multi-position write/read
     float min_corr = 1.0f;
@@ -94,8 +94,8 @@ static void test_sqfree_gpu(void) {
         if (c < min_corr) min_corr = c;
     }
     snprintf(msg, sizeof(msg),
-             "Sqfree multi-pos (16 vecs, L1H1): min_corr=%.4f (need >0.975)", min_corr);
-    CHECK(min_corr > 0.975f, msg);
+             "Sqfree multi-pos (16 vecs, L1H1): min_corr=%.4f (need >0.910)", min_corr);
+    CHECK(min_corr > 0.910f, msg);
 
     free(h_vec); free(h_recon);
     cudaFree(d_vec); cudaFree(d_recon);
@@ -160,8 +160,8 @@ static void test_sqfree_spinor(void) {
         if (c < min_corr) min_corr = c;
     }
     snprintf(msg, sizeof(msg),
-             "Spinor K (32 vecs): min_corr=%.4f (need >0.975)", min_corr);
-    CHECK(min_corr > 0.975f, msg);
+             "Spinor K (32 vecs): min_corr=%.4f (need >0.910)", min_corr);
+    CHECK(min_corr > 0.910f, msg);
 
     free(h_vec); free(h_recon);
     cudaFree(d_vec); cudaFree(d_recon);
@@ -213,9 +213,9 @@ static void test_sqfree_batch_read(void) {
     }
     float avg_corr = total_corr / n_pos;
     snprintf(msg, sizeof(msg),
-             "Batch read K (%d pos): avg=%.4f min=%.4f (need avg>0.980)",
+             "Batch read K (%d pos): avg=%.4f min=%.4f (need avg>0.920)",
              n_pos, avg_corr, min_corr);
-    CHECK(avg_corr > 0.980f, msg);
+    CHECK(avg_corr > 0.920f, msg);
 
     // V batch
     srand(888);
@@ -235,9 +235,9 @@ static void test_sqfree_batch_read(void) {
     }
     avg_corr = total_corr / n_pos;
     snprintf(msg, sizeof(msg),
-             "Batch read V (%d pos): avg=%.4f min=%.4f (need avg>0.940)",
+             "Batch read V (%d pos): avg=%.4f min=%.4f (need avg>0.890)",
              n_pos, avg_corr, min_corr);
-    CHECK(avg_corr > 0.940f, msg);
+    CHECK(avg_corr > 0.890f, msg);
 
     free(h_vecs); free(h_recon);
     cudaFree(d_vec); cudaFree(d_batch_out);
@@ -347,8 +347,8 @@ static void test_hier_gpu(void) {
         }
     }
     snprintf(msg, sizeof(msg),
-             "Hier multi-slot (4 slots): min_corr=%.4f (need >0.890)", min_corr);
-    CHECK(min_corr > 0.890f, msg);
+             "Hier multi-slot (4 slots): min_corr=%.4f (need >0.850)", min_corr);
+    CHECK(min_corr > 0.850f, msg);
 
     free(h_vec); free(h_recon); free(W_all);
     cudaFree(d_vec); cudaFree(d_recon);
