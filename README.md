@@ -31,7 +31,7 @@ the same VHT2 / Möbius / sqfree implementation.
 | Repo | Role | Status |
 |---|---|---|
 | **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + prefill + greedy chat with optimised single-token decode all working on Llama-3 / Qwen3, ship + sqfree + sqfree+spinor. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
-| **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Post-decode hook into llama.cpp. Inherits 30+ model architectures via the upstream loader, but the hook surface itself has been a source of integration bugs — every PPL number measured through it carries a footnote. | In production for ship + sqfree paths; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) and the measured-results section below. |
+| **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Full engine integration into llama.cpp. The b8733 full-engine patch compiles the entire SP stack (VHT2 ship + sqfree+spinor + hierarchical + System 1/2 + multi-GPU, 4 backends) into llama.dll/libllama.so as static libs. Includes an LM Studio runtime builder (`lmstudio/build.bat`). Validated: Qwen3.6-35B-A3B MoE at 26.92 tok/sec in LM Studio v2.13.0. | In production; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) and the measured-results section below. |
 | **[shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)** | ComfyUI custom nodes that compress + cache cross-attention K/V in Wan 2.1 / 2.2 video models. Cross-attention from text embeddings is identical across diffusion timesteps — compute once, compress, reconstruct. | In production: 1.20× cross-attention speedup at 0.9984 output correlation on Wan 2.2 14B. See [docs/INTEGRATION-COMFYUI.md](docs/INTEGRATION-COMFYUI.md). |
 
 The first published measurements that don't carry the hook-surface
@@ -135,11 +135,16 @@ shannon-prime-repos/                  ← parent dir holding all three
 │   │                                  prefill, chat, cache_ppl, perplexity
 │   └── CMakeLists.txt                CMake + Ninja, optional CUDA/Vulkan
 │
-├── shannon-prime-llama/              ← SIBLING: llama.cpp post-decode hook
-│   │                                    Inherits 30+ archs from llama.cpp.
-│   │                                    See docs/INTEGRATION-LLAMA.md.
+├── shannon-prime-llama/              ← SIBLING: full engine for llama.cpp
+│   │                                    b8733 patch integrates entire SP stack.
+│   │                                    LM Studio runtime builder included.
 │   ├── lib/shannon-prime/            git submodule → this repo
-│   └── src/llama-shannon-prime.{h,cpp}  Hook implementation
+│   ├── src/
+│   │   ├── backends/{cuda,vulkan,adreno}/  4-backend implementations
+│   │   ├── engine/{kv_cache,gdn_state}.*   KV cache + System 1/2 state
+│   │   └── tools/shannon_prime_llama.*     Bridge to llama.cpp
+│   ├── patches/llama-cpp-b8733-full-engine.patch
+│   └── lmstudio/build.bat           Drop-in LM Studio DLL builder
 │
 └── shannon-prime-comfyui/            ← SIBLING: ComfyUI custom nodes for
     │                                    Wan 2.1/2.2 cross-attention caching.
@@ -294,8 +299,9 @@ Use as a pre-bench filter — skip configs with predicted ΔPPL > 5%.
 |-------|-------|-------------------|
 | Core math | 31 | VHT2 round-trip, Möbius, banded quant, sqfree, full pipeline |
 | Adreno/ARM | 14 | NEON tiers, fp16, absmax, affinity, counters |
-| Vulkan | 4 | CPU fallback, batch ops, memory reporting |
-| CUDA | 7 | Multi-layer, multi-head, batch K+V roundtrip |
+| Vulkan | 4+1 | CPU fallback, batch ops, memory reporting, dual-GPU cross-device (RTX 2060 + Intel UHD, correlation 1.0000) |
+| CUDA basic | 7 | Multi-layer, multi-head, batch K+V roundtrip |
+| CUDA advanced | 24 | sqfree GPU, spinor, batch read, hierarchical, cold storage, stress |
 | llama.cpp | 7 | Integration layer, env-var driven config |
 | PyTorch | 31 | VHT2 self-inverse at p-of-2 and sqfree, full pipeline |
 | ComfyUI | 25 | Wan 2.1/2.2 MoE, expert switching, 50×40 simulation |
