@@ -5,6 +5,12 @@
 *.d
 *.elf
 *.map
+*.exe
+*.pyd
+*.pyc
+build/
+__pycache__/
+backends/cuda/build/
 
 # Test/benchmark output and log files — do not commit
 logs/
