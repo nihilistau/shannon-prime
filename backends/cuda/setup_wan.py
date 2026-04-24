@@ -34,9 +34,13 @@ from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 sources = [
-    os.path.join(HERE, "vht2_wan_ext.cpp"),       # PyTorch binding
-    os.path.join(HERE, "shannon_prime_cuda.cu"),  # VHT2 + Möbius + band quant
-    os.path.join(HERE, "shannon_prime_sqfree.cu"),# Vilenkin non-p2 stages
+    os.path.join(HERE, "vht2_wan_ext.cpp"),        # PyTorch binding
+    os.path.join(HERE, "shannon_prime_cuda.cu"),   # VHT2 + Möbius + band quant kernels
+    os.path.join(HERE, "shannon_prime_sqfree.cu"), # Vilenkin non-p2 stages
+    # Core C library — provides sp_mobius_mask_init, sp_band_config_init,
+    # sp_sqfree_pad_dim, sp_knight_mask_* etc. that the CUDA files call.
+    os.path.join(_CORE_INC, "shannon_prime.c"),
+    os.path.join(_CORE_INC, "shannon_prime_sqfree.c"),
 ]
 
 # ── Compiler flags ─────────────────────────────────────────────────────────────
