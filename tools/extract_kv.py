@@ -890,6 +890,13 @@ Examples:
 
     parser.add_argument('--per-head', action='store_true',
                         help='Also save per-head arrays (k_layer{L}_head{H})')
+    parser.add_argument('--layer-period', type=int, default=None,
+                        help='Repeating attention-type period for hybrid models. '
+                             'Saves layer_types array to .npz. '
+                             'Known: Qwen3.6 (27B, 35B-A3B) = 4, Gemma4 = 4')
+    parser.add_argument('--global-offset', type=int, default=3,
+                        help='Layer index within the period that is full/global attention '
+                             '(default: 3). With --layer-period 4: layers 3,7,11,… are global.')
     parser.add_argument('--verbose', '-v', action='store_true',
                         help='Verbose output')
 
@@ -1039,6 +1046,63 @@ Examples:
         if n_layers > 4:
             print(f"    ... ({n_layers - 4} more layers)")
 
+    # ── Detect layer types ───────────────────────────────────────────────
+    layer_types = None
+    lt_source   = None
+
+    if args.layer_period:
+        # User-specified periodic pattern
+        period = args.layer_period
+        offset = args.global_offset
+        layer_types = np.array(
+            ['global' if L % period == offset else 'local' for L in range(n_layers)]
+        )
+        lt_source = f'period={period},offset={offset}'
+
+    else:
+        # Auto-detect from GGUF metadata: look for sliding_window key
+        try:
+            if is_gguf:
+                from llama_cpp import Llama, llama_cpp as _lc
+                import ctypes as _ct
+                _m = metadata  # already have model metadata
+                # Try to read GGUF metadata keys for SWA
+                sw_key_hits = 0
+                try:
+                    lm = Llama(model_path=args.model, n_ctx=8, verbose=False)._model.model
+                    n_meta = _lc.llama_model_meta_count(lm)
+                    sw_val = None
+                    for idx in range(n_meta):
+                        kbuf = (_ct.c_char * 256)()
+                        vbuf = (_ct.c_char * 256)()
+                        _lc.llama_model_meta_key_by_index(lm, idx, kbuf, 256)
+                        _lc.llama_model_meta_val_str_by_index(lm, idx, vbuf, 256)
+                        k_str = kbuf.value.decode('utf-8', errors='replace')
+                        v_str = vbuf.value.decode('utf-8', errors='replace')
+                        if 'sliding_window' in k_str.lower() and 'layer' not in k_str.lower():
+                            try:
+                                sw_val = int(v_str.strip())
+                                sw_key_hits += 1
+                            except ValueError:
+                                pass
+                    if sw_key_hits > 0 and sw_val and sw_val > 0:
+                        # SWA model detected: use the standard 3:1 pattern (period=4, offset=3)
+                        # This matches Qwen3.6 and Gemma4 architectures
+                        period, offset = 4, 3
+                        layer_types = np.array(
+                            ['global' if L % period == offset else 'local'
+                             for L in range(n_layers)]
+                        )
+                        lt_source = f'auto-detected(sw={sw_val},period={period},offset={offset})'
+                        print(f"  Auto-detected SWA (sliding_window={sw_val}): "
+                              f"period={period}, offset={offset} "
+                              f"-> {np.sum(layer_types=='global')} global, "
+                              f"{np.sum(layer_types=='local')} local layers")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     # ── Save output ──────────────────────────────────────────────────────
     print(f"\nSaving to {args.output}...")
 
@@ -1047,6 +1111,16 @@ Examples:
         for L in range(n_layers):
             for H in range(n_heads):
                 save_dict[f'k_layer{L}_head{H}'] = k_vectors[L, H]
+
+    if layer_types is not None:
+        save_dict['layer_types'] = layer_types
+        n_global = int(np.sum(layer_types == 'global'))
+        n_local  = int(np.sum(layer_types == 'local'))
+        metadata['layer_types_source'] = lt_source
+        metadata['n_global_layers']    = n_global
+        metadata['n_local_layers']     = n_local
+        print(f"  Layer types: {n_global} global, {n_local} local ({lt_source})")
+
     save_dict['metadata'] = np.array(json.dumps(metadata))
     np.savez_compressed(args.output, **save_dict)
 
