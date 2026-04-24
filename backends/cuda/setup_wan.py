@@ -61,8 +61,11 @@ _CXX_FLAGS = [
 ]
 
 # ── Core library include path ──────────────────────────────────────────────────
+# Use realpath() to resolve the absolute path before any virtual-drive or
+# subst shenanigans. Relative paths like ../../core break when building from
+# a subst'd drive letter (X:\) because Windows doesn't traverse up through it.
 
-_CORE_INC = os.path.join(HERE, "..", "..", "core")
+_CORE_INC = os.path.realpath(os.path.join(HERE, "..", "..", "core"))
 
 # ── Extension definition ───────────────────────────────────────────────────────
 
@@ -74,7 +77,8 @@ ext = CUDAExtension(
         "cxx":  _CXX_FLAGS,
         "nvcc": _CUDA_FLAGS,
     },
-    extra_link_args=["-lcuda"],
+    # -lcuda is implicit on Windows via CUDA toolkit; omit to avoid linker errors
+    extra_link_args=[],
 )
 
 # ── Build ──────────────────────────────────────────────────────────────────────
