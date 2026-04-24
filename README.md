@@ -32,7 +32,7 @@ the same VHT2 / Möbius / sqfree implementation.
 |---|---|---|
 | **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + prefill + greedy chat with optimised single-token decode all working on Llama-3 / Qwen3, ship + sqfree + sqfree+spinor. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
 | **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Full engine integration into llama.cpp. The b8733 full-engine patch compiles the entire SP stack (VHT2 ship + sqfree+spinor + hierarchical + System 1/2 + multi-GPU, 4 backends) into llama.dll/libllama.so as static libs. Includes an LM Studio runtime builder (`lmstudio/build.bat`). Validated: Qwen3.6-35B-A3B MoE at 26.92 tok/sec in LM Studio v2.13.0. | In production; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md) and the measured-results section below. |
-| **[shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)** | ComfyUI custom nodes that compress + cache cross-attention K/V in Wan 2.1 / 2.2 video models. Cross-attention from text embeddings is identical across diffusion timesteps — compute once, compress, reconstruct. | In production: 1.20× cross-attention speedup at 0.9984 output correlation on Wan 2.2 14B. See [docs/INTEGRATION-COMFYUI.md](docs/INTEGRATION-COMFYUI.md). |
+| **[shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)** | ComfyUI custom nodes for Wan 2.1/2.2 video models. Phase 12 adds `ShannonPrimeWanBlockSkip` — patches `WanAttentionBlock.forward()` to skip Q/K/V+attention on stable early blocks (L00-L03), reusing cached y with correct adaLN gate re-anchoring. Output 100% identical to baseline at 720p. `ShannonPrimeWanCacheFlush` clears the y-cache before VAE decode, eliminating the ~34s VAE overhead. | Phase 12 validated: BlockSkip+CacheFlush matches baseline total time at 720p (1280×720, RTX 2060). See [shannon-prime-comfyui README](https://github.com/nihilistau/shannon-prime-comfyui). |
 
 The first published measurements that don't carry the hook-surface
 footnote will come from `shannon-prime-engine` when the optimised
@@ -87,6 +87,31 @@ sentinel — detects the drift and refreshes the cache with a re-prefill from
 ground-truth tokens. Zero measured cost in the shipping default
 (Mertens-only), bounds cache error for ctx ≥ 2k. Detailed design in
 [docs/CAUCHY-RESET.md](docs/CAUCHY-RESET.md).
+
+## Phase 12 Tools (Diagnostic Suite + ComfyUI/Wan)
+
+Phase 12 added a comprehensive diagnostic suite for empirical validation
+and the first ComfyUI self-attention caching layer for Wan DiT models.
+
+### Diagnostic suite (`tools/`)
+
+| Tool | Purpose |
+|------|---------|
+| `sp_diagnostics.py` | 4-test Phase 12 suite: Boundary Sharpness, Ghost Basin (DBSCAN), RoPE Pair Correlation, Fractional Slope Lookahead |
+| `sp_regime_analysis.py` | Two-regime reconstruction analysis with optional GL(α=0.25) transition trigger (`--use-gl-trigger`) |
+| `extract_kv.py` | KV vector extraction from GGUF/HF models; stores `layer_types` for hybrid-attention models |
+
+Key findings across 7 models (Dolphin-1B → Wan 2.2 TI2V-5B):
+- **T3 (RoPE Pair Correlation)**: r=0.73–0.87 for dense models; r=0.76 flat across all Wan DiT blocks
+- **T4 (GL trigger)**: α=0.25 detects regime transition 9–31 layers before standard slope on dense models
+- **3D RoPE axis split**: temporal dims (r=0.82) > spatial (r=0.73) at Wan mid-sigma
+- **Block stability sweep**: Wan L00-L03 cos_sim>0.95 for 10+ steps; L23 drops to 0.34
+
+### ComfyUI / Wan DiT (shannon-prime-comfyui)
+
+Validated at 1280×720, 9 frames, Wan 2.2 TI2V-5B Q8, RTX 2060 12GB:
+- BlockSkip + CacheFlush: **matches baseline total time**, 100% identical output
+- ComfyUI flags: `--normalvram --disable-async-offload`
 
 ## Project Structure
 
