@@ -29,9 +29,17 @@ import torch
 from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 
-# ── Source files ───────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Core library include path — must be defined before sources list.
+# Use realpath() to resolve the absolute path before any virtual-drive or
+# subst shenanigans. Relative paths like ../../core break when building from
+# a subst'd drive letter (X:\) because Windows doesn't traverse up through it.
+_CORE_INC = os.path.realpath(os.path.join(HERE, "..", "..", "core"))
+
+# ── Source files ───────────────────────────────────────────────────────────────
 
 sources = [
     os.path.join(HERE, "vht2_wan_ext.cpp"),        # PyTorch binding
@@ -63,13 +71,6 @@ _CXX_FLAGS = [
     "-O3",
     "-std=c++17",
 ]
-
-# ── Core library include path ──────────────────────────────────────────────────
-# Use realpath() to resolve the absolute path before any virtual-drive or
-# subst shenanigans. Relative paths like ../../core break when building from
-# a subst'd drive letter (X:\) because Windows doesn't traverse up through it.
-
-_CORE_INC = os.path.realpath(os.path.join(HERE, "..", "..", "core"))
 
 # ── Extension definition ───────────────────────────────────────────────────────
 
