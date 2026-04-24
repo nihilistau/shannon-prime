@@ -1,50 +1,16 @@
 # Build artifacts
-build/
 *.o
+*.a
 *.so
-*.dylib
-*.dll
-*.exe
-*.spv
+*.d
+*.elf
+*.map
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-*.egg
-
-# IDE
-.vscode/settings.json
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# CUDA
-*.cubin
-*.ptx
-*.fatbin
-
-# Temporary
-*.tmp
-*.bak
-
-# Bench artefacts too large to version (logs/ keeps JSON summaries only)
-logs/*.gguf
-logs/*.sp_freq_factors.bin
-logs/*.log
-logs/*.bin
-logs/*.txt
+# Test/benchmark output and log files — do not commit
+logs/
 
 # Internal templates not for the published repo
 COPYRIGHT_HEADER.txt
 
 # Don't ignore these
 !.gitkeep
-!logs/.gitkeep
