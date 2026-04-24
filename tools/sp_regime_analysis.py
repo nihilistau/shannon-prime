@@ -319,13 +319,130 @@ def detect_transition(k_vectors: np.ndarray, analysis_dim: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GL(α=0.25) fractional-derivative transition trigger
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gl_derivative(f: np.ndarray, alpha: float) -> np.ndarray:
+    """Grünwald-Letnikov fractional derivative of order alpha on sequence f.
+
+    D^α f(n) = Σ_{k=0}^{n} w[k] * f(n-k)
+
+    w[0]=1,  w[k] = -w[k-1] * (alpha - k + 1) / k
+
+    Special cases: alpha=1 → first difference; alpha=2 → second difference.
+
+    Empirical finding (sp_diagnostics Phase 12): alpha=0.25 consistently
+    detects the p3-decline regime transition 9–31 layers earlier than the
+    standard first difference (alpha=1) across Dolphin-1B, Phi-3, Qwen3-8B
+    and Qwen3.6-27B.
+    """
+    f  = np.asarray(f, dtype=np.float64)
+    n  = len(f)
+    w  = np.zeros(n)
+    w[0] = 1.0
+    for k in range(1, n):
+        w[k] = -w[k - 1] * (alpha - k + 1) / k
+
+    result = np.zeros(n)
+    for i in range(n):
+        acc = 0.0
+        for k in range(i + 1):
+            acc += w[k] * f[i - k]
+        result[i] = acc
+    return result
+
+
+def detect_transition_gl(k_vectors: np.ndarray, analysis_dim: int,
+                          use_sqfree: bool,
+                          alpha: float = 0.25,
+                          n_baseline_frac: float = 0.25) -> Tuple[int, Dict]:
+    """Detect regime transition using a GL fractional derivative of the p3 curve.
+
+    Unlike the standard midpoint/max-drop method in detect_transition(), this
+    triggers on the first layer where the GL(alpha) derivative of the p3 curve
+    drops more than 2σ below the baseline mean.
+
+    alpha=0.25 (default) was identified in Phase 12 diagnostics as the optimal
+    order: it accumulates enough fractional history to smooth over local noise
+    while remaining sensitive to the early onset of p3 decline.
+
+    Returns:
+        gl_transition_layer  the detected transition layer
+        info dict with p3 curve, GL curve, and baseline stats
+    """
+    n_layers, n_heads = k_vectors.shape[:2]
+    head_dim = k_vectors.shape[3]
+
+    # Compute p3 curve (same as detect_transition)
+    p3_by_layer = []
+    for L in range(n_layers):
+        p3_fracs = []
+        for H in range(n_heads):
+            kv = k_vectors[L, H]
+            n_sample = min(32, kv.shape[0])
+            total_p3, total_all = 0.0, 0.0
+            for pos in range(n_sample):
+                if use_sqfree and analysis_dim != head_dim:
+                    vec = sqfree_pad_vector(kv[pos], analysis_dim)
+                    spec = vht2(vec)
+                else:
+                    spec = vht2(kv[pos])
+                e = spec ** 2
+                total_all += e.sum()
+                total_p3  += e[3::3].sum()   # indices divisible by 3, excl. DC
+            p3_fracs.append(total_p3 / total_all if total_all > 0 else 0.0)
+        p3_by_layer.append(float(np.mean(p3_fracs)))
+
+    p3_arr = np.array(p3_by_layer)
+
+    # GL derivative
+    gl_curve = _gl_derivative(p3_arr, alpha)
+
+    # Baseline: first n_baseline_frac of layers
+    n_baseline  = max(3, int(n_layers * n_baseline_frac))
+    baseline    = gl_curve[:n_baseline]
+    bl_mean     = float(baseline.mean())
+    bl_std      = float(baseline.std())
+    threshold   = bl_mean - 2.0 * bl_std       # downward excursion trigger
+
+    # Detection: first post-baseline layer that breaches the threshold
+    gl_transition = n_layers // 2              # fallback
+    for L in range(n_baseline, n_layers):
+        if gl_curve[L] < threshold:
+            gl_transition = L
+            break
+
+    # Compare with standard max-drop detection
+    deltas    = np.diff(p3_arr)
+    std_transition = int(np.argmin(deltas)) + 1 if len(deltas) > 0 else n_layers // 2
+    lookahead = std_transition - gl_transition   # positive → GL fires earlier
+
+    info = {
+        'gl_transition_layer': gl_transition,
+        'std_transition_layer': std_transition,
+        'lookahead_layers': lookahead,
+        'alpha': alpha,
+        'baseline_mean': round(bl_mean, 6),
+        'baseline_std':  round(bl_std,  6),
+        'threshold':     round(threshold, 6),
+        'p3_curve':    [round(v, 6) for v in p3_by_layer],
+        'gl_curve':    [round(v, 6) for v in gl_curve.tolist()],
+        'p3_early_mean': round(float(np.mean(p3_arr[:n_layers // 3])), 6),
+        'p3_late_mean':  round(float(np.mean(p3_arr[2 * n_layers // 3:])), 6),
+    }
+    return gl_transition, info
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_regime(k_vectors: np.ndarray, use_sqfree: bool = True,
                    skeleton_fractions: Optional[List[float]] = None,
                    n_sample_positions: int = 64,
-                   verbose: bool = True) -> Dict:
+                   verbose: bool = True,
+                   use_gl_trigger: bool = False,
+                   gl_alpha: float = 0.25) -> Dict:
     """Run the two-regime reconstruction quality analysis.
 
     For each layer, simulates compression with three skeleton strategies
@@ -383,12 +500,29 @@ def analyze_regime(k_vectors: np.ndarray, use_sqfree: bool = True,
     # Detect transition
     if verbose:
         print(f"\n  Detecting regime transition...")
-    transition_layer, transition_info = detect_transition(
-        k_vectors, analysis_dim, use_sqfree
-    )
-    if verbose:
-        print(f"  Transition at layer {transition_layer} "
-              f"(p3: {transition_info['p3_early_mean']:.3f} → {transition_info['p3_late_mean']:.3f})")
+
+    if use_gl_trigger:
+        # GL fractional-derivative trigger (alpha=0.25 by default)
+        # Fires 9-31 layers earlier than the standard first-difference trigger
+        # across Dolphin-1B, Phi-3, Qwen3-8B, Qwen3.6-27B (Phase 12 diagnostics)
+        transition_layer, transition_info = detect_transition_gl(
+            k_vectors, analysis_dim, use_sqfree, alpha=gl_alpha
+        )
+        if verbose:
+            la = transition_info['lookahead_layers']
+            print(f"  GL trigger (alpha={gl_alpha}): transition at layer {transition_layer} "
+                  f"({'+' if la >= 0 else ''}{la} layers vs std trigger at "
+                  f"layer {transition_info['std_transition_layer']})")
+            print(f"  p3: {transition_info['p3_early_mean']:.3f} -> {transition_info['p3_late_mean']:.3f}")
+        transition_info['trigger'] = 'gl'
+    else:
+        transition_layer, transition_info = detect_transition(
+            k_vectors, analysis_dim, use_sqfree
+        )
+        if verbose:
+            print(f"  Transition at layer {transition_layer} "
+                  f"(p3: {transition_info['p3_early_mean']:.3f} -> {transition_info['p3_late_mean']:.3f})")
+        transition_info['trigger'] = 'standard'
 
     # ── Per-layer analysis ──────────────────────────────────────────────
     if verbose:
@@ -698,6 +832,14 @@ def main():
                         help='Pad to sqfree dimensions for multi-prime analysis')
     parser.add_argument('--sample-positions', type=int, default=64,
                         help='Number of positions to sample per head (default: 64)')
+    parser.add_argument('--use-gl-trigger', action='store_true',
+                        help='Use GL(alpha) fractional-derivative transition trigger instead of '
+                             'the standard p3 midpoint/max-drop method. '
+                             'Empirically fires 9-31 layers earlier across Dolphin-1B, '
+                             'Phi-3, Qwen3-8B, Qwen3.6-27B (Phase 12 diagnostics).')
+    parser.add_argument('--gl-alpha', type=float, default=0.25,
+                        help='Fractional-derivative order for --use-gl-trigger (default: 0.25). '
+                             '0.25 was the optimal order in Phase 12 diagnostics.')
     parser.add_argument('--quiet', '-q', action='store_true',
                         help='Minimal output')
     args = parser.parse_args()
@@ -706,11 +848,18 @@ def main():
     k_vectors, nl, nh, hd = load_k_vectors(args.input)
     print(f"  Shape: {k_vectors.shape}")
 
+    if args.use_gl_trigger:
+        print(f"  Transition trigger: GL(alpha={args.gl_alpha}) fractional derivative")
+    else:
+        print(f"  Transition trigger: standard p3 midpoint/max-drop")
+
     results = analyze_regime(
         k_vectors,
         use_sqfree=args.sqfree,
         n_sample_positions=args.sample_positions,
         verbose=not args.quiet,
+        use_gl_trigger=args.use_gl_trigger,
+        gl_alpha=args.gl_alpha,
     )
 
     if args.output:
