@@ -22,6 +22,8 @@
 #include <cuda_runtime.h>
 
 // ── Forward declarations of CUDA kernel launchers (in shannon_prime_cuda.cu) ──
+// stream=nullptr → default CUDA stream (same stream PyTorch uses by default).
+// Avoids pulling in ATen CUDA stream headers which add build complexity.
 extern "C" void sp_cuda_vht2_forward(float *d_data, int n, int n_vecs,
                                       void *stream);
 
@@ -38,9 +40,9 @@ static inline void check_wan_tensor(const torch::Tensor &t, const char *name) {
         name, " last dim must be 128 (Wan head_dim), got ", t.size(-1));
 }
 
-static inline at::cuda::CUDAStream current_stream() {
-    return at::cuda::getCurrentCUDAStream();
-}
+// Default CUDA stream — safe to use since all tensors are already on CUDA and
+// PyTorch serializes kernel launches on the default stream by default.
+static constexpr void *kDefaultStream = nullptr;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -52,7 +54,7 @@ torch::Tensor vht2_forward(const torch::Tensor &input) {
     auto out   = input.clone();
     int  n_vec = (int)(out.numel() / 128);
     sp_cuda_vht2_forward(out.data_ptr<float>(), 128, n_vec,
-                          (void *)current_stream().stream());
+                          kDefaultStream);
     return out;
 }
 
@@ -62,7 +64,7 @@ void vht2_inplace(torch::Tensor &t) {
     check_wan_tensor(t, "t");
     int n_vec = (int)(t.numel() / 128);
     sp_cuda_vht2_forward(t.data_ptr<float>(), 128, n_vec,
-                          (void *)current_stream().stream());
+                          kDefaultStream);
 }
 
 // vht2_compress: transform + zero non-skeleton positions.
@@ -81,7 +83,7 @@ torch::Tensor vht2_compress(const torch::Tensor &input,
 
     // Forward butterfly
     sp_cuda_vht2_forward(out.data_ptr<float>(), 128, n_vec,
-                          (void *)current_stream().stream());
+                          kDefaultStream);
 
     // Apply skeleton mask: broadcast [128] mask over [N, 128] output.
     // mul_ with float mask (0.0 / 1.0) zeros non-skeleton positions.
@@ -108,7 +110,7 @@ torch::Tensor vht2_decompress(const torch::Tensor &coeffs,
 
     // Inverse butterfly (= forward, self-inverse)
     sp_cuda_vht2_forward(out.data_ptr<float>(), 128, n_vec,
-                          (void *)current_stream().stream());
+                          kDefaultStream);
     return out;
 }
 
@@ -124,7 +126,7 @@ torch::Tensor vht2_roundtrip(const torch::Tensor &input,
 
     auto out    = input.clone();
     int n_vec   = (int)(out.numel() / 128);
-    auto stream = (void *)current_stream().stream();
+    auto stream = kDefaultStream;
     auto mask_f = skel_mask.to(torch::kFloat32).view({1, 128});
 
     // Forward (compress)
