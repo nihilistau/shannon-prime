@@ -1008,6 +1008,142 @@ def test_fractional_lookahead(k_vectors: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Layer-type utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def layer_type_indices(n_layers: int,
+                       period: int,
+                       global_offset: int) -> tuple:
+    """Return (global_indices, local_indices) for a periodic attention pattern.
+
+    E.g. period=4, global_offset=3 → layers 3,7,11,… are 'global' (full
+    attention); all others are 'local' (sliding-window / linear attention).
+
+    Known patterns:
+      Qwen3.6 (27B, 35B-A3B): period=4, global_offset=3
+      Gemma4  (31B):           period=4, global_offset=3
+    """
+    global_idx = [L for L in range(n_layers) if L % period == global_offset]
+    local_idx  = [L for L in range(n_layers) if L % period != global_offset]
+    return global_idx, local_idx
+
+
+def _run_suite(k_vectors: np.ndarray,
+               analysis_dim: int,
+               use_sqfree: bool,
+               run_tests: set,
+               skeleton_frac: float,
+               n_sample: int,
+               dbscan_eps,
+               dbscan_min_samples: int,
+               ghost_threshold,
+               verbose: bool,
+               label: str = "") -> dict:
+    """Run the full diagnostic suite on k_vectors and return results dict.
+
+    Used both for the full model and for per-layer-type slices.
+    """
+    n_layers = k_vectors.shape[0]
+
+    if verbose:
+        prefix = f"[{label}] " if label else ""
+        print(f"  {prefix}Precomputing spectra ({n_layers} layers)...")
+
+    _spectra, _originals = precompute_spectra(
+        k_vectors, analysis_dim, use_sqfree, n_sample
+    )
+
+    if verbose:
+        print(f"  {prefix if label else ''}Spectra shape: {_spectra.shape}\n")
+
+    results = {}
+    _sep = ("─" * 62) if not label else ("· " * 31)
+
+    for test_id in sorted(run_tests):
+        tag = f"  [{label}] T{test_id}" if label else f"  TEST {test_id}"
+
+        if test_id == 1:
+            if verbose:
+                print(_sep)
+                print(f"{tag} — Boundary Sharpness")
+                print(_sep)
+            r = test_boundary_sharpness(
+                k_vectors, analysis_dim, use_sqfree,
+                skeleton_frac=skeleton_frac, n_sample=n_sample,
+                verbose=verbose,
+                _spectra=_spectra, _originals=_originals,
+            )
+            results["test_1"] = r
+
+        elif test_id == 2:
+            if verbose:
+                print(_sep)
+                print(f"{tag} — Ghost Basin Hunt")
+                print(_sep)
+            r = test_ghost_basin(
+                k_vectors, analysis_dim, use_sqfree,
+                n_sample=n_sample,
+                eps=dbscan_eps, min_samples=dbscan_min_samples,
+                verbose=verbose,
+                _spectra=_spectra,
+                entropy_threshold=ghost_threshold,
+            )
+            results["test_2"] = r
+
+        elif test_id == 3:
+            if verbose:
+                print(_sep)
+                print(f"{tag} — RoPE Pair Correlation")
+                print(_sep)
+            r = test_rope_pair_correlation(
+                k_vectors, analysis_dim, use_sqfree,
+                skeleton_frac=skeleton_frac, n_sample=n_sample,
+                verbose=verbose,
+                _spectra=_spectra, _originals=_originals,
+            )
+            results["test_3"] = r
+
+        elif test_id == 4:
+            if verbose:
+                print(_sep)
+                print(f"{tag} — Fractional Lookahead")
+                print(_sep)
+            r = test_fractional_lookahead(
+                k_vectors, analysis_dim, use_sqfree,
+                n_sample=min(n_sample, 32),
+                verbose=verbose,
+                _spectra=_spectra,
+            )
+            results["test_4"] = r
+
+        if verbose:
+            print()
+
+    return results
+
+
+def _print_suite_summary(results: dict, run_tests: set, label: str = ""):
+    """Print a compact summary line per test from a results dict."""
+    labels = {
+        1: "Boundary Sharpness",
+        2: "Ghost Basin Hunt",
+        3: "RoPE Pair Correlation",
+        4: "Fractional Lookahead",
+    }
+    prefix = f"[{label}] " if label else ""
+    for tid in sorted(run_tests):
+        key = f"test_{tid}"
+        if key not in results:
+            continue
+        r = results[key]
+        v = r.get("verdict", "—")[:65]
+        w = r.get("win", r.get("win_variance_ratio", False)
+                         or r.get("win_step_sharpness", False))
+        marker = "WIN " if w else "MISS"
+        print(f"  [{marker}] {prefix}T{tid}: {labels.get(tid, '')}  —  {v}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1045,6 +1181,16 @@ Examples:
                         help="DBSCAN epsilon for Test 2 (default: auto-tuned)")
     parser.add_argument("--dbscan-min-samples", type=int, default=3,
                         help="DBSCAN min_samples for Test 2 (default: 3)")
+    parser.add_argument("--layer-period", type=int, default=None,
+                        help="Repeating attention-type period for hybrid models. "
+                             "Enables layer-type-split analysis. "
+                             "Qwen3.6 / Gemma4: 4")
+    parser.add_argument("--global-offset", type=int, default=3,
+                        help="Layer index within the period that is full/global attention "
+                             "(default: 3). With --layer-period 4: layers 3,7,11,… are global.")
+    parser.add_argument("--layer-types", type=str, default=None,
+                        help="Comma-separated list of layer indices that are global/full attention. "
+                             "Alternative to --layer-period/--global-offset for irregular patterns.")
     parser.add_argument("--quiet", "-q", action="store_true", help="Minimal output")
     args = parser.parse_args()
 
@@ -1055,7 +1201,7 @@ Examples:
     print(f"Loading K vectors from {args.input}...")
     k_vectors = load_k_vectors(args.input)
     n_layers, n_heads, n_pos, head_dim = k_vectors.shape
-    print(f"  Shape: {n_layers}L × {n_heads}H × {n_pos}P × {head_dim}D")
+    print(f"  Shape: {n_layers}L x {n_heads}H x {n_pos}P x {head_dim}D")
 
     if args.sqfree:
         analysis_dim = sqfree_pad_dim(head_dim)
@@ -1064,126 +1210,102 @@ Examples:
         analysis_dim = head_dim
         print(f"  Analysis dim: {analysis_dim} (no sqfree padding)")
 
+    # ── Resolve layer-type indices ────────────────────────────────────────────
+    global_idx: list = []
+    local_idx:  list = []
+    do_split = False
+
+    if args.layer_types:
+        # Explicit list of global layer indices
+        global_idx = [int(x.strip()) for x in args.layer_types.split(",")]
+        local_idx  = [L for L in range(n_layers) if L not in set(global_idx)]
+        do_split   = True
+        print(f"  Layer types: {len(global_idx)} global, {len(local_idx)} local "
+              f"(from --layer-types)")
+    elif args.layer_period:
+        global_idx, local_idx = layer_type_indices(
+            n_layers, args.layer_period, args.global_offset
+        )
+        do_split = True
+        print(f"  Layer types: {len(global_idx)} global (every {args.layer_period}th, "
+              f"offset {args.global_offset}), {len(local_idx)} local")
+
+    # Also check .npz for stored layer_types
+    try:
+        npz = np.load(args.input, allow_pickle=True)
+        if 'layer_types' in npz and not do_split:
+            lt = npz['layer_types']
+            global_idx = [i for i, t in enumerate(lt) if str(t) == 'global']
+            local_idx  = [i for i, t in enumerate(lt) if str(t) != 'global']
+            if global_idx:
+                do_split = True
+                print(f"  Layer types: loaded from .npz — "
+                      f"{len(global_idx)} global, {len(local_idx)} local")
+    except Exception:
+        pass
+
     print()
 
-    # ── Precompute all spectra in one batched numpy call ─────────────────────
-    print(f"  Precomputing VHT2 spectra (batch mode)...")
-    t_pre = time.time()
-    _spectra, _originals = precompute_spectra(k_vectors, analysis_dim, args.sqfree, args.sample)
-    print(f"  Precompute done in {time.time() - t_pre:.1f}s  "
-          f"(shape: {_spectra.shape})\n")
+    # ── Common kwargs ─────────────────────────────────────────────────────────
+    suite_kwargs = dict(
+        analysis_dim=analysis_dim, use_sqfree=args.sqfree,
+        run_tests=run_tests,
+        skeleton_frac=args.skeleton_frac, n_sample=args.sample,
+        dbscan_eps=args.dbscan_eps, dbscan_min_samples=args.dbscan_min_samples,
+        ghost_threshold=args.ghost_threshold, verbose=verbose,
+    )
 
-    # ── Run selected tests ───────────────────────────────────────────────────
-    report   = {
+    # ── Full-model run ────────────────────────────────────────────────────────
+    t_start = time.time()
+    print("=" * 62)
+    print(f"  FULL MODEL  ({n_layers} layers)")
+    print("=" * 62)
+    results_full = _run_suite(k_vectors, label="", **suite_kwargs)
+
+    report = {
         "input":        args.input,
         "shape":        {"n_layers": n_layers, "n_heads": n_heads,
                          "n_pos": n_pos, "head_dim": head_dim},
         "analysis_dim": analysis_dim,
         "sqfree":       args.sqfree,
-        "results":      {},
+        "results":      results_full,
     }
-    wins     = []
-    misses   = []
-    t_start  = time.time()
 
-    _sep = "─" * 62
+    print("=" * 62)
+    print(f"  FULL MODEL SUMMARY")
+    print("=" * 62)
+    _print_suite_summary(results_full, run_tests)
 
-    for test_id in sorted(run_tests):
-
-        if test_id == 1:
-            print(_sep)
-            print(f"  TEST 1 — Boundary Sharpness  (superconductivity analogy)")
-            print(_sep)
-            r = test_boundary_sharpness(
-                k_vectors, analysis_dim, args.sqfree,
-                skeleton_frac=args.skeleton_frac,
-                n_sample=args.sample,
-                verbose=verbose,
-                _spectra=_spectra, _originals=_originals,
-            )
-            report["results"]["test_1"] = r
-            (wins if (r["win_variance_ratio"] or r["win_step_sharpness"]) else misses).append(1)
-
-        elif test_id == 2:
-            print(_sep)
-            print(f"  TEST 2 — Ghost Basin Hunt  (Collatz clustering analogy)")
-            print(_sep)
-            r = test_ghost_basin(
-                k_vectors, analysis_dim, args.sqfree,
-                n_sample=args.sample,
-                eps=args.dbscan_eps,
-                min_samples=args.dbscan_min_samples,
-                verbose=verbose,
-                _spectra=_spectra,
-                entropy_threshold=args.ghost_threshold,
-            )
-            report["results"]["test_2"] = r
-            (wins if r["win"] else misses).append(2)
-
-        elif test_id == 3:
-            print(_sep)
-            print(f"  TEST 3 — RoPE Pair Correlation  (twin-prime analogy)")
-            print(_sep)
-            r = test_rope_pair_correlation(
-                k_vectors, analysis_dim, args.sqfree,
-                skeleton_frac=args.skeleton_frac,
-                n_sample=args.sample,
-                verbose=verbose,
-                _spectra=_spectra, _originals=_originals,
-            )
-            report["results"]["test_3"] = r
-            (wins if r["win"] else misses).append(3)
-
-        elif test_id == 4:
-            print(_sep)
-            print(f"  TEST 4 — Fractional Slope Lookahead  (fractional operators analogy)")
-            print(_sep)
-            r = test_fractional_lookahead(
-                k_vectors, analysis_dim, args.sqfree,
-                n_sample=min(args.sample, 32),  # p3 curve needs fewer samples
-                verbose=verbose,
-                _spectra=_spectra,
-            )
-            report["results"]["test_4"] = r
-            (wins if r["win"] else misses).append(4)
-
-        print()
+    # ── Layer-type split runs ─────────────────────────────────────────────────
+    if do_split and global_idx:
+        for subset_label, idx_list in [("global", global_idx), ("local", local_idx)]:
+            if not idx_list:
+                continue
+            print()
+            print("=" * 62)
+            print(f"  {subset_label.upper()} LAYERS ({len(idx_list)} of {n_layers}): "
+                  f"indices {idx_list[:6]}{'...' if len(idx_list) > 6 else ''}")
+            print("=" * 62)
+            kv_sub = k_vectors[idx_list]
+            r_sub  = _run_suite(kv_sub, label=subset_label, **suite_kwargs)
+            report[f"results_{subset_label}"] = {
+                "layer_indices": idx_list,
+                "n_layers": len(idx_list),
+                **r_sub,
+            }
+            _print_suite_summary(r_sub, run_tests, label=subset_label)
 
     elapsed = time.time() - t_start
-
-    # ── Summary ──────────────────────────────────────────────────────────────
-    print("=" * 62)
-    print(f"  PHASE 12 DIAGNOSTIC SUMMARY  ({elapsed:.1f}s)")
-    print("=" * 62)
-
-    labels = {
-        1: "Boundary Sharpness",
-        2: "Ghost Basin Hunt",
-        3: "RoPE Pair Correlation",
-        4: "Fractional Lookahead",
-    }
-    for tid in sorted(run_tests):
-        key = f"test_{tid}"
-        if key in report["results"]:
-            r = report["results"][key]
-            # Extract a short verdict line
-            v = r.get("verdict", "—")[:70]
-            w = r.get("win", r.get("win_variance_ratio", False) or r.get("win_step_sharpness", False))
-            marker = "✓ WIN " if w else "  MISS"
-            print(f"  [{marker}] T{tid}: {labels.get(tid, '')}  —  {v}")
-
     print()
-    print(f"  Wins: {len(wins)}/{len(run_tests)}  "
-          f"(Tests {wins if wins else 'none'} show the analogy has empirical support)")
-    print()
+    print("=" * 62)
+    print(f"  DONE  ({elapsed:.1f}s)")
+    print("=" * 62)
 
     # ── Save JSON ─────────────────────────────────────────────────────────────
     if args.output:
         with open(args.output, "w") as f:
             json.dump(report, f, indent=2)
         print(f"  Report saved to {args.output}")
-
-    print("=" * 62)
 
 
 if __name__ == "__main__":
