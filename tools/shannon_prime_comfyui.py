@@ -77,6 +77,27 @@ from shannon_prime_torch import (
     vht2, MobiusMask, BandedQuantizer, correlation
 )
 
+# ── VHT2 dispatch: CUDA extension when available, PyTorch otherwise ────────
+def _make_vht2_dispatch():
+    try:
+        import sys, pathlib
+        _cuda_dir = pathlib.Path(__file__).resolve().parent.parent / "backends" / "cuda"
+        if str(_cuda_dir) not in sys.path:
+            sys.path.insert(0, str(_cuda_dir))
+        import shannon_prime_cuda_wan as _ext
+        print("[Shannon-Prime] VHT2 dispatch: CUDA kernel (shannon_prime_cuda_wan)")
+        def _dispatch(x: "torch.Tensor") -> "torch.Tensor":
+            return _ext.inplace(x.contiguous())  # modifies in-place, returns None... use forward instead
+        # Use forward (returns new tensor, cleaner)
+        def _dispatch(x: "torch.Tensor") -> "torch.Tensor":
+            return _ext.forward(x.contiguous())
+        return _dispatch
+    except ImportError:
+        print("[Shannon-Prime] VHT2 dispatch: PyTorch fallback (CUDA ext not compiled)")
+        return vht2
+
+_vht2 = _make_vht2_dispatch()
+
 
 class VHT2CrossAttentionCache:
     """
@@ -170,8 +191,8 @@ class VHT2CrossAttentionCache:
         v_flat = v.reshape(-1, self.head_dim).float().clone()
 
         # VHT2 forward
-        k_flat = vht2(k_flat)
-        v_flat = vht2(v_flat)
+        k_flat = _vht2(k_flat)
+        v_flat = _vht2(v_flat)
 
         # Möbius reorder both K and V (cross-attn K has no RoPE,
         # so K and V have similar spectral profiles — reorder both)
@@ -214,8 +235,8 @@ class VHT2CrossAttentionCache:
             v_flat = self.mobius.unreorder(v_flat)
 
         # Inverse VHT2 (self-inverse — same call as forward, no 1/N)
-        k_flat = vht2(k_flat)
-        v_flat = vht2(v_flat)
+        k_flat = _vht2(k_flat)
+        v_flat = _vht2(v_flat)
 
         # Reshape and cast back to original dtype
         k = k_flat.reshape(orig_shape).to(orig_dtype)
