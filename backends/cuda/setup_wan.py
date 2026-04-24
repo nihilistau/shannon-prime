@@ -98,5 +98,5 @@ setup(
     ext_modules=[ext],
     cmdclass={"build_ext": BuildExtension},
     python_requires=">=3.9",
-    install_requires=[f"torch>={torch.__version__}"],
+    install_requires=["torch>=2.0"],
 )
