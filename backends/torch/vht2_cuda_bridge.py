@@ -28,10 +28,29 @@ try:
     import shannon_prime_cuda_wan as _cuda_ext
     _CUDA_AVAILABLE = True
 except ImportError:
-    # Try to find the .so next to this file (built with --inplace into cuda/)
+    # Try to find the .pyd/.so next to this file (built with --inplace into cuda/)
     _here     = pathlib.Path(__file__).resolve().parent
     _cuda_dir = _here.parent / "cuda"
-    import sys
+
+    # On Windows, Python 3.8+ requires explicit DLL search directories.
+    # The extension depends on c10.dll, torch_cuda.dll, cudart64_12.dll etc.
+    if hasattr(os, "add_dll_directory"):
+        try:
+            import torch
+            _torch_lib = pathlib.Path(torch.__file__).resolve().parent / "lib"
+            if _torch_lib.exists():
+                os.add_dll_directory(str(_torch_lib))
+        except Exception:
+            pass
+        # Also add CUDA runtime bin if CUDA_HOME or standard install path exists
+        for _cuda_bin in [
+            pathlib.Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.1/bin"),
+            pathlib.Path("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin"),
+        ]:
+            if _cuda_bin.exists():
+                os.add_dll_directory(str(_cuda_bin))
+                break
+
     if str(_cuda_dir) not in sys.path:
         sys.path.insert(0, str(_cuda_dir))
     try:
