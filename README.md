@@ -21,6 +21,31 @@ The 5/5/4/3 bit allocation beats lossless fp16 by 0.04%. Aggressive config
 make test-all   # 187/188 tests across 8 suites (one synthetic-K flake, see CLAUDE.md)
 ```
 
+## Universal Across Modalities
+
+The VHT2 spectral decomposition is not specific to language. Every transformer
+architecture that uses rotary position embeddings creates the same spectral
+concentration in its key vectors — the mathematics is identical whether the
+model generates text tokens, video frames, audio waveforms, or image patches.
+
+| Modality | Models | Mechanism | Headline Result |
+|---|---|---|---|
+| **Language** | Llama 3, Qwen 3, Phi-3, Gemma 3 | KV cache compression (autoregressive) | 3.4–3.8× at <1.25% PPL cost |
+| **Video** | Wan 2.1/2.2 (5B, 14B, A14B MoE) | Block-skip + cross-attn cache | 4.6× step speed (32→7 s/step) |
+| **Image** | Flux v1/v2, Stable Diffusion | Block-skip + 2D lattice RoPE | Spectral-aware cache with Fisher weighting |
+| **Audio** | Stable Audio, Voxtral 4B, Qwen3-TTS | Block-skip (diffusion) + KV compress (autoregressive) | 4.6× KV memory on Voxtral |
+
+Two distinct compression strategies, unified by one transform:
+
+- **KV cache compression** (autoregressive models — LLMs, Voxtral TTS):
+  VHT2 → Möbius reorder → banded quantize → store compressed. Ship path.
+- **Block-skip caching** (diffusion models — Wan, Flux, Stable Audio):
+  Cache entire block outputs, use VHT2 spectral cosine similarity for drift
+  detection, re-apply adaLN gate on cache hits. Skip redundant block computation.
+
+See the per-modality deep-dives: [Video](docs/MODALITY-VIDEO.md) ·
+[Image](docs/MODALITY-IMAGE.md) · [Audio](docs/MODALITY-AUDIO.md).
+
 ## Sibling repositories
 
 The math core (this repo) is the canonical reference. Two sibling
@@ -32,7 +57,15 @@ the same VHT2 / Möbius / sqfree implementation.
 |---|---|---|
 | **[shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine)** | Standalone inference binary that owns the compressed KV layout end-to-end. Compression is on the write path by construction (no decompress→attention→recompress hook). The bug-free reference measurement surface. | Stage 5b: full forward + prefill + greedy chat with optimised single-token decode all working on Llama-3 / Qwen3, ship + sqfree + sqfree+spinor. See [docs/PRIME-ENGINE.md](docs/PRIME-ENGINE.md). |
 | **[shannon-prime-llama](https://github.com/nihilistau/shannon-prime-llama)** | Full engine integration into llama.cpp. The b8861 patch (LM Studio v2.14.0) compiles the entire SP stack (VHT2 ship + sqfree+spinor + hierarchical + System 1/2 + multi-GPU, 4 backends) into llama.dll/libllama.so as static libs. Includes an LM Studio runtime builder (`lmstudio/build.bat`). Validated: Qwen3.6-35B-A3B MoE at 26.92 tok/sec. Qwen 3.6 27B supported. | In production; see [docs/INTEGRATION-LLAMA.md](docs/INTEGRATION-LLAMA.md). |
-| **[shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)** | ComfyUI custom nodes for Wan 2.x video generation. Phase 15 FULL SEND: block-level self-attn + cross-attn + FFN caching with 4-tier system, TURBO mode, mixed fp16/fp8 precision. Achieves ~7 s/step on hardware that does 32 s/step stock (RTX 2060, lowvram). 8 nodes, proper ComfyUI Manager packaging. | Phase 15 shipped. See [shannon-prime-comfyui README](https://github.com/nihilistau/shannon-prime-comfyui). |
+| **[shannon-prime-comfyui](https://github.com/nihilistau/shannon-prime-comfyui)** | ComfyUI custom nodes for video, image, and audio generation. 16 nodes total: 8 Wan video (block-skip + cross-attn cache), 3 Flux image (dual/single-stream block-skip), 3 Audio DiT (Stable Audio block-skip), 2 Voxtral TTS (KV cache compression). 4-tier skip system, TURBO mode, Fisher-weighted spectral drift detection. | Shipped. See [shannon-prime-comfyui README](https://github.com/nihilistau/shannon-prime-comfyui). |
+
+### Voxtral TTS forks (Shannon-Prime VHT2 KV compression integrated)
+
+| Repo | Language | Integration |
+|---|---|---|
+| **[ComfyUI-FL-VoxtralTTS](https://github.com/nihilistau/ComfyUI-FL-VoxtralTTS)** | Python | ComfyUI node, monkey-patches MistralBackbone.forward() |
+| **[voxtral-mini-realtime-rs](https://github.com/nihilistau/voxtral-mini-realtime-rs)** | Rust | ShannonPrimeKVCache\<B\> wrapping KVCache\<B\>, 4 unit tests |
+| **[voxtral-tts.c](https://github.com/nihilistau/voxtral-tts.c)** | C | Header-only shannon_prime_kv.h, sp_voxtral_compress_position() API |
 
 The first published measurements that don't carry the hook-surface
 footnote will come from `shannon-prime-engine` when the optimised
@@ -88,18 +121,18 @@ ground-truth tokens. Zero measured cost in the shipping default
 (Mertens-only), bounds cache error for ctx ≥ 2k. Detailed design in
 [docs/CAUCHY-RESET.md](docs/CAUCHY-RESET.md).
 
-## Phase 12 Tools (Diagnostic Suite + ComfyUI/Wan)
-
-Phase 12 added a comprehensive diagnostic suite for empirical validation
-and the first ComfyUI self-attention caching layer for Wan DiT models.
+## Tools and Diagnostics
 
 ### Diagnostic suite (`tools/`)
 
 | Tool | Purpose |
 |------|---------|
-| `sp_diagnostics.py` | 4-test Phase 12 suite: Boundary Sharpness, Ghost Basin (DBSCAN), RoPE Pair Correlation, Fractional Slope Lookahead |
+| `sp_diagnostics.py` | 4-test suite: Boundary Sharpness, Ghost Basin (DBSCAN), RoPE Pair Correlation, Fractional Slope Lookahead |
 | `sp_regime_analysis.py` | Two-regime reconstruction analysis with optional GL(α=0.25) transition trigger (`--use-gl-trigger`) |
 | `extract_kv.py` | KV vector extraction from GGUF/HF models; stores `layer_types` for hybrid-attention models |
+| `sp_scaling_law.py` | K-corr → PPL design rule: `log(PPL/PPL_base) ≈ 4700·(1−K_corr)²/(params^1.1·bits^1.5)` |
+| `sp_benchmark.py` | Compression benchmark across bit allocations |
+| `sp_inject_freqs.py` | GGUF frequency injection for PrimePE sidecar |
 
 Key findings across 7 models (Dolphin-1B → Wan 2.2 TI2V-5B):
 - **T3 (RoPE Pair Correlation)**: r=0.73–0.87 for dense models; r=0.76 flat across all Wan DiT blocks
@@ -107,11 +140,21 @@ Key findings across 7 models (Dolphin-1B → Wan 2.2 TI2V-5B):
 - **3D RoPE axis split**: temporal dims (r=0.82) > spatial (r=0.73) at Wan mid-sigma
 - **Block stability sweep**: Wan L00-L03 cos_sim>0.95 for 10+ steps; L23 drops to 0.34
 
-### ComfyUI / Wan DiT (shannon-prime-comfyui)
+### ComfyUI integration (shannon-prime-comfyui)
 
-Validated at 1280×720, 9 frames, Wan 2.2 TI2V-5B Q8, RTX 2060 12GB:
-- BlockSkip + CacheFlush: **matches baseline total time**, 100% identical output
-- ComfyUI flags: `--normalvram --disable-async-offload`
+16 custom nodes across three generative modalities:
+
+| Modality | Nodes | Mechanism | Validated Hardware |
+|---|---|---|---|
+| Video (Wan 2.x) | 8 nodes | Block-skip + cross-attn cache + TURBO | RTX 2060 12GB, 1280×720 9fr |
+| Image (Flux v1/v2) | 3 nodes | Dual/single-stream block-skip | RTX 2060 12GB |
+| Audio (Stable Audio) | 3 nodes | 1D RoPE block-skip | RTX 2060 12GB |
+| TTS (Voxtral 4B) | 2 nodes | Autoregressive KV compression | RTX 2060 12GB |
+
+ComfyUI flags: `--normalvram --disable-async-offload`
+
+See modality deep-dives: [Video](docs/MODALITY-VIDEO.md) ·
+[Image](docs/MODALITY-IMAGE.md) · [Audio](docs/MODALITY-AUDIO.md)
 
 ## Project Structure
 
@@ -171,10 +214,14 @@ shannon-prime-repos/                  ← parent dir holding all three
 │   ├── patches/llama-cpp-b8733-full-engine.patch
 │   └── lmstudio/build.bat           Drop-in LM Studio DLL builder
 │
-└── shannon-prime-comfyui/            ← SIBLING: ComfyUI custom nodes for
-    │                                    Wan 2.1/2.2 cross-attention caching.
+└── shannon-prime-comfyui/            ← SIBLING: 16 ComfyUI nodes for
+    │                                    video, image, audio, and TTS.
     │                                    See docs/INTEGRATION-COMFYUI.md.
-    └── shannon_prime_comfyui*.py     ShannonPrimeWanCache + Sqfree variants
+    ├── nodes/
+    │   ├── shannon_prime_nodes.py     8 Wan video nodes (block-skip + cache)
+    │   ├── shannon_prime_flux_nodes.py  3 Flux image nodes
+    │   └── shannon_prime_audio_nodes.py 3 Audio DiT nodes
+    └── lib/shannon-prime/            git submodule → this repo
 ```
 
 ## Documentation
@@ -191,6 +238,11 @@ shannon-prime-repos/                  ← parent dir holding all three
 | [docs/BACKEND-VULKAN.md](docs/BACKEND-VULKAN.md) | Vulkan compute shaders, standalone vs shared device |
 | [docs/BACKEND-ADRENO.md](docs/BACKEND-ADRENO.md) | Snapdragon: NEON tiers, Hexagon HVX, big.LITTLE, fp16 |
 | [docs/BACKEND-TORCH.md](docs/BACKEND-TORCH.md) | PyTorch API, VHT2 reference, sqfree+spinor path |
+| [docs/MODALITY-VIDEO.md](docs/MODALITY-VIDEO.md) | Video generation: Wan 2.x block-skip, MoE expert switching, 3D RoPE |
+| [docs/MODALITY-IMAGE.md](docs/MODALITY-IMAGE.md) | Image generation: Flux v1/v2 dual-stream block-skip, 2D lattice RoPE |
+| [docs/MODALITY-AUDIO.md](docs/MODALITY-AUDIO.md) | Audio generation: Stable Audio block-skip, Voxtral TTS KV compression, multi-language implementations |
+| [docs/MODEL-PACK.md](docs/MODEL-PACK.md) | Per-architecture compression defaults registry |
+| [docs/MODEL-PACK-CALIBRATION.md](docs/MODEL-PACK-CALIBRATION.md) | Calibration ledger: phi3 PASS, qwen3 edge-fail, 7 PROVISIONAL |
 | [docs/TESTING.md](docs/TESTING.md) | How to run, what to look for, interpreting failures |
 
 ## Quick Start
@@ -259,16 +311,16 @@ Note: 3,3,3,3,3 on the Knight skeleton was retracted in v1.03
 (catastrophic post-fix — see the longer note below the aggressive-path
 results table); the effective Pareto point is 5,4,4,4,5.
 
-### ComfyUI (Wan 2.2 MoE)
-```python
-from shannon_prime_comfyui import WanVHT2Wrapper
+### ComfyUI (Video / Image / Audio / TTS)
 
-wrapper = WanVHT2Wrapper(head_dim=128, model_type='wan22_moe', task_type='t2v')
-for step, sigma in enumerate(sigmas):
-    wrapper.set_expert_from_sigma(sigma)
-    for block_idx in range(40):
-        k, v = wrapper.get_or_compute(f"block_{block_idx}", compute_fn)
-```
+All 16 nodes are installed via the `shannon-prime-comfyui` custom node package. In ComfyUI workflows:
+
+- **Video**: Model Loader → ShannonPrimeWanBlockSkip → ShannonPrimeWanTurbo → KSampler → ShannonPrimeWanCacheFlush
+- **Image**: Model Loader → ShannonPrimeFluxBlockSkip → KSampler → ShannonPrimeFluxCacheFlush
+- **Audio**: Model Loader → ShannonPrimeAudioBlockSkip → Generate → ShannonPrimeAudioCacheFlush
+- **TTS**: VoxtralModelLoader → ShannonPrimeVoxtralKVCache → VoxtralGenerate → ShannonPrimeVoxtralCacheFlush
+
+See the [shannon-prime-comfyui README](https://github.com/nihilistau/shannon-prime-comfyui) for full node documentation and workflow examples.
 
 ## Key Results
 
