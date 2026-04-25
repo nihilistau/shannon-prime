@@ -233,6 +233,21 @@ void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                         const sp_band_config_t *bc);
 
 // ============================================================================
+// FP8 / FP4 banded quantization (GPU-only, compile-time gated)
+// ============================================================================
+//
+// FP8 (E4M3FN): 8-bit float — higher dynamic range than int8 for smooth
+// distributions (V cache). Per-band scaling same as int path.
+// Requires: SP_FP8=1 compile flag.
+//
+// FP4 (MXFP4): 4-bit float with shared exponent — Blackwell tensor cores.
+// Requires: SP_FP4=1 compile flag + sm_120+ GPU + CUDA >= 12.8.
+//
+// GPU host API declarations are in backends/cuda/shannon_prime_fp8.cu.
+// CPU fp8 fallback (software emulation) not yet implemented — use int
+// quantization on CPU path.
+
+// ============================================================================
 // Vilenkin-Hartley Transform — multi-prime basis (research path)
 // ============================================================================
 //

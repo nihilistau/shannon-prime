@@ -71,6 +71,21 @@ typedef struct {
     bool recommend_sqfree;       // architecture benefits from sqfree over ship
     bool recommend_spinor;       // architecture benefits from SU(2) sheet
 
+    // Hierarchical Kronecker sub-projection defaults.
+    // Zero means "use global defaults" (skeleton_frac=0.09, residual_bits=2).
+    float hier_skeleton_frac;    // skeleton fraction (0.0 = default 0.09)
+    int   hier_residual_bits;    // hierarchical residual bits (0 = default 2)
+    bool  recommend_hierarchical; // architecture benefits from hier over ship
+
+    // Graph-size multiplier for ggml_new_graph_custom.
+    // Used by the engine to scale graph capacity for deep or MoE models.
+    // 0 means "use default (256)".
+    int   graph_size_mult;
+
+    // FP8 recommendation: architecture benefits from fp8 over int quantization
+    // (typically: smooth V-cache distributions where fp8's dynamic range wins)
+    bool  recommend_fp8;
+
     // Status
     sp_preset_status_t status;
 } sp_model_preset_t;

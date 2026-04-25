@@ -55,6 +55,11 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = true,
         .recommend_spinor  = true,
+        .hier_skeleton_frac    = 0.09f,
+        .hier_residual_bits    = 2,
+        .recommend_hierarchical = true,   // 35B-A3B: scaling law projects <0.1% PPL hier hit
+        .graph_size_mult       = 384,     // MoE routing overhead: 40 layers × MoE expansion
+        .recommend_fp8         = true,    // smooth V distributions benefit from fp8 range
         .status            = SP_PRESET_PROVISIONAL,
     },
 
@@ -126,7 +131,7 @@ static const sp_model_preset_t g_presets[] = {
     {
         .name              = "gemma3",
         .arch_pattern      = "gemma3",
-        .notes             = "Gemma 3: sliding-window attn stresses upper K band; keep K[0]=5",
+        .notes             = "Gemma 3: sliding-window attn stresses upper K band; keep K[0]=5. 12B=48 layers needs graph_size_mult.",
         .head_dim_hint     = 0,
         .min_n_layer       = 1,
         .min_n_head_kv     = 1,
@@ -138,6 +143,8 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = true,
         .recommend_spinor  = false,
+        .graph_size_mult       = 320,     // 48 layers on 12B variant; default 256 overflows
+        .recommend_hierarchical = true,   // 12B+: scaling law projects competitive with ship
         .status            = SP_PRESET_PROVISIONAL,
     },
 
