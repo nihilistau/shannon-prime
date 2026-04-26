@@ -141,23 +141,29 @@ def _twin_prime_pairs(n: int = 128) -> list[tuple[int, int]]:
 
 def _apply_twin_borrow(coeffs: torch.Tensor, mask: torch.Tensor,
                        pairs: list[tuple[int, int]],
-                       alpha: float = 0.10, threshold: float = 0.0) -> torch.Tensor:
+                       alpha: float = 0.10, threshold: float = 0.0,
+                       mode: str = "symmetric") -> torch.Tensor:
     """
     Decode-side twin-prime borrowing. Applied to spectral coefficients
     AFTER mask-application but BEFORE the inverse VHT2 transform.
 
     For each twin-prime pair (i, j) where both indices survive in the mask:
       diff = |c_i - c_j| / max(|c_i|, |c_j|, eps)
-      if diff > threshold:
-        avg = (c_i + c_j) / 2
-        c_i ← (1-α) c_i + α avg
-        c_j ← (1-α) c_j + α avg
+      if diff > threshold:  apply blend per `mode`
 
-    Properties:
-      - Symmetric (no asymmetric drift)
+    Modes:
+      symmetric   (default) — both indices pull toward (c_i+c_j)/2 with α.
+                              |Δc| ≤ α/2 * |c_i - c_j| each.
+      low_anchor  — lower-prime index is the anchor (unchanged); higher-prime
+                    pulled toward the lower with α. Reflects the heuristic
+                    that lower primes carry more spectral energy in RoPE'd K
+                    so they're the more reliable reference.
+      high_anchor — inverse: higher-prime is anchor. Useful as a control or
+                    for V vectors where the energy distribution may differ.
+
+    Properties (all modes):
       - Reduces to identity when c_i ≈ c_j (no spurious correction)
       - Decode-only — encoder doesn't need to know about it
-      - Bounded change: |Δc| ≤ α/2 * |c_i - c_j|
       - Reversibility of stored skeleton is unaffected (encode side untouched)
 
     coeffs: [..., n] tensor (post-mask, pre-inverse)
@@ -190,9 +196,18 @@ def _apply_twin_borrow(coeffs: torch.Tensor, mask: torch.Tensor,
     else:
         kick = torch.ones_like(c_i)
 
-    avg = 0.5 * (c_i + c_j)
-    new_i = c_i + alpha * kick * (avg - c_i)
-    new_j = c_j + alpha * kick * (avg - c_j)
+    if mode == "low_anchor":
+        # i (lower-prime) is the anchor → unchanged.
+        # j pulled toward i with full alpha.
+        new_i = c_i
+        new_j = c_j + alpha * kick * (c_i - c_j)
+    elif mode == "high_anchor":
+        new_i = c_i + alpha * kick * (c_j - c_i)
+        new_j = c_j
+    else:  # symmetric
+        avg = 0.5 * (c_i + c_j)
+        new_i = c_i + alpha * kick * (avg - c_i)
+        new_j = c_j + alpha * kick * (avg - c_j)
 
     # Scatter back
     coeffs = coeffs.clone()
@@ -361,14 +376,16 @@ class VHT2Bridge:
 
     def apply_twin_borrow(self, coeffs: torch.Tensor, mask: torch.Tensor,
                           alpha: float = 0.10,
-                          threshold: float = 0.0) -> torch.Tensor:
+                          threshold: float = 0.0,
+                          mode: str = "symmetric") -> torch.Tensor:
         """
         Public wrapper for the decode-side twin-prime borrowing pass.
         Apply between mask-application and the inverse VHT2 forward.
-        See _apply_twin_borrow for the math.
+        See _apply_twin_borrow for the math and mode options.
         """
         return _apply_twin_borrow(coeffs, mask, self._twin_pairs,
-                                  alpha=alpha, threshold=threshold)
+                                  alpha=alpha, threshold=threshold,
+                                  mode=mode)
 
     @property
     def mode(self) -> str:
