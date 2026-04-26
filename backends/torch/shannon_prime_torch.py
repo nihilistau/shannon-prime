@@ -234,7 +234,8 @@ class BandedQuantizer:
       - Flat beats banded for V vectors (no exceptions)
     """
 
-    def __init__(self, n: int, band_bits: List[int]):
+    def __init__(self, n: int, band_bits: List[int],
+                 ternary_bands: Optional[List[int]] = None):
         self.n = n
         self.n_bands = len(band_bits)
         self.band_bits = band_bits
@@ -243,6 +244,12 @@ class BandedQuantizer:
         # remainder (matches the C core's sp_band_span helper). For 10 bands
         # at pad_dim=154 this means bands 0..8 have size 15, band 9 has size 19.
         self._last_band_size = n - self.band_size * (self.n_bands - 1)
+        # Strange-attractor stack piece 4/4: bands listed here are quantized
+        # to ternary {-1, 0, +1} (≈1.58 bits/coefficient information content)
+        # regardless of band_bits[b]. The deadband threshold is fixed at
+        # scale*0.5, which is the L1-optimal quantizer for symmetric
+        # zero-mean signals. Empty list = identical to ship behavior.
+        self.ternary_bands = set(ternary_bands or [])
 
     def _band_span(self, b: int) -> Tuple[int, int]:
         start = b * self.band_size
@@ -265,15 +272,27 @@ class BandedQuantizer:
             start, size = self._band_span(b)
             end   = start + size
             band  = x[..., start:end]
-            bits  = self.band_bits[b]
-            max_val = (1 << (bits - 1)) - 1
 
-            # Scale per vector
-            amax = band.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
-            scale = amax / max_val
-
-            # Quantize
-            q = (band / scale).round().clamp(-max_val, max_val).to(torch.int8)
+            if b in self.ternary_bands:
+                # Ternary {-1, 0, +1}: scale = amax (no max_val division).
+                # Deadband at scale*0.5 — values in [-0.5,0.5]·amax round to 0.
+                # This is the L1-optimal three-level quantizer for symmetric
+                # zero-mean signals and matches the "1.58-bit" information
+                # content the strange-attractor stack predicts is enough
+                # for the noise tail.
+                amax  = band.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
+                scale = amax
+                normalized = band / scale  # in [-1, 1]
+                # Round to nearest of {-1, 0, +1}: > 0.5 → +1, < -0.5 → -1, else 0
+                q = torch.zeros_like(normalized, dtype=torch.int8)
+                q = torch.where(normalized >  0.5, torch.ones_like(q),  q)
+                q = torch.where(normalized < -0.5, -torch.ones_like(q), q)
+            else:
+                bits  = self.band_bits[b]
+                max_val = (1 << (bits - 1)) - 1
+                amax = band.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
+                scale = amax / max_val
+                q = (band / scale).round().clamp(-max_val, max_val).to(torch.int8)
 
             scales.append(scale.squeeze(-1).half())
             quant_vals.append(q)
@@ -302,11 +321,19 @@ class BandedQuantizer:
 
     def compressed_bytes_per_vec(self) -> int:
         """Bytes per compressed vector."""
+        import math as _math
         total = 0
         for b, bits in enumerate(self.band_bits):
             _, size = self._band_span(b)
             total += 2  # fp16 scale
-            total += (size * bits + 7) // 8  # packed data
+            if b in self.ternary_bands:
+                # Ternary 5-per-byte packing target: ceil(size * log2(3) / 8).
+                # Current quantize() returns int8 because pack/unpack lives in
+                # the C/CUDA layers; this is the post-pack byte count for the
+                # compression-ratio honesty check.
+                total += int(_math.ceil(size * _math.log2(3) / 8))
+            else:
+                total += (size * bits + 7) // 8  # packed data
         return total
 
 
@@ -341,6 +368,8 @@ class ShadowCache:
         max_seq_len: int = 4096,
         k_band_bits: List[int] = [5, 5, 4, 3],
         v_band_bits: List[int] = [3],
+        k_ternary_bands: Optional[List[int]] = None,
+        v_ternary_bands: Optional[List[int]] = None,
         use_mobius: bool = True,
         # ---- Progressive-enhancement flags (default off = classic ship path) --
         use_sqfree_pad: bool = False,
@@ -405,9 +434,18 @@ class ShadowCache:
             return
 
         # ---- Classic VHT2 ship path (behavior identical to v1.0) ---------
+        # Strange-attractor stack piece 4/4: optional ternary noise-tail.
+        # When k_ternary_bands=[3] and k_band_bits=[5,5,4,3], band 3 is
+        # quantized to {-1, 0, +1} instead of 3-bit signed. The 5/5/4/1.58
+        # configuration tests whether the noise-tail can be reduced to
+        # ternary without quality loss (per the multiplicative-lattice
+        # scaling-law equation, head_dim=128 + bf16-class models should
+        # tolerate this).
         self._impl = None
-        self.k_quantizer = BandedQuantizer(head_dim, k_band_bits)
-        self.v_quantizer = BandedQuantizer(head_dim, v_band_bits)
+        self.k_quantizer = BandedQuantizer(head_dim, k_band_bits,
+                                           ternary_bands=k_ternary_bands)
+        self.v_quantizer = BandedQuantizer(head_dim, v_band_bits,
+                                           ternary_bands=v_ternary_bands)
         self.mobius = MobiusMask(head_dim) if use_mobius else None
 
         # Storage: lists of (scales, quant_vals) per position
