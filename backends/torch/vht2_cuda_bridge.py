@@ -82,6 +82,125 @@ def _sqfree_mask_128() -> torch.Tensor:
     return mask
 
 
+def _twin_prime_pairs(n: int = 128) -> list[tuple[int, int]]:
+    """
+    Return spectral-index pairs (i, j) where i+1 and j+1 are primes with j-i==2.
+
+    The +1 is because the Hartley basis is 0-indexed but the squarefree /
+    prime structure is naturally 1-indexed (position k corresponds to the
+    arithmetic value k+1).
+
+    At n=128, the twin-prime pairs in the spectrum are:
+      (3,5)→(2,4), (5,7)→(4,6), (11,13)→(10,12), (17,19)→(16,18),
+      (29,31)→(28,30), (41,43)→(40,42), (59,61)→(58,60), (71,73)→(70,72),
+      (101,103)→(100,102), (107,109)→(106,108).
+
+    The pairs (3,5) and (5,7) share index 4. Sequential application is
+    safe at small alpha; the second pass sees the first pass's tiny pull.
+
+    Strange-attractor reading: each twin pair is a +2 arithmetic neighbor
+    on the prime lattice. Quantization noise that lands on the wrong side
+    of a bin boundary disagrees with its neighbor; the borrowing pulls
+    the outlier back toward the local consensus before the inverse VHT2.
+    """
+    def is_prime(k: int) -> bool:
+        if k < 2:
+            return False
+        if k < 4:
+            return True
+        if k % 2 == 0:
+            return False
+        d = 3
+        while d * d <= k:
+            if k % d == 0:
+                return False
+            d += 2
+        return True
+
+    raw_pairs = []
+    # We're looking for primes p, p+2 with p+2 <= n (so index j = p+1 < n)
+    for p in range(2, n - 1):
+        if is_prime(p) and is_prime(p + 2):
+            raw_pairs.append((p - 1, p + 1))
+
+    # Deduplicate overlapping pairs (e.g. (3,5) and (5,7) share index 4).
+    # Vectorized scatter applies pairs simultaneously, so overlap would make
+    # the result depend on internal index_copy_ ordering. Greedy keep: take
+    # each pair only if neither index has been touched yet. At n=128 this
+    # drops one pair (the (5,7) overlap with (3,5)) leaving 9 disjoint pairs.
+    seen = set()
+    pairs = []
+    for i, j in raw_pairs:
+        if i in seen or j in seen:
+            continue
+        pairs.append((i, j))
+        seen.add(i)
+        seen.add(j)
+    return pairs
+
+
+def _apply_twin_borrow(coeffs: torch.Tensor, mask: torch.Tensor,
+                       pairs: list[tuple[int, int]],
+                       alpha: float = 0.10, threshold: float = 0.0) -> torch.Tensor:
+    """
+    Decode-side twin-prime borrowing. Applied to spectral coefficients
+    AFTER mask-application but BEFORE the inverse VHT2 transform.
+
+    For each twin-prime pair (i, j) where both indices survive in the mask:
+      diff = |c_i - c_j| / max(|c_i|, |c_j|, eps)
+      if diff > threshold:
+        avg = (c_i + c_j) / 2
+        c_i ← (1-α) c_i + α avg
+        c_j ← (1-α) c_j + α avg
+
+    Properties:
+      - Symmetric (no asymmetric drift)
+      - Reduces to identity when c_i ≈ c_j (no spurious correction)
+      - Decode-only — encoder doesn't need to know about it
+      - Bounded change: |Δc| ≤ α/2 * |c_i - c_j|
+      - Reversibility of stored skeleton is unaffected (encode side untouched)
+
+    coeffs: [..., n] tensor (post-mask, pre-inverse)
+    mask:   [n] bool — only pairs where BOTH indices are masked-true are touched
+    """
+    if alpha <= 0.0 or not pairs:
+        return coeffs
+
+    # Pre-filter pairs: both indices must be in the surviving skeleton
+    mask_cpu = mask.detach().cpu()
+    active_pairs = [(i, j) for (i, j) in pairs
+                    if bool(mask_cpu[i].item()) and bool(mask_cpu[j].item())]
+    if not active_pairs:
+        return coeffs
+
+    # Vectorized: gather all i-indices and j-indices, do one weighted blend
+    idx_i = torch.tensor([p[0] for p in active_pairs],
+                         dtype=torch.long, device=coeffs.device)
+    idx_j = torch.tensor([p[1] for p in active_pairs],
+                         dtype=torch.long, device=coeffs.device)
+
+    c_i = coeffs.index_select(-1, idx_i)
+    c_j = coeffs.index_select(-1, idx_j)
+
+    if threshold > 0.0:
+        # Only borrow when relative disagreement exceeds threshold
+        denom = torch.clamp(torch.maximum(c_i.abs(), c_j.abs()), min=1e-6)
+        rel_diff = (c_i - c_j).abs() / denom
+        kick = (rel_diff > threshold).to(coeffs.dtype)
+    else:
+        kick = torch.ones_like(c_i)
+
+    avg = 0.5 * (c_i + c_j)
+    new_i = c_i + alpha * kick * (avg - c_i)
+    new_j = c_j + alpha * kick * (avg - c_j)
+
+    # Scatter back
+    coeffs = coeffs.clone()
+    coeffs.index_copy_(-1, idx_i, new_i)
+    coeffs.index_copy_(-1, idx_j, new_j)
+    return coeffs
+
+
 def _hartley_butterfly_torch(x: torch.Tensor) -> torch.Tensor:
     """
     Pure-PyTorch Hadamard/Hartley butterfly for head_dim=128 (= 2^7).
@@ -135,6 +254,8 @@ class VHT2Bridge:
         self._skel_mask    = None   # cached skeleton mask [128] at fraction
         self._cuda         = _CUDA_AVAILABLE
         self._mode         = "cuda" if _CUDA_AVAILABLE else "torch"
+        # Twin-prime pairs at head_dim=128 (computed once, cached)
+        self._twin_pairs   = _twin_prime_pairs(128)
 
         print(f"[SP VHT2Bridge] mode={self._mode}  "
               f"skeleton_frac={skeleton_frac:.0%}  "
@@ -185,14 +306,40 @@ class VHT2Bridge:
         coeffs = _hartley_butterfly_torch(x)
         return coeffs * mask.float().reshape(*([1] * (x.ndim - 1)), 128)
 
-    def decompress(self, coeffs: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def decompress(self, coeffs: torch.Tensor, mask: torch.Tensor,
+                   twin_borrow: bool = False,
+                   twin_alpha: float = 0.10,
+                   twin_threshold: float = 0.0) -> torch.Tensor:
         """
-        Decompress: re-apply mask → VHT2 inverse (= forward).
+        Decompress: re-apply mask → [twin-prime borrow] → VHT2 inverse.
+
         coeffs: [..., 128] sparse coefficient tensor
         mask:   [128]      bool CUDA tensor
+        twin_borrow: when True, applies decode-side twin-prime smoothing on
+                     the masked spectral coefficients before the inverse
+                     transform (strange-attractor stack piece 3/4). Decode-only,
+                     so the stored skeleton bytes are unchanged. Worst case is
+                     identity (alpha=0 or no agreement issues).
+        twin_alpha:  blend strength toward the pair average. Small values
+                     (0.05-0.15) for safety; larger values pull harder.
+        twin_threshold: only borrow when relative |c_i-c_j|/max exceeds this.
+                        0.0 = always borrow; 0.1 = only on outliers.
+
         Returns: [..., 128] reconstructed vectors
         """
         coeffs = coeffs.contiguous()
+        if twin_borrow:
+            # Mask + twin-borrow + inverse, in PyTorch (CUDA path doesn't
+            # know about twin pairs yet — bridge fallback handles this safely)
+            masked = coeffs * mask.float().reshape(*([1] * (coeffs.ndim - 1)), 128)
+            corrected = _apply_twin_borrow(masked, mask, self._twin_pairs,
+                                           alpha=twin_alpha,
+                                           threshold=twin_threshold)
+            if self._cuda:
+                # Use the CUDA forward (= inverse, self-inverse) on the corrected coeffs
+                return _cuda_ext.forward(corrected.contiguous())
+            return _hartley_butterfly_torch(corrected)
+
         if self._cuda:
             return _cuda_ext.decompress(coeffs, mask)
         # Torch fallback
@@ -211,6 +358,17 @@ class VHT2Bridge:
         coeffs = _hartley_butterfly_torch(x)
         masked = coeffs * mask.float().reshape(*([1] * (x.ndim - 1)), 128)
         return _hartley_butterfly_torch(masked)
+
+    def apply_twin_borrow(self, coeffs: torch.Tensor, mask: torch.Tensor,
+                          alpha: float = 0.10,
+                          threshold: float = 0.0) -> torch.Tensor:
+        """
+        Public wrapper for the decode-side twin-prime borrowing pass.
+        Apply between mask-application and the inverse VHT2 forward.
+        See _apply_twin_borrow for the math.
+        """
+        return _apply_twin_borrow(coeffs, mask, self._twin_pairs,
+                                  alpha=alpha, threshold=threshold)
 
     @property
     def mode(self) -> str:
