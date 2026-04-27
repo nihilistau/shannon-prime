@@ -117,32 +117,106 @@ def _twin_prime_pairs(n: int = 128) -> list[tuple[int, int]]:
             d += 2
         return True
 
-    raw_pairs = []
-    # We're looking for primes p, p+2 with p+2 <= n (so index j = p+1 < n)
-    for p in range(2, n - 1):
-        if is_prime(p) and is_prime(p + 2):
-            raw_pairs.append((p - 1, p + 1))
+    return _prime_pairs_with_gap(n, gap=2, _is_prime=is_prime)
 
-    # Deduplicate overlapping pairs (e.g. (3,5) and (5,7) share index 4).
-    # Vectorized scatter applies pairs simultaneously, so overlap would make
-    # the result depend on internal index_copy_ ordering. Greedy keep: take
-    # each pair only if neither index has been touched yet. At n=128 this
-    # drops one pair (the (5,7) overlap with (3,5)) leaving 9 disjoint pairs.
+
+def _prime_pairs_with_gap(n: int, gap: int, _is_prime=None) -> list[tuple[int, int]]:
+    """
+    Return spectral-index pairs (i, j) where i+1 and j+1 are primes with
+    j-i == gap. Greedy-deduplicated so all returned pairs are disjoint.
+
+    gap=2  : twin primes      (3-5, 11-13, 17-19, ...)
+    gap=4  : cousin primes    (3-7, 7-11, 13-17, 19-23, ...)
+    gap=6  : sexy primes      (5-11, 7-13, 11-17, 13-19, ...)
+    gap=2k : larger Goldbach-style pairs
+
+    The Goldbach-extended view: any even gap counts. Larger gaps
+    correspond to weaker arithmetical neighborhoods, so callers should
+    typically scale the borrow alpha down for larger-gap pairs.
+    """
+    if _is_prime is None:
+        def is_prime(k: int) -> bool:
+            if k < 2:    return False
+            if k < 4:    return True
+            if k % 2 == 0: return False
+            d = 3
+            while d * d <= k:
+                if k % d == 0: return False
+                d += 2
+            return True
+        _is_prime = is_prime
+
+    raw_pairs = []
+    for p in range(2, n - gap + 1):
+        if _is_prime(p) and _is_prime(p + gap):
+            raw_pairs.append((p - 1, p + gap - 1))
+
     seen = set()
     pairs = []
     for i, j in raw_pairs:
         if i in seen or j in seen:
             continue
         pairs.append((i, j))
-        seen.add(i)
-        seen.add(j)
+        seen.add(i); seen.add(j)
     return pairs
+
+
+def _goldbach_pairs(n: int = 128, gaps: tuple[int, ...] = (2, 4, 6)) -> dict[int, list[tuple[int, int]]]:
+    """
+    Return a dict mapping each gap to its disjoint prime-pair list.
+    Pairs are deduplicated WITHIN each gap; pairs ACROSS gaps may overlap
+    in spectral index, which is fine because each gap is processed in a
+    separate vectorized pass with its own (decreasing) alpha.
+    """
+    return {gap: _prime_pairs_with_gap(n, gap=gap) for gap in gaps}
+
+
+# v2 quick win: distance-to-Zeta-Zero decay scaling.
+#
+# First ~30 imaginary parts of nontrivial Riemann zeta zeros. The paper's
+# claim is that these are the Poincaré sections of the cache trajectory
+# in the prime-harmonic basis; spectral coefficients near these positions
+# are "anchored" and tolerate stronger correction. Coefficients between
+# zeros have weaker anchoring and should receive less aggressive borrow.
+#
+# Reconstruction: R(θ) = exp(-λ · |θ − ρ_n|) per the paper's "Zero-
+# Computation Resonance" claim. We discretize θ = spectral index k and
+# ρ_n = round(im_part) so the distance is integer-arithmetic friendly.
+RIEMANN_ZEROS_IMAG = (
+    14.13472, 21.02204, 25.01086, 30.42488, 32.93506,
+    37.58618, 40.91872, 43.32707, 48.00515, 49.77383,
+    52.97032, 56.44625, 59.34704, 60.83178, 65.11254,
+    67.07981, 69.54640, 72.06716, 75.70469, 77.14484,
+    79.33738, 82.91038, 84.73549, 87.42527, 88.80911,
+    92.49190, 94.65134, 95.87063, 98.83119, 101.31785,
+)
+
+
+def _zeta_resonance_weights(n: int = 128, lambda_: float = 0.05) -> list[float]:
+    """
+    Per-coefficient resonance weight `exp(-λ · dist_to_nearest_zero[k])`.
+
+    n=128: 19 zeros fall in range; remaining indices' distance is to the
+    nearest of those 19. Weight is in (0, 1]; 1 at zeros, decays smoothly
+    away. λ=0.05 means a weight of 0.61 at distance 10 (mid-decay), 0.37
+    at distance 20.
+    """
+    import math
+    rounded_zeros = sorted({int(round(z)) for z in RIEMANN_ZEROS_IMAG if 0 <= round(z) < n})
+    if not rounded_zeros:
+        return [1.0] * n
+    weights = []
+    for k in range(n):
+        dist = min(abs(k - z) for z in rounded_zeros)
+        weights.append(math.exp(-lambda_ * dist))
+    return weights
 
 
 def _apply_twin_borrow(coeffs: torch.Tensor, mask: torch.Tensor,
                        pairs: list[tuple[int, int]],
                        alpha: float = 0.10, threshold: float = 0.0,
-                       mode: str = "symmetric") -> torch.Tensor:
+                       mode: str = "symmetric",
+                       zeta_weights: list[float] | None = None) -> torch.Tensor:
     """
     Decode-side twin-prime borrowing. Applied to spectral coefficients
     AFTER mask-application but BEFORE the inverse VHT2 transform.
@@ -196,18 +270,31 @@ def _apply_twin_borrow(coeffs: torch.Tensor, mask: torch.Tensor,
     else:
         kick = torch.ones_like(c_i)
 
+    # v2 quick win: optional per-pair α scaling from zeta-resonance weights.
+    # Each pair gets a scalar in (0, 1] derived from the geometric mean of
+    # the per-coefficient resonance weights at i and j. Pairs near zeta
+    # zeros get full α; pairs far from zeros get reduced α. Pure metaphor-
+    # to-code: the zeros are the Poincaré sections, the pairs ARE the
+    # "anchored" connectivity graph, the weights tell us which anchors are
+    # near a section.
+    pair_scale = 1.0
+    if zeta_weights is not None:
+        ws = [0.5 * (zeta_weights[i] + zeta_weights[j]) for (i, j) in active_pairs]
+        pair_scale = torch.tensor(ws, dtype=coeffs.dtype, device=coeffs.device)
+        # Reshape so it broadcasts against c_i/c_j whose last dim is len(active_pairs)
+        # c_i shape: [..., len_pairs]. pair_scale shape: [len_pairs]. broadcasts.
+    eff_alpha = alpha * pair_scale  # scalar or [len_pairs]
+
     if mode == "low_anchor":
-        # i (lower-prime) is the anchor → unchanged.
-        # j pulled toward i with full alpha.
         new_i = c_i
-        new_j = c_j + alpha * kick * (c_i - c_j)
+        new_j = c_j + eff_alpha * kick * (c_i - c_j)
     elif mode == "high_anchor":
-        new_i = c_i + alpha * kick * (c_j - c_i)
+        new_i = c_i + eff_alpha * kick * (c_j - c_i)
         new_j = c_j
     else:  # symmetric
         avg = 0.5 * (c_i + c_j)
-        new_i = c_i + alpha * kick * (avg - c_i)
-        new_j = c_j + alpha * kick * (avg - c_j)
+        new_i = c_i + eff_alpha * kick * (avg - c_i)
+        new_j = c_j + eff_alpha * kick * (avg - c_j)
 
     # Scatter back
     coeffs = coeffs.clone()
@@ -271,6 +358,19 @@ class VHT2Bridge:
         self._mode         = "cuda" if _CUDA_AVAILABLE else "torch"
         # Twin-prime pairs at head_dim=128 (computed once, cached)
         self._twin_pairs   = _twin_prime_pairs(128)
+        # v2 quick win: Goldbach-extended pair sets (gap-4 cousins, gap-6 sexy)
+        self._goldbach_pairs = _goldbach_pairs(128, gaps=(2, 4, 6))
+        # v2 quick win: zeta-resonance weight cache, keyed by lambda
+        self._zeta_weight_cache: dict[float, list[float]] = {}
+
+    def get_zeta_weights(self, lambda_: float = 0.05, n: int = 128) -> list[float]:
+        """Cached per-coefficient resonance weights from zeta-zero distance."""
+        key = round(lambda_, 4)
+        w = self._zeta_weight_cache.get(key)
+        if w is None:
+            w = _zeta_resonance_weights(n=n, lambda_=lambda_)
+            self._zeta_weight_cache[key] = w
+        return w
 
         print(f"[SP VHT2Bridge] mode={self._mode}  "
               f"skeleton_frac={skeleton_frac:.0%}  "
@@ -377,15 +477,51 @@ class VHT2Bridge:
     def apply_twin_borrow(self, coeffs: torch.Tensor, mask: torch.Tensor,
                           alpha: float = 0.10,
                           threshold: float = 0.0,
-                          mode: str = "symmetric") -> torch.Tensor:
+                          mode: str = "symmetric",
+                          zeta_lambda: float = 0.0) -> torch.Tensor:
         """
         Public wrapper for the decode-side twin-prime borrowing pass.
         Apply between mask-application and the inverse VHT2 forward.
-        See _apply_twin_borrow for the math and mode options.
+
+        zeta_lambda > 0 enables per-pair α scaling by zeta-zero proximity
+        (the "Zero-Computation Resonance" decay). λ=0.05 is a slow decay;
+        larger values concentrate the borrow more tightly around zeros.
         """
+        zw = self.get_zeta_weights(zeta_lambda) if zeta_lambda > 0 else None
         return _apply_twin_borrow(coeffs, mask, self._twin_pairs,
                                   alpha=alpha, threshold=threshold,
-                                  mode=mode)
+                                  mode=mode, zeta_weights=zw)
+
+    def apply_goldbach_borrow(self, coeffs: torch.Tensor, mask: torch.Tensor,
+                              alpha: float = 0.10,
+                              threshold: float = 0.0,
+                              mode: str = "symmetric",
+                              gaps: tuple[int, ...] = (2, 4, 6),
+                              zeta_lambda: float = 0.0) -> torch.Tensor:
+        """
+        v2 quick win: Goldbach-extended borrowing.
+
+        Applies _apply_twin_borrow once per gap with α scaled inversely
+        by the gap (gap-2 = α, gap-4 = α/2, gap-6 = α/3) reflecting the
+        weaker arithmetical neighborhood at larger gaps.
+
+        zeta_lambda > 0 also applies the zeta-resonance per-pair scaling
+        within each gap, so pairs near zeros get full strength and pairs
+        between zeros get reduced strength.
+        """
+        zw = self.get_zeta_weights(zeta_lambda) if zeta_lambda > 0 else None
+        out = coeffs
+        for gap in gaps:
+            pairs = self._goldbach_pairs.get(gap, [])
+            if not pairs:
+                continue
+            scaled_alpha = alpha * (2.0 / gap)  # gap-2 → α, gap-4 → α/2, gap-6 → α/3
+            out = _apply_twin_borrow(out, mask, pairs,
+                                     alpha=scaled_alpha,
+                                     threshold=threshold,
+                                     mode=mode,
+                                     zeta_weights=zw)
+        return out
 
     @property
     def mode(self) -> str:
