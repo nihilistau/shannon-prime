@@ -359,7 +359,9 @@ class VHT2Bridge:
         # Twin-prime pairs at head_dim=128 (computed once, cached)
         self._twin_pairs   = _twin_prime_pairs(128)
         # v2 quick win: Goldbach-extended pair sets (gap-4 cousins, gap-6 sexy)
-        self._goldbach_pairs = _goldbach_pairs(128, gaps=(2, 4, 6))
+        # v5 extension: gap-8, gap-10, gap-12 also computed and cached so the
+        # caller can opt in to wider arithmetical neighborhoods.
+        self._goldbach_pairs = _goldbach_pairs(128, gaps=(2, 4, 6, 8, 10, 12))
         # v2 quick win: zeta-resonance weight cache, keyed by lambda
         self._zeta_weight_cache: dict[float, list[float]] = {}
 
