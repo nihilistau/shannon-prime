@@ -236,7 +236,7 @@ class WanSqfreeVHT2Wrapper:
 
 
 def _input_fingerprint(x: torch.Tensor):
-    """Content hash for cache-invalidation — identical semantics to the WHT
+    """Content hash for cache-invalidation — identical semantics to the ship
     wrapper's `_input_fingerprint` in `shannon_prime_comfyui.py`. Three flat
     anchors + shape + dtype distinguish "same context across timesteps" from
     "fresh context for a new generation" without scanning the full tensor."""
@@ -300,7 +300,7 @@ class VHT2SqfreeCrossAttentionCache:
         self._hits = 0
         self._misses = 0
 
-    # ----- WHT-compatible API surface --------------------------------------
+    # ----- put/get API (matches the ship-path VHT2CrossAttentionCache) ----
 
     def _cache_key(self, block_id: str) -> str:
         return f"{self._expert}:{block_id}"
@@ -345,10 +345,6 @@ class VHT2SqfreeCrossAttentionCache:
             self._compressor._reconstruct_vec(c, self._compressor.v_quantizer)
             for c in v_rows
         ], dim=0)
-
-        # NaN / overflow guard (same as WHT ship path)
-        k_recon = torch.nan_to_num(torch.clamp(k_recon, -65504.0, 65504.0), nan=0.0)
-        v_recon = torch.nan_to_num(torch.clamp(v_recon, -65504.0, 65504.0), nan=0.0)
 
         k = k_recon.reshape(orig_shape).to(dtype=orig_dtype, device=orig_device)
         v = v_recon.reshape(orig_shape).to(dtype=orig_dtype, device=orig_device)

@@ -1,0 +1,18 @@
+{
+  "model": "Qwen3-8B-Q8_0",
+  "backend": "cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build)",
+  "config": "sqfree+spinor 10×auto (tools/sp_auto_bands.py → 4,4,4,4,4,3,3,3,3,3 @ total=35)",
+  "env": {"SHANNON_PRIME_ENABLED": "1", "SHANNON_PRIME_MOBIUS": "1", "SHANNON_PRIME_SQFREE": "1", "SHANNON_PRIME_SPINOR": "1", "SHANNON_PRIME_RESIDUAL_BITS": "3", "SHANNON_PRIME_K_BITS": "4,4,4,4,4,3,3,3,3,3"},
+  "head_dim": 128,
+  "pad_dim": 154,
+  "n_bands": 10,
+  "total_k_bits": 35,
+  "ctx": 2048,
+  "chunks": 4,
+  "repeats": 1,
+  "median_ppl": 10.0768,
+  "raw_ppls": [10.0768],
+  "auto_bands_method": "per-band VHT2 variance → log-weight allocation clipped to [3,5], rebalanced to sum=35",
+  "note": "sp_auto_bands.py computed factors from a 2048-vector K-dump (SHANNON_PRIME_DUMP_K) on hd=128. Post-fix Qwen3 K dump had near-flat band energies so a pure min/max proportional split degenerates to 3,3,3,3,3,3,3,3,3,3 at total=30; bumping total to 35 produced this front-loaded 4,4,4,4,4,3,3,3,3,3 allocation.",
+  "date": "2026-04-18T08:05:00Z"
+}

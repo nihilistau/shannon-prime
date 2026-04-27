@@ -12,8 +12,8 @@
 // cas(x) = cos(x) + sin(x), normalized by 1/√p per factor.
 // Self-inverse: applying twice = identity.
 //
-// Unlike wht.comp which uses log2(n) butterfly passes (power-of-2 only),
-// this shader handles arbitrary products of small primes {2,3,5,7,11,13}.
+// Uses log2(n) butterfly passes at p=2; generalises to arbitrary products
+// of small primes {2,3,5,7,11,13}.
 //
 // For hd=128 → pad_dim=154 = 2·7·11: three stages (p=2, p=7, p=11).
 // For hd=64  → pad_dim=66  = 2·3·11: three stages (p=2, p=3, p=11).
@@ -26,12 +26,14 @@ layout(set = 0, binding = 0) buffer Data {
     float data[];
 };
 
-// Prime factors passed as push constants (up to 6 factors)
+// Prime factors passed as push constants — up to 8 factors to cover all
+// supported head dims. hd=256 = 2^8 needs 8 factors; hd=128 = 2^7 needs 7.
+// Sqfree-padded dims (hd=66, 154, 330) never exceed 4 factors.
 layout(push_constant) uniform PushConstants {
     uint n;             // Total dimension (pad_dim, product of factors)
     uint n_vecs;        // Number of vectors in the batch
     uint n_factors;     // How many prime factors
-    uint factors[6];    // The prime factors (e.g. {2, 7, 11} for N=154)
+    uint factors[8];    // The prime factors (e.g. {2, 7, 11} for N=154)
 };
 
 shared float smem[330];   // Max pad_dim = 330 (hd=256)

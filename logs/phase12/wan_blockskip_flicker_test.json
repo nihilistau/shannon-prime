@@ -1,0 +1,134 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "Wan2.2-TI2V-5B-Q8_0.gguf"
+    },
+    "class_type": "UnetLoaderGGUF"
+  },
+  "11": {
+    "inputs": {
+      "use_mobius": true,
+      "v_bits": "5,4,4,3",
+      "k_bits": "5,4,4,3",
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "ShannonPrimeWanCache"
+  },
+  "12": {
+    "inputs": {
+      "model": [
+        "11",
+        0
+      ],
+      "drift_threshold": 0.85,
+      "tier_0_window": 10,
+      "verbose": true,
+      "x_drift_threshold": 0.15,
+      "tier_1_window": 3
+    },
+    "class_type": "ShannonPrimeWanBlockSkip"
+  },
+  "2": {
+    "inputs": {
+      "type": "wan",
+      "clip_name": "umt5-xxl-encoder-Q8_0.gguf"
+    },
+    "class_type": "CLIPLoaderGGUF"
+  },
+  "3": {
+    "inputs": {
+      "vae_name": "wan2.2_vae.safetensors"
+    },
+    "class_type": "VAELoader"
+  },
+  "4": {
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "text": "a red fox walking slowly through a snowy forest clearing in winter morning light, cinematic"
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "5": {
+    "inputs": {
+      "clip": [
+        "2",
+        0
+      ],
+      "text": "blurry, low quality, static"
+    },
+    "class_type": "CLIPTextEncode"
+  },
+  "6": {
+    "inputs": {
+      "length": 25,
+      "width": 480,
+      "batch_size": 1,
+      "height": 320,
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "Wan22ImageToVideoLatent"
+  },
+  "8": {
+    "inputs": {
+      "positive": [
+        "4",
+        0
+      ],
+      "model": [
+        "12",
+        0
+      ],
+      "seed": 42,
+      "cfg": 5.0,
+      "latent_image": [
+        "6",
+        0
+      ],
+      "denoise": 1.0,
+      "negative": [
+        "5",
+        0
+      ],
+      "steps": 50,
+      "sampler_name": "euler",
+      "scheduler": "simple"
+    },
+    "class_type": "KSampler"
+  },
+  "9": {
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "VAEDecode"
+  },
+  "10": {
+    "inputs": {
+      "filename_prefix": "sp_blockskip_flicker_test",
+      "images": [
+        "9",
+        0
+      ],
+      "quality": 80,
+      "lossless": false,
+      "fps": 16.0,
+      "method": "default"
+    },
+    "class_type": "SaveAnimatedWEBP"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "model": "Dolphin3.0-Llama3.2-1B-Q8_0",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "config": "sqfree+spinor",
+  "env": {"SHANNON_PRIME_ENABLED": "1", "SHANNON_PRIME_MOBIUS": "1", "SHANNON_PRIME_SQFREE": "1", "SHANNON_PRIME_SPINOR": "1", "SHANNON_PRIME_RESIDUAL_BITS": "3", "SHANNON_PRIME_K_BITS": "3,3,3,3,3", "SHANNON_PRIME_V_BITS": "3"},
+  "head_dim": 64,
+  "pad_dim": 66,
+  "ctx": 2048,
+  "chunks": 8,
+  "repeats": 1,
+  "median_ppl": 13.3277,
+  "raw_ppls": [13.3277],
+  "baseline_ppl": 10.7164,
+  "delta_pct": 24.37,
+  "sec_per_pass": 24.94,
+  "note": "Dolphin 1B is below the sqfree+spinor viability floor; scaling-law predicts the 1-bit correction is below quantization noise at this param count. Ship path is the right choice here.",
+  "date": "2026-04-18T01:48:00Z"
+}

@@ -25,45 +25,6 @@ static inline int sp_is_power_of_2(int n) {
     return n > 0 && (n & (n - 1)) == 0;
 }
 
-static inline float sp_f16_to_f32(uint16_t h) {
-    // IEEE 754 half-precision to single-precision
-    uint32_t sign = (uint32_t)(h >> 15) << 31;
-    uint32_t exp  = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-    uint32_t f;
-    if (exp == 0) {
-        if (mant == 0) {
-            f = sign;
-        } else {
-            // Denormalized
-            exp = 1;
-            while (!(mant & 0x400)) { mant <<= 1; exp--; }
-            mant &= 0x3FF;
-            f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-        }
-    } else if (exp == 31) {
-        f = sign | 0x7F800000 | (mant << 13); // Inf/NaN
-    } else {
-        f = sign | ((exp + 127 - 15) << 23) | (mant << 13);
-    }
-    float result;
-    memcpy(&result, &f, sizeof(float));
-    return result;
-}
-
-static inline uint16_t sp_f32_to_f16(float val) {
-    uint32_t f;
-    memcpy(&f, &val, sizeof(uint32_t));
-    uint16_t sign = (f >> 16) & 0x8000;
-    int exp = ((f >> 23) & 0xFF) - 127 + 15;
-    uint32_t mant = f & 0x7FFFFF;
-    if (exp <= 0) {
-        return sign; // Flush to zero
-    } else if (exp >= 31) {
-        return sign | 0x7C00; // Inf
-    }
-    return sign | (exp << 10) | (mant >> 13);
-}
 
 // ============================================================================
 // Config
@@ -106,7 +67,7 @@ void sp_config_init(sp_config_t *cfg, int head_dim, int n_layers, int n_heads_kv
 // orthonormal, so the whole transform is self-inverse: VHT2(VHT2(x)) = x.
 //
 // At n = 2^k this collapses to the Walsh-Hadamard butterfly scaled by 1/√2
-// per stage — the spectral structure is the same as the classical WHT but
+// per stage — the spectral structure is that of the p=2 Hartley butterfly but
 // there is no 1/N to undo on the inverse.
 
 #define SP_VHT2_MAX_P 11
@@ -162,19 +123,36 @@ void sp_vht2_forward_f32(float *data, int n) {
     for (int pi = 0; pi < _sp_vht2_n_primes; pi++) {
         int p = _sp_vht2_primes[pi];
         while (residue % p == 0) {
-            const float *H = _sp_hartley_kernel(p);
             const int block = p * stride;
-            for (int i = 0; i < n; i += block) {
-                for (int j = 0; j < stride; j++) {
-                    float in[SP_VHT2_MAX_P];
-                    for (int k = 0; k < p; k++) {
-                        in[k] = data[i + k * stride + j];
+            if (p == 2) {
+                // Specialised Walsh-Hadamard butterfly. H2 is {{s,s},{s,-s}}
+                // with s = 1/√2, so the generic matmul collapses to
+                // (x0+x1, x0-x1)·s. Compilers vectorise the j loop cleanly
+                // once the k/m reductions are elided — this is by far the
+                // dominant stage for power-of-2 head_dims.
+                const float s = 0.70710678118654752440f;
+                for (int i = 0; i < n; i += block) {
+                    for (int j = 0; j < stride; j++) {
+                        const float x0 = data[i + j];
+                        const float x1 = data[i + stride + j];
+                        data[i + j]          = (x0 + x1) * s;
+                        data[i + stride + j] = (x0 - x1) * s;
                     }
-                    for (int k = 0; k < p; k++) {
-                        float sum = 0.0f;
-                        const float *row = H + k * p;
-                        for (int m = 0; m < p; m++) sum += row[m] * in[m];
-                        data[i + k * stride + j] = sum;
+                }
+            } else {
+                const float *H = _sp_hartley_kernel(p);
+                for (int i = 0; i < n; i += block) {
+                    for (int j = 0; j < stride; j++) {
+                        float in[SP_VHT2_MAX_P];
+                        for (int k = 0; k < p; k++) {
+                            in[k] = data[i + k * stride + j];
+                        }
+                        for (int k = 0; k < p; k++) {
+                            float sum = 0.0f;
+                            const float *row = H + k * p;
+                            for (int m = 0; m < p; m++) sum += row[m] * in[m];
+                            data[i + k * stride + j] = sum;
+                        }
                     }
                 }
             }
@@ -197,11 +175,6 @@ void sp_vht2_forward_f16(uint16_t *data, int n) {
     free(tmp);
 }
 
-// Deprecated aliases — route through VHT2. Both forward and inverse WHT are
-// now the same self-inverse call; the 1/N normalisation the old API required
-// for round-trip is absorbed into the 1/√p per stage.
-void sp_wht_inplace_f32(float *data, int n) { sp_vht2_forward_f32(data, n); }
-void sp_wht_inplace_f16(uint16_t *data, int n) { sp_vht2_forward_f16(data, n); }
 
 // ============================================================================
 // Möbius mask
@@ -293,38 +266,38 @@ void sp_mobius_mask_free(sp_mobius_mask_t *mask) {
 
 // Caller-owned-scratch variants. Used on the hot path (shadow cache,
 // Adreno backend) to avoid malloc per KV vector.
-void sp_mobius_reorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+void sp_mobius_reorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
                           float *scratch) {
     int n = mask->n;
     for (int i = 0; i < n; i++) {
-        scratch[i] = wht_coeffs[mask->order[i]];
+        scratch[i] = vht2_coeffs[mask->order[i]];
     }
-    memcpy(wht_coeffs, scratch, n * sizeof(float));
+    memcpy(vht2_coeffs, scratch, n * sizeof(float));
 }
 
-void sp_mobius_unreorder_ex(float *wht_coeffs, const sp_mobius_mask_t *mask,
+void sp_mobius_unreorder_ex(float *vht2_coeffs, const sp_mobius_mask_t *mask,
                             float *scratch) {
     int n = mask->n;
     for (int i = 0; i < n; i++) {
-        scratch[mask->order[i]] = wht_coeffs[i];
+        scratch[mask->order[i]] = vht2_coeffs[i];
     }
-    memcpy(wht_coeffs, scratch, n * sizeof(float));
+    memcpy(vht2_coeffs, scratch, n * sizeof(float));
 }
 
 // Malloc-owning variants retained for existing callers (tests, research code).
-void sp_mobius_reorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
+void sp_mobius_reorder(float *vht2_coeffs, const sp_mobius_mask_t *mask) {
     int n = mask->n;
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
-    sp_mobius_reorder_ex(wht_coeffs, mask, tmp);
+    sp_mobius_reorder_ex(vht2_coeffs, mask, tmp);
     free(tmp);
 }
 
-void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
+void sp_mobius_unreorder(float *vht2_coeffs, const sp_mobius_mask_t *mask) {
     int n = mask->n;
     float *tmp = (float *)malloc(n * sizeof(float));
     if (!tmp) return;
-    sp_mobius_unreorder_ex(wht_coeffs, mask, tmp);
+    sp_mobius_unreorder_ex(vht2_coeffs, mask, tmp);
     free(tmp);
 }
 
@@ -334,7 +307,7 @@ void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
 //
 // Each band stores: 1 fp16 scale + packed integer values.
 // The scale is max(abs(band)) / (2^(bits-1) - 1).
-// This mirrors WHT energy decay: band 0 (highest energy) gets most bits,
+// This mirrors VHT2 energy decay: band 0 (highest energy) gets most bits,
 // band 3 (lowest energy / noise tail) gets fewest.
 //
 // Critical results from paper:
@@ -345,51 +318,61 @@ void sp_mobius_unreorder(float *wht_coeffs, const sp_mobius_mask_t *mask) {
 void sp_band_config_init(sp_band_config_t *bc, int head_dim,
                          int n_bands, const int *band_bits) {
     bc->n_bands   = n_bands;
+    bc->head_dim  = head_dim;
     bc->band_size = head_dim / n_bands;
 
     int total = 0;
     for (int b = 0; b < n_bands; b++) {
         bc->band_bits[b] = band_bits[b];
-        // Per band: 2 bytes (fp16 scale) + ceil(band_size * bits / 8) bytes
-        int data_bits = bc->band_size * band_bits[b];
+        int off, sz;
+        sp_band_span(bc, b, &off, &sz);
+        // Per band: 2 bytes (fp16 scale) + ceil(sz * bits / 8) bytes
+        int data_bits = sz * band_bits[b];
         int data_bytes = (data_bits + 7) / 8;
         total += 2 + data_bytes; // fp16 scale + packed data
     }
     bc->total_bytes = total;
 }
 
-void sp_band_quantize(const float *wht_coeffs, uint8_t *out,
+void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
                       const sp_band_config_t *bc) {
     int offset = 0;
 
     for (int b = 0; b < bc->n_bands; b++) {
-        const float *band = wht_coeffs + b * bc->band_size;
+        int band_off, band_sz;
+        sp_band_span(bc, b, &band_off, &band_sz);
+        const float *band = vht2_coeffs + band_off;
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1; // e.g. 5-bit → 15
 
         // Find max absolute value in band
         float amax = 0.0f;
-        for (int i = 0; i < bc->band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             float a = fabsf(band[i]);
             if (a > amax) amax = a;
         }
 
         // Scale: maps [-amax, amax] to [-max_val, max_val]
         float scale = (amax > 0.0f) ? amax / (float)max_val : 0.0f;
-        float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
 
-        // Store scale as fp16
+        // Store scale as fp16, then recompute inv_scale from the stored
+        // fp16 value so quantize and dequantize use the same scale.
+        // Without this round-trip, sp_f32_to_f16 truncation creates a
+        // systematic asymmetry that variance-ranking amplifies in band 0.
         uint16_t scale_f16 = sp_f32_to_f16(scale);
         out[offset]     = scale_f16 & 0xFF;
         out[offset + 1] = (scale_f16 >> 8) & 0xFF;
         offset += 2;
+
+        float scale_stored = sp_f16_to_f32(scale_f16);
+        float inv_scale = (scale_stored > 0.0f) ? 1.0f / scale_stored : 0.0f;
 
         // Pack quantized values
         // We pack bits-wide signed integers in little-endian bit order
         uint64_t bit_buffer = 0;
         int      bit_pos = 0;
 
-        for (int i = 0; i < bc->band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             // Quantize to signed integer
             int q = (int)roundf(band[i] * inv_scale);
             if (q > max_val)  q = max_val;
@@ -417,19 +400,27 @@ void sp_band_quantize(const float *wht_coeffs, uint8_t *out,
     }
 }
 
-void sp_band_dequantize(const uint8_t *in, float *wht_coeffs,
+void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                         const sp_band_config_t *bc) {
     int offset = 0;
 
     for (int b = 0; b < bc->n_bands; b++) {
-        float *band = wht_coeffs + b * bc->band_size;
+        int band_off, band_sz;
+        sp_band_span(bc, b, &band_off, &band_sz);
+        float *band = vht2_coeffs + band_off;
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
         uint32_t mask = (1u << bits) - 1;
 
-        // Read scale
+        // Read scale. Sanitise: fp16 round-trip can produce +Inf (amax overflowed
+        // the fp16 range on encode) or NaN (corrupted bytes). An Inf or NaN scale
+        // would poison every value in this band and then cascade through the
+        // inverse VHT2, so we clamp to 0 here — the band decodes as all zeros,
+        // which is the same outcome the old blanket NaN guard used to produce,
+        // but applied at the root cause rather than the output tail.
         uint16_t scale_f16 = (uint16_t)in[offset] | ((uint16_t)in[offset + 1] << 8);
         float scale = sp_f16_to_f32(scale_f16);
+        if (!isfinite(scale)) scale = 0.0f;
         offset += 2;
 
         // Unpack quantized values
@@ -437,7 +428,7 @@ void sp_band_dequantize(const uint8_t *in, float *wht_coeffs,
         int      bit_pos = 0;
         int      byte_idx = offset;
 
-        for (int i = 0; i < bc->band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             // Load bytes as needed
             while (bit_pos < bits) {
                 bit_buffer |= ((uint64_t)in[byte_idx++] << bit_pos);
@@ -454,7 +445,7 @@ void sp_band_dequantize(const uint8_t *in, float *wht_coeffs,
         }
 
         // Advance offset past the packed data
-        int data_bits = bc->band_size * bits;
+        int data_bits = band_sz * bits;
         offset += (data_bits + 7) / 8;
     }
 }
@@ -671,6 +662,7 @@ void sp_vilenkin_pass_free(sp_vilenkin_pass_t *pass) {
 // ============================================================================
 
 int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
+    memset(sc, 0, sizeof(*sc));
     memcpy(&sc->config, cfg, sizeof(sp_config_t));
 
     // Initialize band configs
@@ -687,18 +679,27 @@ int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
     }
 
     // Allocate persistent scratch buffers so the hot path never mallocs.
-    // wht_scratch     : write-path WHT buffer
+    // vht2_scratch    : write-path VHT2 buffer
     // mobius_scratch  : Möbius reorder/unreorder tmp (shared between write+read)
-    // read_scratch    : read-path WHT buffer (independent of write path)
-    sc->wht_scratch    = (float *)malloc(cfg->head_dim * sizeof(float));
+    // read_scratch    : read-path VHT2 buffer (independent of write path)
+    sc->vht2_scratch    = (float *)malloc(cfg->head_dim * sizeof(float));
     sc->mobius_scratch = (float *)malloc(cfg->head_dim * sizeof(float));
     sc->read_scratch   = (float *)malloc(cfg->head_dim * sizeof(float));
-    if (!sc->wht_scratch || !sc->mobius_scratch || !sc->read_scratch) return -1;
+    if (!sc->vht2_scratch || !sc->mobius_scratch || !sc->read_scratch) return -1;
 
     // Cache storage will be allocated by backend (depends on max_seq_len)
     sc->k_cache = NULL;
     sc->v_cache = NULL;
     sc->seq_len = (int *)calloc(cfg->n_layers, sizeof(int));
+
+    // Variance-ranked reorder: off until calibrated
+    sc->use_var_reorder = false;
+    sc->var_order = NULL;
+    sc->var_unorder = NULL;
+    sc->calibrating = false;
+    sc->calib_sum = NULL;
+    sc->calib_sum2 = NULL;
+    sc->calib_n = 0;
 
     return 0;
 }
@@ -707,29 +708,43 @@ void sp_shadow_cache_free(sp_shadow_cache_t *sc) {
     if (sc->config.use_mobius_mask) {
         sp_mobius_mask_free(&sc->mobius_mask);
     }
-    free(sc->wht_scratch);
+    free(sc->vht2_scratch);
     free(sc->mobius_scratch);
     free(sc->read_scratch);
     free(sc->seq_len);
+    free(sc->var_order);
+    free(sc->var_unorder);
+    free(sc->calib_sum);
+    free(sc->calib_sum2);
     // k_cache and v_cache freed by backend
-    sc->wht_scratch    = NULL;
+    sc->vht2_scratch    = NULL;
     sc->mobius_scratch = NULL;
     sc->read_scratch   = NULL;
     sc->seq_len        = NULL;
+    sc->var_order      = NULL;
+    sc->var_unorder    = NULL;
+    sc->calib_sum      = NULL;
+    sc->calib_sum2     = NULL;
 }
 
-// Write path: raw KV → WHT → Möbius reorder → band quantize → store
-// Hot path: uses persistent sc->wht_scratch + sc->mobius_scratch. No malloc.
+// Write path: raw KV → VHT2 → Möbius reorder → band quantize → store
+// Hot path: uses persistent sc->vht2_scratch + sc->mobius_scratch. No malloc.
 void sp_shadow_write_k(sp_shadow_cache_t *sc,
                        int layer, int head, int pos,
                        const float *k_vec) {
     int hd = sc->config.head_dim;
-    float *scratch = sc->wht_scratch;
+    float *scratch = sc->vht2_scratch;
 
     memcpy(scratch, k_vec, hd * sizeof(float));
     sp_vht2_forward_f32(scratch, hd);
 
-    if (sc->config.use_mobius_mask) {
+    // Reorder: variance-ranked (if calibrated) > Möbius (if enabled) > none
+    if (sc->use_var_reorder) {
+        // Permute by variance: high-variance → front → high-bit bands
+        float *tmp = sc->mobius_scratch;
+        for (int i = 0; i < hd; i++) tmp[i] = scratch[sc->var_order[i]];
+        memcpy(scratch, tmp, hd * sizeof(float));
+    } else if (sc->config.use_mobius_mask) {
         sp_mobius_reorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
@@ -742,7 +757,7 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
                        int layer, int head, int pos,
                        const float *v_vec) {
     int hd = sc->config.head_dim;
-    float *scratch = sc->wht_scratch;
+    float *scratch = sc->vht2_scratch;
 
     memcpy(scratch, v_vec, hd * sizeof(float));
     sp_vht2_forward_f32(scratch, hd);
@@ -755,7 +770,7 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
     sp_band_quantize(scratch, dest, &sc->v_bands);
 }
 
-// Read path: load → band dequantize → Möbius unreorder → inverse WHT → KV
+// Read path: load → band dequantize → Möbius unreorder → VHT2 (self-inverse) → KV
 // Hot path: uses persistent sc->read_scratch + sc->mobius_scratch. No malloc.
 // The `const` on sc is a contract for thread-call-safety, not true immutability
 // — we write into sc->read_scratch / sc->mobius_scratch. Callers must serialize.
@@ -770,15 +785,19 @@ void sp_shadow_read_k(const sp_shadow_cache_t *sc,
 
     sp_band_dequantize(src, scratch, &sc->k_bands);
 
-    if (sc->config.use_mobius_mask) {
+    // Inverse reorder: variance-ranked (if calibrated) > Möbius > none
+    if (sc->use_var_reorder) {
+        float *tmp = sc->mobius_scratch;
+        for (int i = 0; i < hd; i++) tmp[sc->var_order[i]] = scratch[i];
+        memcpy(scratch, tmp, hd * sizeof(float));
+    } else if (sc->config.use_mobius_mask) {
         sp_mobius_unreorder_ex(scratch, &sc->mobius_mask, sc->mobius_scratch);
     }
 
     // Inverse transform: VHT2 is self-inverse (1/√p per stage absorbs the
-    // 1/N the old unnormalised WHT required).
+    // 1/N the old unnormalised p=2 butterfly required).
     sp_vht2_forward_f32(scratch, hd);
 
-    sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(k_out, scratch, hd * sizeof(float));
 }
 
@@ -796,7 +815,6 @@ void sp_shadow_read_v(const sp_shadow_cache_t *sc,
     // Inverse transform: VHT2 is self-inverse.
     sp_vht2_forward_f32(scratch, hd);
 
-    sp_nan_guard_f32(scratch, hd, 65504.0f);
     memcpy(v_out, scratch, hd * sizeof(float));
 }
 
@@ -844,19 +862,98 @@ void sp_shadow_read_v_batch(const sp_shadow_cache_t *sc,
 }
 
 // ============================================================================
-// NaN guard
+// Ship-path variance-ranked calibration
 // ============================================================================
 
-void sp_nan_guard_f32(float *data, int n, float max_magnitude) {
-    for (int i = 0; i < n; i++) {
-        if (!isfinite(data[i])) {
-            data[i] = 0.0f;
-        } else if (data[i] > max_magnitude) {
-            data[i] = max_magnitude;
-        } else if (data[i] < -max_magnitude) {
-            data[i] = -max_magnitude;
-        }
+int sp_shadow_calibrate_begin(sp_shadow_cache_t *sc) {
+    if (sc->calibrating) return -1;
+    int hd = sc->config.head_dim;
+    sc->calib_sum  = (double *)calloc(hd, sizeof(double));
+    sc->calib_sum2 = (double *)calloc(hd, sizeof(double));
+    if (!sc->calib_sum || !sc->calib_sum2) {
+        free(sc->calib_sum);
+        free(sc->calib_sum2);
+        sc->calib_sum = NULL;
+        sc->calib_sum2 = NULL;
+        return -1;
     }
+    sc->calib_n = 0;
+    sc->calibrating = true;
+    return 0;
+}
+
+void sp_shadow_calibrate_feed(sp_shadow_cache_t *sc, const float *vec) {
+    if (!sc->calibrating) return;
+    int hd = sc->config.head_dim;
+
+    // Transform to VHT2 domain using the persistent scratch
+    memcpy(sc->vht2_scratch, vec, hd * sizeof(float));
+    sp_vht2_forward_f32(sc->vht2_scratch, hd);
+
+    for (int i = 0; i < hd; i++) {
+        double v = (double)sc->vht2_scratch[i];
+        sc->calib_sum[i]  += v;
+        sc->calib_sum2[i] += v * v;
+    }
+    sc->calib_n++;
+}
+
+int sp_shadow_calibrate_end(sp_shadow_cache_t *sc) {
+    if (!sc->calibrating || sc->calib_n < 1) return -1;
+    sc->calibrating = false;
+
+    int hd = sc->config.head_dim;
+    double inv_n = 1.0 / (double)sc->calib_n;
+
+    // Compute per-coefficient variance
+    float *variance = (float *)malloc(hd * sizeof(float));
+    for (int i = 0; i < hd; i++) {
+        double mean = sc->calib_sum[i] * inv_n;
+        double var  = sc->calib_sum2[i] * inv_n - mean * mean;
+        variance[i] = (var > 0.0) ? (float)var : 0.0f;
+    }
+
+    free(sc->calib_sum);
+    free(sc->calib_sum2);
+    sc->calib_sum = NULL;
+    sc->calib_sum2 = NULL;
+
+    // Build variance-ranked permutation: indices sorted by variance descending
+    // so highest-variance coefficients land in band 0 (highest bits).
+    // Free any prior allocation (safe even on first call — they start NULL).
+    free(sc->var_order);
+    free(sc->var_unorder);
+    sc->var_order   = (int *)malloc(hd * sizeof(int));
+    sc->var_unorder = (int *)malloc(hd * sizeof(int));
+    for (int i = 0; i < hd; i++) sc->var_order[i] = i;
+
+    // Insertion sort (head_dim ≤ 256, not hot path)
+    for (int i = 1; i < hd; i++) {
+        int key = sc->var_order[i];
+        float kv = variance[key];
+        int j = i - 1;
+        while (j >= 0 && variance[sc->var_order[j]] < kv) {
+            sc->var_order[j + 1] = sc->var_order[j];
+            j--;
+        }
+        sc->var_order[j + 1] = key;
+    }
+
+    // Build inverse permutation for the read path
+    for (int i = 0; i < hd; i++) {
+        sc->var_unorder[sc->var_order[i]] = i;
+    }
+
+    sc->use_var_reorder = true;
+    free(variance);
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime SHADOW] variance-ranked reorder calibrated "
+                        "(head_dim=%d, n_vectors=%d)\n", hd, sc->calib_n);
+    }
+
+    sc->calib_n = 0;
+    return 0;
 }
 
 // ============================================================================
@@ -930,4 +1027,477 @@ void sp_config_print(const sp_config_t *cfg) {
     fprintf(stderr, "\n");
 
     fprintf(stderr, "  Compression:  %.1f×\n", sp_compression_ratio(cfg));
+}
+
+// ============================================================================
+// Disk Serialization
+// ============================================================================
+
+#include <stdio.h>
+
+uint64_t sp_fnv1a_hash(const char *str, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint64_t)(unsigned char)str[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// Write 64-byte VHT2 v2 header
+static int sp_write_cache_header(FILE *f, int packed_stride, int n_pos,
+                                 int n_heads, int cache_type,
+                                 uint64_t model_hash) {
+    uint32_t hdr[16] = {0};
+    hdr[0] = SP_CACHE_MAGIC;
+    hdr[1] = SP_CACHE_VERSION;
+    hdr[2] = (uint32_t)packed_stride;
+    hdr[3] = (uint32_t)n_pos;
+    hdr[4] = (uint32_t)n_heads;
+    hdr[5] = (uint32_t)cache_type;
+    hdr[6] = (uint32_t)(model_hash & 0xFFFFFFFF);
+    hdr[7] = (uint32_t)(model_hash >> 32);
+    return (fwrite(hdr, sizeof(hdr), 1, f) == 1) ? 0 : -1;
+}
+
+// Read and validate 64-byte VHT2 v2 header
+static int sp_read_cache_header(FILE *f, int *packed_stride, int *n_pos,
+                                int *n_heads, int *cache_type,
+                                uint64_t expected_hash) {
+    uint32_t hdr[16] = {0};
+    if (fread(hdr, sizeof(hdr), 1, f) != 1)        return -1;
+    if (hdr[0] != SP_CACHE_MAGIC)                    return -1;
+    if (hdr[1] != SP_CACHE_VERSION)                  return -1;
+
+    *packed_stride = (int)hdr[2];
+    *n_pos         = (int)hdr[3];
+    *n_heads       = (int)hdr[4];
+    *cache_type    = (int)hdr[5];
+
+    if (expected_hash != 0) {
+        uint64_t disk_hash = (uint64_t)hdr[6] | ((uint64_t)hdr[7] << 32);
+        if (disk_hash != 0 && disk_hash != expected_hash) {
+            fprintf(stderr, "[sp-disk] model hash mismatch: disk=%llx expected=%llx\n",
+                    (unsigned long long)disk_hash,
+                    (unsigned long long)expected_hash);
+            // Warning only — non-blocking (same as Archimedes)
+        }
+    }
+    return 0;
+}
+
+// ── Shadow cache save/load ──────────────────────────────────────────
+
+int sp_shadow_cache_save(const sp_shadow_cache_t *sc,
+                         const char *prefix, int n_pos,
+                         uint64_t model_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer = sc->config.n_layers;
+    const int n_head  = sc->config.n_heads_kv;
+    const int k_bytes = sc->k_bands.total_bytes;
+    const int v_bytes = sc->v_bands.total_bytes;
+
+    for (int il = 0; il < n_layer; il++) {
+        // Determine positions written for this layer
+        int layer_pos = (n_pos > 0) ? n_pos : (sc->seq_len ? sc->seq_len[il] : 0);
+        if (layer_pos <= 0) continue;
+
+        // Save K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) {
+                fprintf(stderr, "[sp-disk] cannot write %s\n", path);
+                return -1;
+            }
+            if (sp_write_cache_header(f, k_bytes, layer_pos, n_head, 0, model_hash) != 0) {
+                fclose(f); return -1;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *cache_ptr = sc->k_cache[slot];
+                for (int p = 0; p < layer_pos; p++) {
+                    if (fwrite(cache_ptr + (size_t)p * k_bytes, k_bytes, 1, f) != 1) {
+                        fclose(f); return -1;
+                    }
+                }
+            }
+            fclose(f);
+        }
+
+        // Save V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) {
+                fprintf(stderr, "[sp-disk] cannot write %s\n", path);
+                return -1;
+            }
+            if (sp_write_cache_header(f, v_bytes, layer_pos, n_head, 0, model_hash) != 0) {
+                fclose(f); return -1;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *cache_ptr = sc->v_cache[slot];
+                for (int p = 0; p < layer_pos; p++) {
+                    if (fwrite(cache_ptr + (size_t)p * v_bytes, v_bytes, 1, f) != 1) {
+                        fclose(f); return -1;
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+    return 0;
+}
+
+int sp_shadow_cache_load(sp_shadow_cache_t *sc,
+                         const char *prefix,
+                         uint64_t expected_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer = sc->config.n_layers;
+    const int n_head  = sc->config.n_heads_kv;
+    const int k_bytes = sc->k_bands.total_bytes;
+    const int v_bytes = sc->v_bands.total_bytes;
+    int max_loaded = 0;
+
+    for (int il = 0; il < n_layer; il++) {
+        // Load K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;  // Layer not on disk — skip
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+                fprintf(stderr, "[sp-disk] K layer %d: bad header in %s\n", il, path);
+                fclose(f); continue;
+            }
+            if (pstr != k_bytes) {
+                fprintf(stderr, "[sp-disk] K layer %d: stride mismatch (disk=%d expected=%d)\n",
+                        il, pstr, k_bytes);
+                fclose(f); continue;
+            }
+            if (n_hd != n_head) {
+                fprintf(stderr, "[sp-disk] K layer %d: head count mismatch (disk=%d expected=%d)\n",
+                        il, n_hd, n_head);
+                fclose(f); continue;
+            }
+
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                uint8_t *cache_ptr = sc->k_cache[slot];
+                for (int p = 0; p < n_pos; p++) {
+                    if (fread(cache_ptr + (size_t)p * k_bytes, k_bytes, 1, f) != 1) {
+                        fprintf(stderr, "[sp-disk] K layer %d head %d: read truncated at pos %d\n",
+                                il, ih, p);
+                        break;
+                    }
+                }
+            }
+            if (sc->seq_len) {
+                sc->seq_len[il] = n_pos;
+            }
+            if (n_pos > max_loaded) max_loaded = n_pos;
+            fclose(f);
+        }
+
+        // Load V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+                fprintf(stderr, "[sp-disk] V layer %d: bad header in %s\n", il, path);
+                fclose(f); continue;
+            }
+            if (pstr != v_bytes || n_hd != n_head) {
+                fprintf(stderr, "[sp-disk] V layer %d: config mismatch\n", il);
+                fclose(f); continue;
+            }
+
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                uint8_t *cache_ptr = sc->v_cache[slot];
+                for (int p = 0; p < n_pos; p++) {
+                    if (fread(cache_ptr + (size_t)p * v_bytes, v_bytes, 1, f) != 1) break;
+                }
+            }
+            fclose(f);
+        }
+    }
+    return max_loaded;
+}
+
+// ── Sqfree cache save/load ──────────────────────────────────────────
+// Same binary format; packed_stride is per-position bytes from sqfree layout.
+
+int sp_sqfree_cache_save(const sp_sqfree_cache_t *sc,
+                         const char *prefix, int n_pos,
+                         uint64_t model_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer  = sc->config.head_dim > 0 ? sc->config.n_layers : 0;
+    const int n_head   = sc->config.n_heads_kv;
+    const int n_res    = sc->mask.n_res;
+    // Per-position storage: banded skeleton + residual + magnitude + optional spinor
+    const int k_bytes  = sc->k_bands.total_bytes
+                       + (n_res * sc->residual_bits + 7) / 8
+                       + 4  // magnitude (float)
+                       + (sc->use_spinor ? (n_res + 7) / 8 : 0);
+    const int v_bytes  = k_bytes;  // Same layout for V
+
+    for (int il = 0; il < n_layer; il++) {
+        int layer_pos = (n_pos > 0) ? n_pos : 0;
+        if (layer_pos <= 0) continue;
+
+        // K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "[sp-disk] cannot write %s\n", path); return -1; }
+            sp_write_cache_header(f, k_bytes, layer_pos, n_head, 1, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *data = sc->k_cache[slot];
+                fwrite(data, (size_t)k_bytes * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+        // V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) { fprintf(stderr, "[sp-disk] cannot write %s\n", path); return -1; }
+            sp_write_cache_header(f, v_bytes, layer_pos, n_head, 1, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                const uint8_t *data = sc->v_cache[slot];
+                fwrite(data, (size_t)v_bytes * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+    }
+    return 0;
+}
+
+int sp_sqfree_cache_load(sp_sqfree_cache_t *sc,
+                         const char *prefix,
+                         uint64_t expected_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer = sc->config.n_layers;
+    const int n_head  = sc->config.n_heads_kv;
+    const int n_res   = sc->mask.n_res;
+    const int k_bytes = sc->k_bands.total_bytes
+                      + (n_res * sc->residual_bits + 7) / 8
+                      + 4
+                      + (sc->use_spinor ? (n_res + 7) / 8 : 0);
+    int max_loaded = 0;
+
+    for (int il = 0; il < n_layer; il++) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+
+        int pstr, n_pos, n_hd, ctype;
+        if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
+            || pstr != k_bytes || n_hd != n_head) {
+            fprintf(stderr, "[sp-disk] sqfree K layer %d: config mismatch\n", il);
+            fclose(f); continue;
+        }
+        for (int ih = 0; ih < n_head; ih++) {
+            int slot = il * n_head + ih;
+            fread(sc->k_cache[slot], (size_t)k_bytes * n_pos, 1, f);
+        }
+        if (n_pos > max_loaded) max_loaded = n_pos;
+        fclose(f);
+
+        // V
+        snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+        f = fopen(path, "rb");
+        if (!f) continue;
+        if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+            fclose(f); continue;
+        }
+        for (int ih = 0; ih < n_head; ih++) {
+            int slot = il * n_head + ih;
+            fread(sc->v_cache[slot], (size_t)pstr * n_pos, 1, f);
+        }
+        fclose(f);
+    }
+    return max_loaded;
+}
+
+// ── Hierarchical cache save/load ────────────────────────────────────
+// Saves: skeleton bands + residual per position, PLUS the W predictor matrices.
+// W matrices go in a separate file: {prefix}.hier_w.bin
+
+int sp_hier_cache_save(const sp_hier_cache_t *sc,
+                       const char *prefix, int n_pos,
+                       uint64_t model_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer   = sc->config.n_layers;
+    const int n_head    = sc->config.n_heads_kv;
+    const int k_bpp     = sc->k_bytes_per_pos;
+    const int v_bpp     = sc->v_bytes_per_pos;
+    const int n_target  = sc->predictors[0].n_target;
+    const int n_skel    = sc->predictors[0].n_skeleton;
+
+    for (int il = 0; il < n_layer; il++) {
+        int layer_pos = (n_pos > 0) ? n_pos : 0;
+        if (layer_pos <= 0) continue;
+
+        // K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) return -1;
+            sp_write_cache_header(f, k_bpp, layer_pos, n_head, 2, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fwrite(sc->k_cache[slot], (size_t)k_bpp * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+        // V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "wb");
+            if (!f) return -1;
+            sp_write_cache_header(f, v_bpp, layer_pos, n_head, 2, model_hash);
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fwrite(sc->v_cache[slot], (size_t)v_bpp * layer_pos, 1, f);
+            }
+            fclose(f);
+        }
+    }
+
+    // Save W predictor matrices: one file for all slots
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.hier_w.bin", prefix);
+        FILE *f = fopen(path, "wb");
+        if (!f) return -1;
+
+        const int n_slots = n_layer * n_head;
+        // Header: magic + n_slots + n_skeleton + n_target
+        uint32_t whdr[4] = {SP_CACHE_MAGIC, (uint32_t)n_slots,
+                            (uint32_t)n_skel, (uint32_t)n_target};
+        fwrite(whdr, sizeof(whdr), 1, f);
+
+        // W matrices stored as fp16 (uint16_t), [n_target × n_skeleton] per slot
+        const size_t w_size = (size_t)n_target * n_skel * sizeof(uint16_t);
+        for (int s = 0; s < n_slots; s++) {
+            if (sc->predictors[s].W) {
+                fwrite(sc->predictors[s].W, w_size, 1, f);
+            } else {
+                // Uncalibrated slot — write zeros
+                uint16_t *zeros = (uint16_t *)calloc(w_size, 1);
+                fwrite(zeros, w_size, 1, f);
+                free(zeros);
+            }
+        }
+        fclose(f);
+    }
+
+    return 0;
+}
+
+int sp_hier_cache_load(sp_hier_cache_t *sc,
+                       const char *prefix,
+                       uint64_t expected_hash) {
+    if (!sc || !prefix) return -1;
+
+    const int n_layer  = sc->config.n_layers;
+    const int n_head   = sc->config.n_heads_kv;
+    const int k_bpp    = sc->k_bytes_per_pos;
+    const int v_bpp    = sc->v_bytes_per_pos;
+    const int n_target = sc->predictors[0].n_target;
+    const int n_skel   = sc->predictors[0].n_skeleton;
+    int max_loaded = 0;
+
+    for (int il = 0; il < n_layer; il++) {
+        // K
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
+                || pstr != k_bpp || n_hd != n_head) {
+                fclose(f); continue;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fread(sc->k_cache[slot], (size_t)k_bpp * n_pos, 1, f);
+            }
+            if (n_pos > max_loaded) max_loaded = n_pos;
+            fclose(f);
+        }
+        // V
+        {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+
+            int pstr, n_pos, n_hd, ctype;
+            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
+                || pstr != v_bpp || n_hd != n_head) {
+                fclose(f); continue;
+            }
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                fread(sc->v_cache[slot], (size_t)v_bpp * n_pos, 1, f);
+            }
+            fclose(f);
+        }
+    }
+
+    // Load W predictor matrices
+    {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.hier_w.bin", prefix);
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            uint32_t whdr[4];
+            if (fread(whdr, sizeof(whdr), 1, f) == 1
+                && whdr[0] == SP_CACHE_MAGIC
+                && (int)whdr[2] == n_skel
+                && (int)whdr[3] == n_target) {
+
+                const int n_slots = n_layer * n_head;
+                const size_t w_size = (size_t)n_target * n_skel * sizeof(uint16_t);
+                for (int s = 0; s < n_slots && s < (int)whdr[1]; s++) {
+                    if (sc->predictors[s].W) {
+                        fread(sc->predictors[s].W, w_size, 1, f);
+                        sc->predictors[s].calibrated = true;
+                    } else {
+                        fseek(f, (long)w_size, SEEK_CUR);  // Skip uncalibrated
+                    }
+                }
+            }
+            fclose(f);
+        }
+    }
+
+    return max_loaded;
 }

@@ -1,0 +1,18 @@
+{
+  "model": "Dolphin3.0-Llama3.2-1B-Q8_0",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "config": "ship",
+  "env": {"SHANNON_PRIME_ENABLED": "1", "SHANNON_PRIME_MOBIUS": "1", "SHANNON_PRIME_K_BITS": "5,5,4,3", "SHANNON_PRIME_V_BITS": "3"},
+  "head_dim": 64,
+  "pad_dim": 64,
+  "ctx": 2048,
+  "chunks": 8,
+  "repeats": 1,
+  "median_ppl": 10.7698,
+  "raw_ppls": [10.7698],
+  "baseline_ppl": 10.7164,
+  "delta_pct": 0.498,
+  "sec_per_pass": 12.51,
+  "date": "2026-04-18T01:38:00Z"
+}

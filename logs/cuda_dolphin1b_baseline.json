@@ -1,0 +1,14 @@
+{
+  "model": "Dolphin3.0-Llama3.2-1B-Q8_0",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "config": "baseline",
+  "head_dim": 64,
+  "ctx": 2048,
+  "chunks": 8,
+  "repeats": 1,
+  "median_ppl": 10.7164,
+  "raw_ppls": [10.7164],
+  "sec_per_pass": 11.77,
+  "date": "2026-04-18T01:35:00Z"
+}

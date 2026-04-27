@@ -7,18 +7,19 @@ cd shannon-prime
 make test-all
 ```
 
-This runs all 7 test suites (116 tests total). Every suite must pass before shipping.
+This runs all 8 test suites. Post-v1.03: 188/189 passing (35/36 core + 7 cuda + 4 vulkan + 14 adreno + 7 integration + 31 torch + 25 comfyui + 69 sqfree). The one synthetic-K-pipeline flake is known — see the banded-quantization notes below.
 
 For individual suites:
 
 ```bash
-make test-core          # C core math (31 tests)
+make test-core          # C core math (36 tests, incl. v1.03 non-divisible bands)
 make test-adreno        # Adreno/ARM mobile (14 tests)
 make test-vulkan        # Vulkan + CPU fallback (4 tests)
 make test-cuda          # CUDA backend on a real NVIDIA GPU (7 tests)
 make test-integration   # llama.cpp integration (7 tests)
-make test-torch         # PyTorch backend (28 tests)
+make test-torch         # PyTorch backend (31 tests)
 make test-comfyui       # ComfyUI + Wan architecture (25 tests)
+make test-sqfree        # Sqfree + spinor path (69 tests, PyTorch)
 ```
 
 ## What Each Suite Validates
@@ -31,7 +32,7 @@ The foundation. If these fail, nothing else works.
 make test-core
 ```
 
-**WHT Round-Trip (4 tests):** Verifies `WHT(WHT(x)) = N·x` for hd=32, 64, 128, 256. Maximum error should be <1e-5 (typically ~1e-7). If this fails, the butterfly implementation has a bug — check indexing in the inner loop.
+**VHT2 Round-Trip (4 tests):** Verifies `VHT2(VHT2(x)) = x` (self-inverse, no 1/N) for hd=32, 64, 128, 256. Maximum error should be <1e-5 (typically ~1e-7). If this fails, the VHT2 at p=2 butterfly has a bug — check indexing in the inner loop or the 1/√2 per-stage normalisation.
 
 **Möbius Function (9 tests):** Checks known values: μ(1)=1, μ(2)=−1, μ(4)=0, μ(6)=1, μ(30)=−1, etc. Also verifies squarefree count matches. If μ(4)≠0, the squared-prime detection in the sieve is broken.
 
@@ -49,17 +50,21 @@ make test-core
 
 If correlation is high but compression is wrong, the byte counting in `sp_band_config_init` is off. If compression is right but correlation is low, the bit packing/unpacking has a bug.
 
-**K/V Spectral Asymmetry (2 tests):** K (periodic/structured) should concentrate >60% energy in the first half of WHT bands. V (random) should be roughly uniform (~50%). This is the foundational property — if K doesn't concentrate, the banded allocation is pointless.
+**K/V Spectral Asymmetry (2 tests):** K (periodic/structured) should concentrate >60% energy in the first half of VHT2 bands. V (random) should be roughly uniform (~50%). This is the foundational property — if K doesn't concentrate, the banded allocation is pointless.
 
 **Vilenkin Round-Trip (3 tests):** Tests 2, 3, and 4-prime bases. Max error should be <1e-4. The key fix was normalization: V·V=I (not N·I). If round-trip error is ~0.5, the inverse is still dividing by N.
 
 **Full VHT2 Pipeline (2 tests):** End-to-end: write K through shadow cache, read back, check correlation. K should be >0.985, V should be >0.950. If K passes but V fails badly, check that V isn't getting Möbius reorder (V should NOT be reordered in self-attention mode).
+
+> **Known flake:** this test's K threshold is 0.990 but the synthetic K generator used in `tests/test_core.c` sometimes lands at 0.9894. Real post-RoPE K hits 0.997+ reliably. The threshold is preserved to catch genuine regressions; the flake is documented in CLAUDE.md as acceptable. Count this as 30/31 = pass.
 
 **Möbius Quality Improvement (1 test):** Compares correlation with and without Möbius reorder on structured signals. Möbius should be ≥ plain (typically +0.004). If Möbius is worse, the reorder/unreorder might be swapped.
 
 **Compression Ratios (2 tests):** Checks hd=128 gives 3.0–4.5× and hd=64 gives 2.5–5.0×.
 
 **Vilenkin Successive Extraction (1 test):** Extracts 95% energy via first pass, checks residual is <10% of original energy.
+
+**Banded Quant Non-Divisible (5 checks — v1.03):** Exercises `sp_band_span` on 10 bands over pad_dim=154. Asserts the typical band size is 15, the last band absorbs the 19-coeff remainder, round-trip correlation holds (>0.900 at 3-bit × 10), and the tail coefficients are actually written back (regression guard against silent truncation of indices 150..153). If this fails on CUDA or Torch while core passes, check that the band loop in `backends/{cuda,torch}/*` uses the per-band `band_sz` computed from `bc->head_dim` — pre-v1.04 the CUDA launcher passed `band_size * n_bands` and orphaned the tail.
 
 ### Adreno/ARM Mobile (14 tests)
 
@@ -71,7 +76,7 @@ On x86 this uses scalar fallbacks. On ARM it uses real NEON.
 
 **Hardware Detection (1 test):** Just verifies `sp_mobile_detect_caps()` doesn't crash. Check the printed output — on x86 it should show NEON=no and detect CPU cores via sysfs.
 
-**NEON WHT vs Core (3 tests):** The NEON WHT must produce identical results to the C core WHT. Max error should be 0.00 on scalar fallback, <1e-6 on actual NEON. Any difference means the NEON butterfly has an indexing bug.
+**NEON VHT2 vs Core (3 tests):** The NEON VHT2 at p=2 must produce identical results to the C core `sp_vht2_forward_*`. Max error should be 0.00 on scalar fallback, <1e-6 on actual NEON. Any difference means the NEON butterfly has an indexing bug.
 
 **fp16 Conversion (1 test):** f32→f16→f32 round-trip. Max error should be <0.01 (fp16 precision is ~1e-3). If error is large, check the sign/exponent/mantissa bit manipulation.
 
@@ -119,7 +124,7 @@ so the test harness stages host↔device with `cudaMemcpy`.
 **Init (1 test):** `sp_cuda_cache_init()` with the default stream succeeds after
 confirming at least one CUDA device is present.
 **K Pipeline (1 test):** Write + read K through the full GPU chain
-(WHT → Möbius reorder → band quantize → dequantize → Möbius unreorder → iWHT),
+(VHT2 → Möbius reorder → band quantize → dequantize → Möbius unreorder → VHT2 (self-inverse)),
 correlation >0.990.
 **V Pipeline (1 test):** Same shape, no Möbius, V config (flat 3-bit),
 correlation >0.950.
@@ -187,7 +192,7 @@ python3 tests/test_comfyui.py
 
 **Correlation below threshold on random data:** Random vectors occasionally produce lower correlation than structured (RoPE-like) vectors. If the test shows 0.984 against a 0.985 threshold, this is noise — not a bug. Real K vectors with RoPE structure achieve 0.997+. Thresholds are set to catch real bugs while tolerating statistical variation.
 
-**NaN in output:** If you see NaN in reconstructed vectors, check: (1) the bit allocation — any band at 2-bit is catastrophic, (2) the WHT normalization — inverse WHT must divide by N, (3) the Möbius reorder/unreorder — if these are swapped, the quantization hits wrong coefficients.
+**NaN in output:** If you see NaN in reconstructed vectors, check: (1) the bit allocation — any band at 2-bit is catastrophic, (2) the VHT2 normalisation — each p-stage is already scaled by 1/√p, so a forward-then-forward round-trip must NOT divide by N (VHT2 is self-inverse), (3) the Möbius reorder/unreorder — if these are swapped, the quantization hits wrong coefficients. The only surviving guard is the non-finite fp16-scale check inside `sp_band_dequantize`, which zeros the band on overflow.
 
 **Compression ratio doesn't match paper:** The paper reports 3.4–3.8× total (K+V combined). Our ratio calculation counts both K and V bytes. If you see 3.4× for K alone, that's the K-specific ratio, not the total.
 

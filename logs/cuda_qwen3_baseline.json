@@ -1,0 +1,14 @@
+{
+  "model": "Qwen3-8B-Q8_0",
+  "backend": "cuda",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "config": "baseline",
+  "head_dim": 128,
+  "ctx": 4096,
+  "chunks": 8,
+  "repeats": 1,
+  "median_ppl": 8.6746,
+  "raw_ppls": [8.6746],
+  "sec_per_pass": 149.74,
+  "date": "2026-04-18T01:50:00Z"
+}

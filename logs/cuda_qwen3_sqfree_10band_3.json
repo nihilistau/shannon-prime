@@ -1,0 +1,17 @@
+{
+  "model": "Qwen3-8B-Q8_0",
+  "backend": "cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build)",
+  "config": "sqfree+spinor 10×3",
+  "env": {"SHANNON_PRIME_ENABLED": "1", "SHANNON_PRIME_MOBIUS": "1", "SHANNON_PRIME_SQFREE": "1", "SHANNON_PRIME_SPINOR": "1", "SHANNON_PRIME_RESIDUAL_BITS": "3", "SHANNON_PRIME_K_BITS": "3,3,3,3,3,3,3,3,3,3"},
+  "head_dim": 128,
+  "pad_dim": 154,
+  "n_bands": 10,
+  "total_k_bits": 30,
+  "ctx": 2048,
+  "chunks": 4,
+  "repeats": 1,
+  "median_ppl": 11.8324,
+  "raw_ppls": [11.8324],
+  "note": "v1.03: required (a) raising SP_MAX_BANDS 8→16 + per-band span helper for non-divisible splits, and (b) fixing sp_sqfree_cache_init which had hard-coded the 5-band default and ignored caller K_BITS. Post-fix 10 bands actually took effect.",
+  "date": "2026-04-18T07:40:00Z"
+}

@@ -1,0 +1,17 @@
+{
+  "model": "Qwen3-8B-Q8_0",
+  "backend": "cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build)",
+  "config": "sqfree+spinor 10×2 (catastrophic — below 3-bit floor)",
+  "env": {"SHANNON_PRIME_ENABLED": "1", "SHANNON_PRIME_MOBIUS": "1", "SHANNON_PRIME_SQFREE": "1", "SHANNON_PRIME_SPINOR": "1", "SHANNON_PRIME_RESIDUAL_BITS": "3", "SHANNON_PRIME_K_BITS": "2,2,2,2,2,2,2,2,2,2"},
+  "head_dim": 128,
+  "pad_dim": 154,
+  "n_bands": 10,
+  "total_k_bits": 20,
+  "ctx": 2048,
+  "chunks": 4,
+  "repeats": 1,
+  "median_ppl": 428.7779,
+  "raw_ppls": [428.7779],
+  "note": "Confirms CLAUDE.md invariant #3 ('2-bit on any band is catastrophic'). Requested explicitly by the user to capture a data point below the floor; do not ship this config.",
+  "date": "2026-04-18T07:55:00Z"
+}

@@ -9,10 +9,10 @@
 //
 // llama.cpp integration for the sqfree + spinor aggressive compression path.
 //
-// Additive to tools/shannon_prime_llama.c — does NOT modify the WHT ship path.
+// Additive to tools/shannon_prime_llama.c — does NOT modify the VHT2 ship path.
 // Link this alongside the existing llama integration when building with sqfree.
 //
-// New environment variables (all opt-in, WHT ship config remains default):
+// New environment variables (all opt-in, VHT2 ship config remains default):
 //
 //   SHANNON_PRIME_SQFREE=1       Enable sqfree prime-Hartley basis
 //   SHANNON_PRIME_SPINOR=1       Enable spinor sheet bit (requires SQFREE)
@@ -70,7 +70,7 @@ static sp_llama_sqfree_config_t sp_llama_sqfree_config_from_env(void) {
     if (cfg.sk_frac < 0.1f) cfg.sk_frac = 0.1f;
     if (cfg.sk_frac > 1.0f) cfg.sk_frac = 1.0f;
 
-    // Parse K band bits (default: 5,4,4,4,5 for sqfree, 5,5,4,3 for WHT)
+    // Parse K band bits (default: 5,4,4,4,5 for sqfree, 5,5,4,3 for ship VHT2)
     const char *kb = getenv("SHANNON_PRIME_K_BITS");
     if (kb) {
         cfg.n_k_bands = 0;
@@ -89,7 +89,7 @@ static sp_llama_sqfree_config_t sp_llama_sqfree_config_from_env(void) {
         cfg.k_band_bits[3] = 4;
         cfg.k_band_bits[4] = 5;
     } else {
-        // Default for WHT: 4-band ship config
+        // Default for ship VHT2: 4-band
         cfg.n_k_bands = 4;
         cfg.k_band_bits[0] = 5;
         cfg.k_band_bits[1] = 5;
@@ -108,10 +108,18 @@ typedef struct {
     sp_sqfree_cache_t  cache;
     sp_llama_sqfree_config_t env_cfg;
     bool               initialized;
+    // SHANNON_PRIME_DUMP_K=<path> appends raw K vectors (head_dim × fp32) to
+    // <path> so tools/sp_auto_bands.py can compute per-band VHT2 energy and
+    // emit a fitted K_BITS allocation. Write-only, append mode. When unset,
+    // dump_fp is NULL and the dump path is a no-op.
+    FILE              *dump_fp;
+    int                dump_head_dim;
+    long long          dump_count;   // number of K vectors written so far
+    long long          dump_limit;   // stop after N vectors (0 = unlimited)
 } sp_llama_sqfree_ctx_t;
 
 // Initialize sqfree context. Call after model params are known.
-// Returns NULL if sqfree is not enabled (caller should use WHT path).
+// Returns NULL if sqfree is not enabled (caller should use ship VHT2 path).
 sp_llama_sqfree_ctx_t *sp_llama_sqfree_init(int head_dim, int n_layers,
                                              int n_heads_kv, int max_seq_len) {
     sp_llama_sqfree_config_t env = sp_llama_sqfree_config_from_env();
@@ -143,6 +151,22 @@ sp_llama_sqfree_ctx_t *sp_llama_sqfree_init(int head_dim, int n_layers,
 
     ctx->initialized = true;
 
+    // Optional: open K-dump file for offline auto-bands analysis.
+    const char *dump_path = getenv("SHANNON_PRIME_DUMP_K");
+    if (dump_path && *dump_path) {
+        ctx->dump_fp = fopen(dump_path, "wb");
+        if (ctx->dump_fp) {
+            ctx->dump_head_dim = head_dim;
+            const char *limit_s = getenv("SHANNON_PRIME_DUMP_K_LIMIT");
+            ctx->dump_limit = limit_s ? atoll(limit_s) : 8192;
+            fprintf(stderr, "[Shannon-Prime] K dump → %s (limit=%lld vectors)\n",
+                    dump_path, ctx->dump_limit);
+        } else {
+            fprintf(stderr, "[Shannon-Prime] warning: failed to open K dump '%s'\n",
+                    dump_path);
+        }
+    }
+
     if (getenv("SHANNON_PRIME_VERBOSE")) {
         int pd = ctx->cache.pad_dim;
         fprintf(stderr, "[Shannon-Prime SQFREE] head_dim=%d → pad_dim=%d\n",
@@ -169,16 +193,26 @@ sp_llama_sqfree_ctx_t *sp_llama_sqfree_init(int head_dim, int n_layers,
 
 void sp_llama_sqfree_free(sp_llama_sqfree_ctx_t *ctx) {
     if (!ctx) return;
+    if (ctx->dump_fp) {
+        fprintf(stderr, "[Shannon-Prime] K dump closed (%lld vectors written)\n",
+                ctx->dump_count);
+        fclose(ctx->dump_fp);
+    }
     if (ctx->initialized) {
         sp_sqfree_cache_free(&ctx->cache);
     }
     free(ctx);
 }
 
-// Write/read wrappers — same interface as the WHT path
+// Write/read wrappers — same interface as the ship VHT2 path
 void sp_llama_sqfree_write_kv(sp_llama_sqfree_ctx_t *ctx,
                                int layer, int head, int pos,
                                const float *k_vec, const float *v_vec) {
+    if (ctx->dump_fp &&
+        (ctx->dump_limit == 0 || ctx->dump_count < ctx->dump_limit)) {
+        fwrite(k_vec, sizeof(float), ctx->dump_head_dim, ctx->dump_fp);
+        ctx->dump_count++;
+    }
     sp_sqfree_write_k(&ctx->cache, layer, head, pos, k_vec);
     sp_sqfree_write_v(&ctx->cache, layer, head, pos, v_vec);
 }

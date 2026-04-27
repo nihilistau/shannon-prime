@@ -20,7 +20,7 @@ Usage:
     python sp_benchmark.py --head-dim 64            # Mobile head_dim
     python sp_benchmark.py --config 5,5,4,3         # Specific config
     python sp_benchmark.py --n-vectors 1000         # More vectors for stable stats
-    python sp_benchmark.py --spectral               # Show WHT spectral analysis
+    python sp_benchmark.py --spectral               # Show VHT2 spectral analysis
 """
 
 import sys
@@ -107,7 +107,7 @@ def benchmark_config(head_dim: int, band_bits: list, n_vectors: int = 500,
 
 def spectral_analysis(head_dim: int):
     """
-    Show WHT spectral energy distribution for RoPE-like vs random vectors.
+    Show VHT2 spectral energy distribution for RoPE-like vs random vectors.
     This is the foundational observation: K concentrates, V doesn't.
     """
     n_bands = 4

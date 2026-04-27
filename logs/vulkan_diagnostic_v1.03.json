@@ -1,0 +1,23 @@
+{
+  "date": "2026-04-18T08:15:00Z",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "env_used": {"SHANNON_PRIME_VULKAN_VALIDATE": "1", "SHANNON_PRIME_VULKAN_FORCE_GPU": "1"},
+  "prior_state_v1.02": "vk_compress_one / vk_decompress_one routed through CPU staged VHT2; GPU dispatch guessed to hit VK_ERROR_DEVICE_LOST at first vkWaitForFences on RTX 2060",
+  "v1.03_finding": "GPU dispatch runs to completion without VK_ERROR_DEVICE_LOST — the crash hypothesis is no longer reproducing. The 4-shader pipeline (vilenkin → mobius → band_quantize → band_dequantize) completes and returns data. Correlation is wrong but not zero.",
+  "measured_correlations": {
+    "K_pipeline": 0.6159,
+    "V_pipeline": 0.6309,
+    "Batch_K_8_positions_avg": 0.5329
+  },
+  "required_correlations": {"K": 0.990, "V": 0.950, "Batch": 0.990},
+  "interpretation": "Shader semantics drift vs CPU reference — output is correlated with input (not random) but substantially wrong. Likely culprits (need RenderDoc + instrumented shader to isolate): (a) 1/sqrt(p) per-stage normalisation mismatch inside vilenkin.comp; (b) Möbius gather/scatter ordering; (c) per-band amax reduction in band_quantize.comp not matching the CPU reference's layout. None of these are the DEVICE_LOST fear the comment blocks predicted.",
+  "next_actions": [
+    "Instrument vilenkin.comp with a single-stage output dump and compare against sp_vht2_forward_f32 byte-for-byte on a known input.",
+    "Register VK_EXT_debug_utils callback so the Khronos validation layer's findings reach stderr instead of the VK debug channel.",
+    "Once shader parity is achieved, flip the default in vk_compress_one to force_gpu=1."
+  ],
+  "log": "logs/vulkan_validate_force_gpu.log",
+  "files_changed": {
+    "backends/vulkan/shannon_prime_vulkan.c": "added SHANNON_PRIME_VULKAN_FORCE_GPU=1 env gate on vk_compress_one + vk_decompress_one so the GPU dispatch can be exercised without disabling the default CPU fallback"
+  }
+}

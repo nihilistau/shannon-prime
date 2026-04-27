@@ -1,0 +1,25 @@
+{
+  "date": "2026-04-18T16:50:00Z",
+  "device": "Samsung SM-S908E (Galaxy S22 Ultra)",
+  "adb_address": "192.168.8.110:42747 via adb 36.0.2",
+  "cpu": "Qualcomm Snapdragon 8 Gen 1 (4× Cortex-X2/A710 + 4× A510)",
+  "binary": "/data/local/tmp/sp_v107/llama-perplexity (fresh shannon-prime v1.08 Android build)",
+  "build_commit": "953a02e",
+  "model": "Dolphin3.0-Llama3.2-1B-Q8_0",
+  "head_dim": 64,
+  "wikitext": "/data/local/tmp/vht2/wiki.test.raw",
+  "ctx": 2048,
+  "chunks": 8,
+  "device_flag": "--device none (CPU NEON path; Adreno Vulkan dispatch is not on the shadow-cache path)",
+  "results": [
+    { "config": "baseline (no SP)",                "k_bits": "-",         "ppl": 10.7156, "delta_pct":  0.000, "sec_per_pass": 32.42 },
+    { "config": "ship",                            "k_bits": "5,5,4,3",   "ppl": 10.7443, "delta_pct": +0.268, "sec_per_pass": 33.72 },
+    { "config": "sqfree+spinor 5×(5,4,4,4,5)",    "k_bits": "5,4,4,4,5", "ppl": 11.0910, "delta_pct": +3.504, "sec_per_pass": 56.32 }
+  ],
+  "findings": [
+    "Android SP hook works end-to-end on S22 Ultra — the v1.05 backend-aware gather/scatter fix lets the post-decode hook run against CPU-resident KV cleanly.",
+    "Ship 5,5,4,3 costs +0.27% PPL at essentially no throughput overhead (33.7 vs 32.4 s/pass) on the 1B model. This matches the desktop CUDA ship result (+0.45%).",
+    "sqfree+spinor 5,4,4,4,5 costs +3.5% PPL and ~1.7× per-pass time on Dolphin-1B — consistent with the scaling law floor (Dolphin 1B Q8 safe K-corr ≈ 0.988; the sqfree path pushes K-corr lower than the ship path). sqfree+spinor is a hd=128 / larger-model feature; this re-confirms the 'use ship path on smaller/more-quantised models' guidance in CLAUDE.md.",
+    "Vulkan compute path on Adreno 730 is still out of scope for the shadow cache (same shader-blob-layout limit as desktop v1.08). --device none routes everything through the CPU NEON path which is already validated at 14/14 via test_adreno."
+  ]
+}

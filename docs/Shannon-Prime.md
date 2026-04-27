@@ -10,7 +10,7 @@
 
 Shannon-Prime is a KV cache compression system for transformer models that exploits a structural property no other system uses: the multiplicative lattice of the integers encoded by rotary position embeddings.
 
-Every modern transformer uses RoPE (Rotary Position Embedding) to give tokens position awareness. RoPE applies angular rotations to key vectors at specific frequencies. Shannon-Prime's insight is that these angular rotations create predictable spectral structure — when you apply the Walsh-Hadamard Transform to a K vector, the energy concentrates in the first spectral bands. V vectors, which carry content rather than position, have uniform energy across all bands.
+Every modern transformer uses RoPE (Rotary Position Embedding) to give tokens position awareness. RoPE applies angular rotations to key vectors at specific frequencies. Shannon-Prime's insight is that these angular rotations create predictable spectral structure — when you apply the Vilenkin-Hartley Transform (VHT2) to a K vector, the energy concentrates in the first spectral bands. V vectors, which carry content rather than position, have uniform energy across all bands. At n=2^k, VHT2 reduces to the classical Walsh-Hadamard Transform scaled by 1/√2 per stage.
 
 This asymmetry is the foundation. K and V are structurally different signals. They should be compressed differently.
 
@@ -31,7 +31,7 @@ The system achieves **3.4–3.8× total KV compression at less than 1.25% perple
               │    │  Shadow Cache     │              │
               │    │                   │              │
               │    │  Write path:      │              │
-              │    │  K/V → WHT →      │              │
+              │    │  K/V → VHT2 →     │              │
               │    │  Möbius reorder → │              │
               │    │  Band quantize → │              │
               │    │  Store (3.4×     │              │
@@ -40,7 +40,7 @@ The system achieves **3.4–3.8× total KV compression at less than 1.25% perple
               │    │  Read path:       │              │
               │    │  Load → Dequant → │              │
               │    │  Unreorder →      │              │
-              │    │  Inverse WHT →    │              │
+              │    │  VHT2 (self-inv) →│              │
               │    │  K/V              │              │
               │    └────┬─────────┬────┘              │
               │         │         │                   │
@@ -59,15 +59,15 @@ Shannon-Prime intercepts KV vectors **after** RoPE is applied to K and **before*
 Each vector goes through five stages:
 
 ```
-Write: raw KV → WHT → Möbius reorder → Band quantize → Store
-Read:  Load → Band dequantize → Möbius unreorder → Inverse WHT → KV
+Write: raw KV → VHT2 → Möbius reorder → Band quantize → Store
+Read:  Load → Band dequantize → Möbius unreorder → VHT2 (self-inverse) → KV
 ```
 
-**WHT (Walsh-Hadamard Transform):** A self-inverse butterfly transform. Takes a vector and decomposes it into spectral components. K vectors with RoPE show strong concentration — 80%+ of energy in the first half of bands. V vectors are uniform. This is the Z/2Z case of the Vilenkin-Hartley basis described in the companion papers.
+**VHT2 (Vilenkin-Hartley Transform):** A staged, orthonormal, self-inverse transform. Each p-stage is already normalised by 1/√p, so there is no 1/N on the inverse — `VHT2(VHT2(x)) = x`. Takes a vector and decomposes it into spectral components. K vectors with RoPE show strong concentration — 80%+ of energy in the first half of bands. V vectors are uniform. At n=2^k, VHT2 reduces to the classical Walsh-Hadamard butterfly scaled by 1/√2 per stage; on squarefree-padded dimensions it factors across small primes {2,3,5,7,11}.
 
-**Möbius reorder:** Rearranges WHT coefficients so squarefree indices come first. The Möbius function μ(n) identifies which indices carry independent information versus structural echoes. This reordering ensures the highest-information coefficients get the most quantization bits. Free quality improvement: +0.14 PPL at identical storage. Cross-platform invariant — K correlation 0.997 on both hd=128 and hd=64.
+**Möbius reorder:** Rearranges VHT2 coefficients so squarefree indices come first. The Möbius function μ(n) identifies which indices carry independent information versus structural echoes. This reordering ensures the highest-information coefficients get the most quantization bits. Free quality improvement: +0.14 PPL at identical storage. Cross-platform invariant — K correlation 0.997 on both hd=128 and hd=64.
 
-**Band quantize:** Splits the reordered coefficients into 4 equal bands. Each band gets its own fp16 scale factor and packed signed integers at a specified bit depth. The allocation follows WHT energy decay:
+**Band quantize:** Splits the reordered coefficients into 4 equal bands. Each band gets its own fp16 scale factor and packed signed integers at a specified bit depth. The allocation follows VHT2 energy decay:
 
 | Band | Energy | Bits | Role |
 |------|--------|------|------|
@@ -87,9 +87,9 @@ The companion papers ("Position Is Arithmetic" and "The KV Cache Is a View") est
 3. The zeta zeros encode the prime harmonic structure via the explicit formula.
 4. Therefore the multiplicative lattice generated by primes provides a natural spectral basis for positional encoding.
 
-The Walsh-Hadamard Transform is the Z/2Z case of this spectral basis. The Vilenkin-Hartley Transform extends it to the full multi-prime decomposition (Z/2Z × Z/3Z × Z/5Z × ...). When the full Vilenkin basis is used at 95% energy threshold, Walsh catastrophically fails (PPL +477%) while Vilenkin achieves +9.9% — proving the multiplicative structure is real and measurable.
+At n=2^k, VHT2 reduces to the classical Walsh-Hadamard Transform — the Z/2Z case of this spectral basis. On squarefree-padded dimensions VHT2 extends to the full multi-prime decomposition (Z/2Z × Z/3Z × Z/5Z × ...). When the full multi-prime VHT2 is used at 95% energy threshold, pure p=2 catastrophically fails (PPL +477%) while the multi-prime VHT2 achieves +9.9% — proving the multiplicative structure is real and measurable.
 
-Shannon-Prime as shipped uses the WHT (Z/2Z) path because it works with all power-of-2 head dimensions. The Vilenkin path is included as a research extension for teams working on non-power-of-2 architectures or seeking maximum compression.
+Shannon-Prime as shipped uses the VHT2 at p=2 path because it works with all power-of-2 head dimensions. The sqfree (multi-prime) VHT2 path is included as a research extension for teams working on non-power-of-2 architectures or seeking maximum compression.
 
 ## Key Results
 
@@ -104,7 +104,7 @@ Critical rules discovered through experimentation:
 
 1. **Skeleton size must equal head_dim.** Using sk=32 on hd=64 gives PPL +47%.
 2. **3-bit floor.** 2-bit on any band is catastrophic — the quantization error exceeds the signal.
-3. **5/5/4/3 mirrors WHT energy decay.** Each band's optimal bit depth tracks its energy.
+3. **5/5/4/3 mirrors VHT2 energy decay.** Each band's optimal bit depth tracks its energy.
 4. **4 bands beats 5 or 8.** The 2-byte fp16 scale overhead per band erases gains from finer granularity.
 5. **Flat beats banded for V.** No exceptions across the entire sweep.
 
@@ -148,3 +148,31 @@ Code released prior to April 12, 2026 (tagged v1.0-public-domain) was released u
 Ray Daniels — raydaniels@gmail.com
 
 For commercial licensing, research collaboration, or questions about integration.
+
+<!-- SP-MEASURED-RESULTS:BEGIN -->
+
+_Auto-generated from `logs/*.json` on 2026-04-17 22:04 UTC_
+
+### KV cache perplexity (VHT2 ship vs sqfree aggressive)
+
+| Model | Backend | Config | Median PPL | Ctx/Chunks | Date |
+|---|---|---|---|---|---|
+| Dolphin3.0-Llama3.2-1B-Q8_0 | cuda | baseline | 10.7164 | 2048/8 | 2026-04-18T01:35:00Z |
+| Dolphin3.0-Llama3.2-1B-Q8_0 | cuda | ship | 10.7698 | 2048/8 | 2026-04-18T01:38:00Z |
+| Dolphin3.0-Llama3.2-1B-Q8_0 | cuda | sqfree+spinor | 13.3277 | 2048/8 | 2026-04-18T01:48:00Z |
+| Qwen3-8B-Q8_0 | cuda | baseline | 8.6746 | 4096/8 | 2026-04-18T01:50:00Z |
+| Qwen3-8B-Q8_0 | cuda | ship | 8.7051 | 4096/8 | 2026-04-18T02:15:00Z |
+| Qwen3-8B-Q8_0 | cuda | sqfree+spinor | 8.8265 | 4096/8 | 2026-04-18T03:00:00Z |
+| Qwen3-8B-Q8_0 | cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build) | sqfree+spinor 10×2 (catastrophic — below 3-bit floor) | 428.7779 | 2048/4 | 2026-04-18T07:55:00Z |
+| Qwen3-8B-Q8_0 | cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build) | sqfree+spinor 10×3 | 11.8324 | 2048/4 | 2026-04-18T07:40:00Z |
+| Qwen3-8B-Q8_0 | cuda-host-cpu (GGML_CUDA=OFF in current llama-cpp-sp build) | sqfree+spinor 10×auto (tools/sp_auto_bands.py → 4,4,4,4,4,3,3,3,3,3 @ total=35) | 10.0768 | 2048/4 | 2026-04-18T08:05:00Z |
+
+### Weight predictor + frequency injector
+
+| Model | Alpha | GGUF size | Sidecar | PPL baseline | PPL injected + ship | Date |
+|---|---|---|---|---|---|---|
+| Dolphin3.0-Llama3.2-1B-Q8_0 | 0.17 | 1,600,178,432 | 128 B | 10.7164 | 10.7698 | 2026-04-18T03:10:00Z |
+
+_sp_inject_freqs.py produces a byte-identical GGUF plus a 128-byte .sp_freq_factors.bin sidecar (32 × fp32). The current shannon-prime-llama integration in D:/F/llama-cpp-sp does not yet consume the sidecar at inference, so injection has zero effect on PPL in this measurement — consistent with the 'GGUF weight compression is still theoretical' memory note. The ship-path KV compression layered on top still hits spec (+0.50% PPL @ 3.4-3.8x)._
+
+<!-- SP-MEASURED-RESULTS:END -->

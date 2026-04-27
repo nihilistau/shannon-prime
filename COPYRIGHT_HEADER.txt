@@ -1,7 +1,0 @@
-// Shannon-Prime VHT2: Exact Spectral KV Cache Compression
-// Copyright (C) 2026 Ray Daniels. All Rights Reserved.
-//
-// Licensed under the GNU Affero General Public License v3.0 (AGPLv3).
-// Commercial license available — contact raydaniels@gmail.com
-//
-// See LICENSE in the project root for full terms.

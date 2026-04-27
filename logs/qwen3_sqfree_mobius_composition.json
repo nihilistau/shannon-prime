@@ -1,0 +1,39 @@
+{
+  "date": "2026-04-18T17:30:00Z",
+  "binary": "D:/F/llama-cpp-sp/build-cuda/bin/llama-perplexity.exe (GGML_CUDA=ON, shannon-prime-llama hook v1.12)",
+  "device": "NVIDIA GeForce RTX 2060 (sm_75)",
+  "model": "Qwen3-8B-Q8_0",
+  "head_dim": 128,
+  "pad_dim": 154,
+  "ctx": 4096,
+  "chunks": 8,
+  "kv_offload": "-nkvo (KV on CPU)",
+  "wikitext": "wiki.test.raw",
+  "experiment": "Does skeleton-level Möbius reorder (SHANNON_PRIME_MOBIUS=1) compose usefully on top of the sqfree+spinor path?",
+  "results": [
+    {
+      "config": "sqfree+spinor 5,4,4,4,5 (no skeleton Möbius)",
+      "env": {"SQFREE": "1", "SPINOR": "1", "MOBIUS": "0", "RESIDUAL_BITS": "3", "K_BITS": "5,4,4,4,5"},
+      "ppl": 8.8089,
+      "ppl_stderr": 0.19585
+    },
+    {
+      "config": "sqfree+spinor 5,4,4,4,5 + skeleton Möbius",
+      "env": {"SQFREE": "1", "SPINOR": "1", "MOBIUS": "1", "RESIDUAL_BITS": "3", "K_BITS": "5,4,4,4,5"},
+      "ppl": 8.8482,
+      "ppl_stderr": 0.19757,
+      "delta_pct_vs_baseline_in_table": 0.446,
+      "delta_sigma": "≈ 0.14σ (within 1σ of 0)"
+    }
+  ],
+  "interpretation": [
+    "The composition is measurable but sits within ±1σ of the unreordered run — borderline noise.",
+    "Directionally slightly worse, consistent with the Knight skeleton already selecting squarefree indices preferentially (the skeleton construction puts squarefree positions in first). An additional ship-style Möbius reorder on the already-squarefree-biased skeleton is redundant at best and mildly mismatched with the CSR predictor's assumptions at worst.",
+    "Not a Pareto win. Leave the default sqfree+spinor path without skeleton Möbius; keep SHANNON_PRIME_SQFREE_SKEL_MOBIUS/SHANNON_PRIME_MOBIUS=1 as a diagnostic switch in case the composition turns out useful on a different architecture or quant level."
+  ],
+  "caveats": [
+    "All PPL numbers in this repo's logs go through the llama.cpp post-decode hook (shannon-prime-llama patch). That hook runs a decompress → attention → recompress round-trip on every decode rather than storing compressed KV natively, which means the measured PPL includes whatever subtle state interactions the hook introduces on top of the pure compression math. This session alone surfaced four hook-specific bugs (GPU-resident KV memcpy segfault, vkCmdCopyBuffer barrier miss, CPU/GPU blob format mismatch, V-pipeline plumbing loss) that looked like compression-math bugs at first glance but weren't.",
+    "The shannon-prime-engine sibling repo (started today at scaffolding) is intended to be the bug-free reference measurement: it will store compressed KV natively from the write path and never round-trip through fp16. Once that engine runs perplexity end-to-end, every result in this file should be re-measured there before treating it as canonical. Today's numbers are directional, not publication-grade.",
+    "Empirically the ORDERING of results is stable across hook refactors in this session (ship < sqfree+spinor < 10-band-auto < 10-band-uniform-3 < catastrophic 10-band-uniform-2). Absolute values can drift; the Pareto-shape conclusions likely hold."
+  ]
+}

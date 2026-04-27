@@ -7,7 +7,7 @@
 // See LICENSE in the project root for full terms.
 
 // CUDA backend validation.
-// Exercises sp_cuda_cache on a real GPU. Backend-agnostic math (WHT
+// Exercises sp_cuda_cache on a real GPU. Backend-agnostic math (VHT2
 // round-trip, Möbius function, banded quantization, Vilenkin) is covered
 // by test_core; this suite verifies the GPU path produces equivalent
 // correlations through the CUDA API surface.

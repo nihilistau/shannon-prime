@@ -1,39 +1,22 @@
 # Build artifacts
-build/
 *.o
+*.a
 *.so
-*.dylib
-*.dll
+*.d
+*.elf
+*.map
 *.exe
-*.spv
-
-# Python
-__pycache__/
+*.pyd
 *.pyc
-*.pyo
-*.egg-info/
-dist/
-*.egg
+build/
+__pycache__/
+backends/cuda/build/
 
-# IDE
-.vscode/settings.json
-.idea/
-*.swp
-*.swo
-*~
+# Test/benchmark output and log files — do not commit
+logs/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# CUDA
-*.cubin
-*.ptx
-*.fatbin
-
-# Temporary
-*.tmp
-*.bak
+# Internal templates not for the published repo
+COPYRIGHT_HEADER.txt
 
 # Don't ignore these
 !.gitkeep

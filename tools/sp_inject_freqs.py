@@ -41,7 +41,7 @@ import shutil
 import numpy as np
 
 try:
-    from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType
+    from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType, GGUFValueType
     HAS_GGUF = True
 except ImportError:
     HAS_GGUF = False
@@ -295,34 +295,136 @@ def inject_frequencies(input_path: str, output_path: str,
         print(f"    mean:   {factors.mean():.4f}")
         print(f"    std:    {factors.std():.4f}")
 
-    # Copy the file and modify in-place would be complex with GGUF.
-    # Instead: copy the file, then use gguf library to add/update the tensor.
-    # The simplest approach: copy input to output, then append/modify.
+    # v1.03: produce a real modified GGUF that inserts a single shared
+    # `rope_freqs.weight` tensor (no `blk.<i>.` prefix) carrying the
+    # blended factors. llama.cpp's LLM_TENSOR_ROPE_FREQS resolves to the
+    # unqualified root name even though it's declared LAYER_REPEATING —
+    # every layer reads the same tensor via `get_rope_factors`. No
+    # runtime env or sidecar consumer is needed; loading the output
+    # GGUF is enough.
+    #
+    # Fall back to the legacy byte-identical copy + sidecar path when either
+    # the `gguf` package isn't importable or the block count cannot be
+    # determined from metadata.
 
-    # For now: copy the entire file, then document how to apply via llama.cpp
-    # command-line override (which is what the paper's production validation used).
-    shutil.copy2(input_path, output_path)
-
-    if verbose:
-        print(f"\n  Output written to: {output_path}")
-        print(f"  (byte-identical copy of the input; injection is served via")
-        print(f"   the companion .sp_freq_factors.bin sidecar at inference time)")
-        print(f"\n  To use with the Shannon-Prime llama.cpp integration:")
-        print(f"    SHANNON_PRIME_ENABLED=1")
-        print(f"    SHANNON_PRIME_ALPHA={alpha}")
-        print(f"    # The hook will read the sidecar next to the loaded GGUF")
-        print()
-
-    # Write the freq factors as a companion file for the llama.cpp integration
     factors_path = output_path.rsplit('.', 1)[0] + '.sp_freq_factors.bin'
     factors.tofile(factors_path)
+    if verbose:
+        print(f"\n  Freq factors sidecar: {factors_path}")
+        print(f"    ({n_freqs} × float32 = {n_freqs * 4} bytes, kept for debugging)")
+
+    n_layers = None
+    for field in reader.fields.values():
+        if field.name.endswith('.block_count'):
+            n_layers = int(field.parts[-1][0])
+            break
+
+    if not HAS_GGUF or n_layers is None:
+        shutil.copy2(input_path, output_path)
+        if verbose:
+            print(f"\n  Output written to: {output_path}")
+            print(f"  (legacy byte-identical path — gguf package missing or")
+            print(f"   block count not in metadata; load SHANNON_PRIME_SIDECAR={factors_path}")
+            print(f"   to apply via the llama.cpp integration)")
+        return factors
+
+    _rewrite_gguf_with_rope_freqs(reader, input_path, output_path,
+                                   arch=arch, n_layers=n_layers,
+                                   factors=factors.astype(np.float32),
+                                   verbose=verbose)
+    return factors
+
+
+def _rewrite_gguf_with_rope_freqs(reader, input_path, output_path,
+                                  arch, n_layers, factors, verbose=True):
+    """Rewrite `input_path` as `output_path` and inject `factors` as the
+    shared `rope_freqs.weight` tensor (read by every layer via
+    LLM_TENSOR_ROPE_FREQS — the tensor name carries no blk prefix even
+    though the category is LAYER_REPEATING).
+
+    Copies every field and existing tensor as-is; the only change is
+    replacing (or adding) the shared rope_freqs.weight. Uses the `gguf`
+    package that ships with llama.cpp / Hugging Face convert scripts.
+    """
+    writer = GGUFWriter(output_path, arch)
+
+    def _scalar_from(field, idx):
+        raw = field.parts[idx]
+        if field.types[0] == GGUFValueType.STRING:
+            return raw.tobytes().decode('utf-8', errors='replace')
+        return raw.tolist()[0] if hasattr(raw, 'tolist') and raw.shape else raw.item()
+
+    # --- copy metadata (skip architecture + GGUF-internal bookkeeping; the
+    # writer supplies header/version/counts itself) -------------------------
+    skip_keys = {'general.architecture', 'GGUF.version',
+                 'GGUF.tensor_count', 'GGUF.kv_count'}
+    for field in reader.fields.values():
+        if field.name in skip_keys:
+            continue
+        if len(field.types) == 0 or len(field.data) == 0:
+            continue
+        try:
+            if field.types[0] == GGUFValueType.ARRAY:
+                inner = field.types[-1]
+                if inner == GGUFValueType.STRING:
+                    values = [field.parts[di].tobytes().decode('utf-8', errors='replace')
+                              for di in field.data]
+                else:
+                    values = [field.parts[di].tolist()[0] if hasattr(field.parts[di], 'tolist') and field.parts[di].shape
+                              else field.parts[di].item()
+                              for di in field.data]
+                writer.add_array(field.name, values)
+            else:
+                val = _scalar_from(field, field.data[0])
+                writer.add_key_value(field.name, val, field.types[0])
+        except Exception as e:
+            if verbose:
+                print(f"  warning: skipping metadata field '{field.name}': {e}")
+
+    # --- copy tensors (streaming — don't load all into memory) -------------
+    # GGUFReader.tensors[i].data is a np.uint8 array in the raw packed byte
+    # layout the file uses. GGUFWriter.add_tensor with `raw_dtype=...` set
+    # and no explicit raw_shape takes tensor.shape (=byte shape) and calls
+    # quant_shape_from_byte_shape() internally to recover the logical shape.
+    # This matches the GGUFReader inverse exactly and is correct for both
+    # unquantised (F32/F16/BF16) and quantised (Q8_0/Q4_K_M/...) tensors.
+    #
+    # The special case: `rope_freqs.weight` is a single shared tensor (not
+    # per-layer — llama.cpp's LLM_TENSOR_ROPE_FREQS maps to the root name
+    # even though it's LAYER_REPEATING, so every layer reads the same
+    # tensor). If the input already has it, we REPLACE the data with our
+    # blended factors; otherwise we add it alongside the existing tensors.
+    ROPE_NAME = "rope_freqs.weight"
+    had_rope  = False
+    for ti in reader.tensors:
+        if ti.name == ROPE_NAME:
+            had_rope = True
+            writer.add_tensor(ROPE_NAME, factors,
+                              raw_shape=[factors.shape[0]],
+                              raw_dtype=GGMLQuantizationType.F32)
+        else:
+            writer.add_tensor(ti.name, ti.data, raw_dtype=ti.tensor_type)
+
+    if not had_rope:
+        writer.add_tensor(ROPE_NAME, factors,
+                          raw_shape=[factors.shape[0]],
+                          raw_dtype=GGMLQuantizationType.F32)
+
+    # --- write -------------------------------------------------------------
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
 
     if verbose:
-        print(f"  Freq factors saved to: {factors_path}")
-        print(f"  ({n_freqs} × float32 = {n_freqs * 4} bytes)")
-        print()
-
-    return factors
+        in_sz  = os.path.getsize(input_path)
+        out_sz = os.path.getsize(output_path)
+        delta  = out_sz - in_sz
+        action = "replaced rope_freqs.weight" if had_rope else "added rope_freqs.weight"
+        print(f"\n  Output GGUF: {output_path}")
+        print(f"  {action} ({factors.shape[0]} × fp32, shared across all {n_layers} layers)")
+        print(f"  Size: {in_sz:,} → {out_sz:,} bytes (delta {delta:+,})")
+        print(f"  No runtime env required — llama.cpp picks up rope_freqs via the standard loader.")
 
 
 # =============================================================================

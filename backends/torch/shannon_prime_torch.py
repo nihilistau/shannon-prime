@@ -31,7 +31,7 @@ from typing import Optional, Tuple, List
 #
 # VHT2 is the squarefree-prime-factor generalization of the Walsh-Hadamard
 # Transform. Each stage applies a p x p Hartley kernel — cas(θ) = cos(θ)+sin(θ)
-# — normalized by 1/√p. At p=2 the stage is exactly the WHT butterfly divided
+# — normalized by 1/√p. At p=2 the stage is exactly the Hadamard butterfly divided
 # by √2, and log2(N) stacked stages give an orthonormal transform with
 # VHT2(VHT2(x)) = x (no division by N on the inverse).
 #
@@ -108,30 +108,6 @@ def vht2(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# ----- Backwards-compatibility shims (deprecated, thin wrappers over vht2) ---
-# Kept so callers and existing tests that import `wht_inplace` / `iwht` keep
-# working through the transition. Both now route to the single self-inverse
-# VHT2 — meaning code that was doing `wht(x); wht(x); x.div_(n)` for a
-# round-trip should drop the division: one vht2() is the inverse of another.
-
-def wht_inplace(x: torch.Tensor) -> torch.Tensor:
-    """Deprecated alias — VHT2 on the last dim, result copied back into x.
-
-    VHT2 is self-inverse with 1/√p per stage, so applying this twice is the
-    identity (no division by N required).
-    """
-    result = vht2(x)
-    if result is not x and result.shape == x.shape:
-        x.copy_(result)
-        return x
-    return result
-
-
-def iwht(x: torch.Tensor) -> torch.Tensor:
-    """Deprecated alias — inverse VHT2 is VHT2 itself (self-inverse)."""
-    return wht_inplace(x)
-
-
 # ----- Sqfree pad helper (used when head_dim needs padding for VHT2) --------
 
 _SMALL_PRIMES_SQFREE = (2, 3, 5, 7, 11)
@@ -170,7 +146,7 @@ def sqfree_pad_dim(head_dim: int) -> int:
 
 class MobiusMask:
     """
-    Squarefree-first coefficient ordering for WHT coefficients.
+    Squarefree-first coefficient ordering for VHT2 coefficients.
     
     The Möbius function μ(n) is non-zero iff n is squarefree.
     Prioritizing squarefree indices during banded quantization
@@ -245,7 +221,7 @@ class MobiusMask:
 
 class BandedQuantizer:
     """
-    VHT2 banded quantization of WHT coefficients.
+    VHT2 banded quantization of spectral coefficients.
     
     Splits n coefficients into k equal bands. Each band gets:
       - 1 fp16 scale (max(abs(band)) / (2^(bits-1) - 1))
@@ -258,39 +234,65 @@ class BandedQuantizer:
       - Flat beats banded for V vectors (no exceptions)
     """
 
-    def __init__(self, n: int, band_bits: List[int]):
+    def __init__(self, n: int, band_bits: List[int],
+                 ternary_bands: Optional[List[int]] = None):
         self.n = n
         self.n_bands = len(band_bits)
         self.band_bits = band_bits
         self.band_size = n // self.n_bands
-        assert n % self.n_bands == 0, \
-            f"head_dim {n} must be divisible by n_bands {self.n_bands}"
+        # If n is not evenly divisible by n_bands, the last band absorbs the
+        # remainder (matches the C core's sp_band_span helper). For 10 bands
+        # at pad_dim=154 this means bands 0..8 have size 15, band 9 has size 19.
+        self._last_band_size = n - self.band_size * (self.n_bands - 1)
+        # Strange-attractor stack piece 4/4: bands listed here are quantized
+        # to ternary {-1, 0, +1} (≈1.58 bits/coefficient information content)
+        # regardless of band_bits[b]. The deadband threshold is fixed at
+        # scale*0.5, which is the L1-optimal quantizer for symmetric
+        # zero-mean signals. Empty list = identical to ship behavior.
+        self.ternary_bands = set(ternary_bands or [])
+
+    def _band_span(self, b: int) -> Tuple[int, int]:
+        start = b * self.band_size
+        size  = self._last_band_size if b == self.n_bands - 1 else self.band_size
+        return start, size
 
     def quantize(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
-        Quantize WHT coefficients into banded format.
-        
+        Quantize VHT2 coefficients into banded format.
+
         x: (..., n) float tensor
         Returns: (scales, quant_vals) per band
           scales[b]: (...,) fp16 scale
-          quant_vals[b]: (..., band_size) int8/int16 quantized values
+          quant_vals[b]: (..., band_size_b) int8/int16 quantized values
         """
         scales = []
         quant_vals = []
 
         for b in range(self.n_bands):
-            start = b * self.band_size
-            end   = start + self.band_size
+            start, size = self._band_span(b)
+            end   = start + size
             band  = x[..., start:end]
-            bits  = self.band_bits[b]
-            max_val = (1 << (bits - 1)) - 1
 
-            # Scale per vector
-            amax = band.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
-            scale = amax / max_val
-
-            # Quantize
-            q = (band / scale).round().clamp(-max_val, max_val).to(torch.int8)
+            if b in self.ternary_bands:
+                # Ternary {-1, 0, +1}: scale = amax (no max_val division).
+                # Deadband at scale*0.5 — values in [-0.5,0.5]·amax round to 0.
+                # This is the L1-optimal three-level quantizer for symmetric
+                # zero-mean signals and matches the "1.58-bit" information
+                # content the strange-attractor stack predicts is enough
+                # for the noise tail.
+                amax  = band.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
+                scale = amax
+                normalized = band / scale  # in [-1, 1]
+                # Round to nearest of {-1, 0, +1}: > 0.5 → +1, < -0.5 → -1, else 0
+                q = torch.zeros_like(normalized, dtype=torch.int8)
+                q = torch.where(normalized >  0.5, torch.ones_like(q),  q)
+                q = torch.where(normalized < -0.5, -torch.ones_like(q), q)
+            else:
+                bits  = self.band_bits[b]
+                max_val = (1 << (bits - 1)) - 1
+                amax = band.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-12)
+                scale = amax / max_val
+                q = (band / scale).round().clamp(-max_val, max_val).to(torch.int8)
 
             scales.append(scale.squeeze(-1).half())
             quant_vals.append(q)
@@ -300,13 +302,18 @@ class BandedQuantizer:
     def dequantize(self, scales: List[torch.Tensor],
                    quant_vals: List[torch.Tensor]) -> torch.Tensor:
         """
-        Dequantize banded format back to float WHT coefficients.
+        Dequantize banded format back to float VHT2 coefficients.
         
         Returns: (..., n) float tensor
         """
         bands = []
         for b in range(self.n_bands):
             scale = scales[b].float().unsqueeze(-1)
+            # Mirror the C core guard: an fp16 scale that round-trips to
+            # +/-Inf or NaN (amax overflowed fp16 on encode) must not
+            # propagate into the inverse VHT2. Zero the scale; the band
+            # then decodes as all zeros, matching CPU semantics.
+            scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
             q     = quant_vals[b].float()
             bands.append(q * scale)
 
@@ -314,10 +321,19 @@ class BandedQuantizer:
 
     def compressed_bytes_per_vec(self) -> int:
         """Bytes per compressed vector."""
+        import math as _math
         total = 0
-        for bits in self.band_bits:
+        for b, bits in enumerate(self.band_bits):
+            _, size = self._band_span(b)
             total += 2  # fp16 scale
-            total += (self.band_size * bits + 7) // 8  # packed data
+            if b in self.ternary_bands:
+                # Ternary 5-per-byte packing target: ceil(size * log2(3) / 8).
+                # Current quantize() returns int8 because pack/unpack lives in
+                # the C/CUDA layers; this is the post-pack byte count for the
+                # compression-ratio honesty check.
+                total += int(_math.ceil(size * _math.log2(3) / 8))
+            else:
+                total += (size * bits + 7) // 8  # packed data
         return total
 
 
@@ -352,6 +368,8 @@ class ShadowCache:
         max_seq_len: int = 4096,
         k_band_bits: List[int] = [5, 5, 4, 3],
         v_band_bits: List[int] = [3],
+        k_ternary_bands: Optional[List[int]] = None,
+        v_ternary_bands: Optional[List[int]] = None,
         use_mobius: bool = True,
         # ---- Progressive-enhancement flags (default off = classic ship path) --
         use_sqfree_pad: bool = False,
@@ -388,11 +406,14 @@ class ShadowCache:
             # imports BandedQuantizer from this module.
             from shannon_prime_sqfree import SqfreeShadowCache  # type: ignore
 
-            # The sqfree path uses a 5-band torus-aligned default. If the
-            # caller passed a 4-band WHT-style list, promote to the sqfree
-            # preset so the BandedQuantizer has an even split over the
-            # Knight skeleton size.
-            sqfree_bands = list(k_band_bits) if len(k_band_bits) == 5 else [5, 4, 4, 4, 5]
+            # Torus-aligned 5-band [5,4,4,4,5] is the sqfree default, but since
+            # v1.03 any count in [1, SP_MAX_BANDS] is honoured (matches the C
+            # core, CUDA kernel, and tools/sp_auto_bands.py's 10-band output).
+            # Only fall back when the caller passed nothing.
+            SP_MAX_BANDS = 16
+            sqfree_bands = (list(k_band_bits)
+                            if k_band_bits and 1 <= len(k_band_bits) <= SP_MAX_BANDS
+                            else [5, 4, 4, 4, 5])
             self._impl = SqfreeShadowCache(
                 head_dim=head_dim,
                 n_layers=n_layers,
@@ -412,10 +433,19 @@ class ShadowCache:
             self.mobius = None  # sqfree path has its own mobius state
             return
 
-        # ---- Classic WHT ship path (behavior identical to v1.0) ----------
+        # ---- Classic VHT2 ship path (behavior identical to v1.0) ---------
+        # Strange-attractor stack piece 4/4: optional ternary noise-tail.
+        # When k_ternary_bands=[3] and k_band_bits=[5,5,4,3], band 3 is
+        # quantized to {-1, 0, +1} instead of 3-bit signed. The 5/5/4/1.58
+        # configuration tests whether the noise-tail can be reduced to
+        # ternary without quality loss (per the multiplicative-lattice
+        # scaling-law equation, head_dim=128 + bf16-class models should
+        # tolerate this).
         self._impl = None
-        self.k_quantizer = BandedQuantizer(head_dim, k_band_bits)
-        self.v_quantizer = BandedQuantizer(head_dim, v_band_bits)
+        self.k_quantizer = BandedQuantizer(head_dim, k_band_bits,
+                                           ternary_bands=k_ternary_bands)
+        self.v_quantizer = BandedQuantizer(head_dim, v_band_bits,
+                                           ternary_bands=v_ternary_bands)
         self.mobius = MobiusMask(head_dim) if use_mobius else None
 
         # Storage: lists of (scales, quant_vals) per position
@@ -486,10 +516,6 @@ class ShadowCache:
         # Inverse == forward for the self-inverse VHT2 (no div by N).
         x = vht2(x.unsqueeze(0)).squeeze(0)
 
-        # NaN / overflow guard for aggressive bit configs
-        x = torch.clamp(x, -65504.0, 65504.0)
-        x = torch.nan_to_num(x, nan=0.0)
-
         return x
 
     def read_v(self, layer: int, head: int, pos: int) -> torch.Tensor:
@@ -505,9 +531,6 @@ class ShadowCache:
 
         # Inverse == forward VHT2 (no div by N — self-inverse).
         x = vht2(x.unsqueeze(0)).squeeze(0)
-
-        x = torch.clamp(x, -65504.0, 65504.0)
-        x = torch.nan_to_num(x, nan=0.0)
 
         return x
 

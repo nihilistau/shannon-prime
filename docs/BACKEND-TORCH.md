@@ -10,8 +10,7 @@ All in `backends/torch/shannon_prime_torch.py`:
 
 | Class / Function | Purpose |
 |-----------------|---------|
-| `vht2(x)` | **The** transform — staged Hartley on the last dim (any dim factoring into {2,3,5,7,11}), orthonormal, self-inverse (`vht2(vht2(x)) ≈ x` with no 1/N). At p=2 this is the WHT butterfly scaled by 1/√2. |
-| `wht_inplace(x)` / `iwht(x)` | Deprecated aliases that now route to `vht2`. Old callers that did `wht_inplace(x); ...; wht_inplace(x); x.div_(n)` for a round-trip should drop the division. |
+| `vht2(x)` | **The** transform — staged Hartley on the last dim (any dim factoring into {2,3,5,7,11}), orthonormal, self-inverse (`vht2(vht2(x)) ≈ x` with no 1/N). At n=2^k this reduces to the classical Walsh-Hadamard butterfly scaled by 1/√2 per stage. |
 | `sqfree_pad_dim(head_dim)` | Next squarefree multiple of {2,3,5,7,11} ≥ head_dim (64 → 66, 128 → 154, 256 → 330). |
 | `MobiusMask(n)` | Squarefree-first coefficient reordering. |
 | `BandedQuantizer(n, bits)` | Per-band abs-max quantization to int8. |
@@ -63,11 +62,11 @@ print(f"Ratio:      {mem['ratio']:.1f}×")
 
 ```python
 import torch
-from shannon_prime_torch import wht_inplace, MobiusMask, BandedQuantizer
+from shannon_prime_torch import vht2, MobiusMask, BandedQuantizer
 
-# WHT on a batch of vectors
+# VHT2 at p=2 on a batch of vectors (self-inverse, operates on last dim)
 vectors = torch.randn(16, 128)  # 16 vectors of dim 128
-wht_inplace(vectors)            # In-place, operates on last dim
+vectors = vht2(vectors)
 
 # Möbius reorder
 mask = MobiusMask(128)
@@ -125,4 +124,4 @@ cd shannon-prime
 python3 tests/test_torch.py  # 28 tests
 ```
 
-Validates: WHT roundtrip (hd=32–256), Möbius function values, Möbius roundtrip, all 5 banded quant configs, K/V spectral asymmetry, Vilenkin roundtrip (2/3/4-prime), full pipeline, Möbius quality improvement, compression ratios, and memory estimation.
+Validates: VHT2 round-trip (hd=32–256, self-inverse, no 1/N), Möbius function values, Möbius roundtrip, all 5 banded quant configs, K/V spectral asymmetry, sqfree VHT2 roundtrip (2/3/4-prime), full pipeline, Möbius quality improvement, compression ratios, and memory estimation.

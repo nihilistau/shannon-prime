@@ -8,15 +8,18 @@
 
 // GLSL Compute Shader: Möbius squarefree-first permutation
 //
-// Reorders WHT coefficients so squarefree indices come first.
+// Reorders VHT2 coefficients so squarefree indices come first.
 // This is a gather operation: output[i] = input[order[i]]
 //
-// The Möbius mask is a property of the WHT spectrum, not the model.
+// The Möbius mask is a property of the VHT2 spectrum, not the model.
 // Cross-platform invariant: K correlation 0.997 on both hd=128 and hd=64.
 
 #version 450
 
-layout(local_size_x = 128) in;
+// 256 threads per workgroup covers the full SP_MAX_HEAD_DIM; the strided
+// loop below also handles any future n > local_size_x without a second
+// dispatch.
+layout(local_size_x = 256) in;
 
 layout(set = 0, binding = 0) readonly buffer Input {
     float input_data[];
@@ -39,10 +42,10 @@ void main() {
     uint vec_idx = gl_WorkGroupID.x;
     uint tid     = gl_LocalInvocationID.x;
 
-    if (vec_idx >= n_vecs || tid >= n) return;
+    if (vec_idx >= n_vecs) return;
 
-    uint out_off = vec_idx * n + tid;
-    uint in_off  = vec_idx * n + uint(order[tid]);
-
-    output_data[out_off] = input_data[in_off];
+    uint base = vec_idx * n;
+    for (uint i = tid; i < n; i += gl_WorkGroupSize.x) {
+        output_data[base + i] = input_data[base + uint(order[i])];
+    }
 }

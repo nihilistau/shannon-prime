@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 #include <math.h>
 #include <stdio.h>
 #include <float.h>
@@ -20,7 +21,7 @@
 // VHT2 Butterfly Kernel (p=2 stage of the Vilenkin-Hartley transform)
 // ============================================================================
 //
-// Staged in-place Hartley transform. At p=2 the stage is the classic WHT
+// Staged in-place Hartley transform. At p=2 the stage is the Hadamard
 // butterfly scaled by 1/√2 per stage — self-inverse after log2(N) stages.
 // Non-power-of-2 dimensions dispatch to the general staged kernel in
 // shannon_prime_sqfree.cu (kernel_vilenkin_inplace), which handles the
@@ -33,7 +34,7 @@
 // This is bandwidth-bound, not compute-bound — fine for KV cache writes
 // which happen once per token per layer.
 
-__global__ void kernel_wht_inplace(float *data, int n) {
+__global__ void kernel_vht2_p2(float *data, int n) {
     extern __shared__ float smem[];
 
     int vec_idx = blockIdx.x;              // Which vector
@@ -48,7 +49,7 @@ __global__ void kernel_wht_inplace(float *data, int n) {
 
     // Butterfly passes — each stage is a p=2 Hartley kernel normalised by
     // 1/√2. After log2(N) stages the total scale is 1/√N, making the whole
-    // transform orthonormal and self-inverse (kernel_wht_inplace applied
+    // transform orthonormal and self-inverse (kernel_vht2_p2 applied
     // twice returns the original vector, no /N).
     const float inv_sqrt2 = 0.70710678118654752440f;
     for (int len = 1; len < n; len <<= 1) {
@@ -73,21 +74,11 @@ __global__ void kernel_wht_inplace(float *data, int n) {
     }
 }
 
-// Inverse WHT = forward WHT followed by 1/N scaling
-__global__ void kernel_iwht_scale(float *data, int n, float inv_n) {
-    int vec_idx = blockIdx.x;
-    int tid     = threadIdx.x;
-
-    if (tid < n) {
-        data[(size_t)vec_idx * n + tid] *= inv_n;
-    }
-}
-
 // ============================================================================
 // Möbius Permutation Kernel
 // ============================================================================
 //
-// Applies the squarefree-first reordering to WHT coefficients.
+// Applies the squarefree-first reordering to VHT2 coefficients.
 // order[i] = source index for position i in reordered vector.
 // Each thread handles one element.
 
@@ -138,7 +129,7 @@ __global__ void kernel_mobius_unreorder(const float *input, float *output,
 // Batch kernels for prefill use the parallel version below.
 
 __global__ void kernel_band_quantize_simple(
-    const float *input,   // [n_vecs][n] WHT coefficients
+    const float *input,   // [n_vecs][n] VHT2 coefficients
     uint8_t *output,      // [n_vecs][total_bytes] packed output
     int n,                // head_dim
     int n_bands,
@@ -156,21 +147,27 @@ __global__ void kernel_band_quantize_simple(
     int offset = 0;
 
     for (int b = 0; b < n_bands; b++) {
-        const float *band = vec + b * band_size;
+        int band_off = b * band_size;
+        int band_sz  = (b == n_bands - 1) ? (n - band_off) : band_size;
+        const float *band = vec + band_off;
         int bits = band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
 
         // Find max absolute value
         float amax = 0.0f;
-        for (int i = 0; i < band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             float a = fabsf(band[i]);
             if (a > amax) amax = a;
         }
 
         float scale = (amax > 0.0f) ? amax / (float)max_val : 0.0f;
-        float inv_scale = (scale > 0.0f) ? 1.0f / scale : 0.0f;
 
-        // Store scale as fp16
+        // Store scale as fp16 first, then recompute inv_scale from the
+        // stored fp16 value. This eliminates the quantize/dequantize
+        // asymmetry: dequantize reads scale from fp16, so quantize must
+        // use the same (rounded) value. Without this, variance-ranked
+        // coefficients in band 0 (highest information) accumulate a
+        // systematic error that shows up as PPL regression.
         __half scale_h = __float2half(scale);
         unsigned short scale_bits;
         memcpy(&scale_bits, &scale_h, sizeof(unsigned short));
@@ -178,11 +175,14 @@ __global__ void kernel_band_quantize_simple(
         out[offset + 1] = (scale_bits >> 8) & 0xFF;
         offset += 2;
 
+        float scale_stored = __half2float(scale_h);
+        float inv_scale = (scale_stored > 0.0f) ? 1.0f / scale_stored : 0.0f;
+
         // Pack quantized values
         unsigned long long bit_buffer = 0;
         int bit_pos = 0;
 
-        for (int i = 0; i < band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             int q = __float2int_rn(band[i] * inv_scale);
             if (q > max_val)  q = max_val;
             if (q < -max_val) q = -max_val;
@@ -226,17 +226,23 @@ __global__ void kernel_band_dequantize_simple(
     int offset = 0;
 
     for (int b = 0; b < n_bands; b++) {
-        float *band = vec + b * band_size;
+        int band_off = b * band_size;
+        int band_sz  = (b == n_bands - 1) ? (n - band_off) : band_size;
+        float *band = vec + band_off;
         int bits = band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
         unsigned int mask = (1u << bits) - 1;
 
-        // Read scale
+        // Read scale. Mirror the CPU core's non-finite guard: if the fp16 scale
+        // round-trips to +/-Inf or NaN (amax overflowed fp16 range on encode),
+        // zero the band so the inverse VHT2 stays finite instead of cascading
+        // NaN through the attention path.
         unsigned short scale_bits = (unsigned short)in[offset] |
                                     ((unsigned short)in[offset + 1] << 8);
         __half scale_h;
         memcpy(&scale_h, &scale_bits, sizeof(__half));
         float scale = __half2float(scale_h);
+        if (!isfinite(scale)) scale = 0.0f;
         offset += 2;
 
         // Unpack
@@ -244,7 +250,7 @@ __global__ void kernel_band_dequantize_simple(
         int bit_pos = 0;
         int byte_idx = offset;
 
-        for (int i = 0; i < band_size; i++) {
+        for (int i = 0; i < band_sz; i++) {
             while (bit_pos < bits) {
                 bit_buffer |= ((unsigned long long)in[byte_idx++] << bit_pos);
                 bit_pos += 8;
@@ -258,29 +264,8 @@ __global__ void kernel_band_dequantize_simple(
             band[i] = (float)q * scale;
         }
 
-        int data_bits = band_size * bits;
+        int data_bits = band_sz * bits;
         offset += (data_bits + 7) / 8;
-    }
-}
-
-// ============================================================================
-// NaN Guard Kernel
-// ============================================================================
-
-__global__ void kernel_nan_guard(float *data, int n, float max_mag) {
-    int vec_idx = blockIdx.x;
-    int tid     = threadIdx.x;
-
-    if (tid < n) {
-        size_t idx = (size_t)vec_idx * n + tid;
-        float val = data[idx];
-        if (!isfinite(val)) {
-            data[idx] = 0.0f;
-        } else if (val > max_mag) {
-            data[idx] = max_mag;
-        } else if (val < -max_mag) {
-            data[idx] = -max_mag;
-        }
     }
 }
 
@@ -320,7 +305,7 @@ void sp_cuda_vht2_forward(float *d_data, int n, int n_vecs, void *stream) {
     if (n > 0 && (n & (n - 1)) == 0) {
         // Power of 2: fast butterfly with per-stage 1/√2 normalisation
         int smem_bytes = n * sizeof(float);
-        kernel_wht_inplace<<<n_vecs, n, smem_bytes, s>>>(d_data, n);
+        kernel_vht2_p2<<<n_vecs, n, smem_bytes, s>>>(d_data, n);
         return;
     }
     // General path via the sqfree staged Hartley kernel
@@ -339,17 +324,6 @@ void sp_cuda_vht2_forward(float *d_data, int n, int n_vecs, void *stream) {
     sp_cuda_vilenkin_inplace(d_data, n, n_vecs, d_factors, nf, s);
     cudaStreamSynchronize(s);
     cudaFree(d_factors);
-}
-
-// Deprecated aliases — both now call the self-inverse VHT2. Old callers that
-// did forward-then-inverse-with-1/N will naturally drop the /N scaling as
-// they're updated to use sp_cuda_vht2_forward directly.
-void sp_cuda_wht_inplace(float *d_data, int n, int n_vecs, void *stream) {
-    sp_cuda_vht2_forward(d_data, n, n_vecs, stream);
-}
-
-void sp_cuda_iwht_inplace(float *d_data, int n, int n_vecs, void *stream) {
-    sp_cuda_vht2_forward(d_data, n, n_vecs, stream);
 }
 
 void sp_cuda_mobius_reorder(float *d_data, const int *d_order,
@@ -379,7 +353,11 @@ void sp_cuda_band_quantize(const float *d_input, void *d_output,
                            const sp_band_config_t *bc,
                            int n_vecs, void *stream) {
     cudaStream_t s = (cudaStream_t)stream;
-    int n = bc->band_size * bc->n_bands;
+    // Must be the logical head_dim, not band_size * n_bands. The kernel
+    // uses `n` as both the per-vector stride AND the last-band upper
+    // bound, so when head_dim % n_bands != 0 (e.g. 10 bands @ hd=128)
+    // multiplying silently orphans the tail coefficients.
+    int n = bc->head_dim;
 
     // Upload band_bits to device
     int *d_band_bits;
@@ -404,7 +382,7 @@ void sp_cuda_band_dequantize(const void *d_input, float *d_output,
                              const sp_band_config_t *bc,
                              int n_vecs, void *stream) {
     cudaStream_t s = (cudaStream_t)stream;
-    int n = bc->band_size * bc->n_bands;
+    int n = bc->head_dim;  // see comment in sp_cuda_band_quantize
 
     int *d_band_bits;
     cudaMalloc(&d_band_bits, bc->n_bands * sizeof(int));
@@ -420,12 +398,6 @@ void sp_cuda_band_dequantize(const void *d_input, float *d_output,
     );
 
     cudaFree(d_band_bits);
-}
-
-void sp_cuda_nan_guard(float *d_data, int n, int n_vecs,
-                       float max_mag, void *stream) {
-    cudaStream_t s = (cudaStream_t)stream;
-    kernel_nan_guard<<<n_vecs, n, 0, s>>>(d_data, n, max_mag);
 }
 
 // ============================================================================
@@ -498,7 +470,7 @@ void sp_cuda_cache_free(sp_cuda_cache_t *cc) {
     cudaFree(cc->d_mobius_inv);
 }
 
-// Single-vector write: WHT → Möbius → quantize → store
+// Single-vector write: VHT2 → Möbius → quantize → store
 void sp_cuda_write_k(sp_cuda_cache_t *cc,
                      int layer, int head, int pos,
                      const float *d_k_vec) {
@@ -510,8 +482,8 @@ void sp_cuda_write_k(sp_cuda_cache_t *cc,
     cudaMemcpyAsync(scratch, d_k_vec, hd * sizeof(float),
                     cudaMemcpyDeviceToDevice, s);
 
-    // WHT forward
-    sp_cuda_wht_inplace(scratch, hd, 1, cc->stream);
+    // VHT2 forward
+    sp_cuda_vht2_forward(scratch, hd, 1, cc->stream);
 
     // Möbius reorder
     if (cc->config.use_mobius_mask) {
@@ -536,7 +508,7 @@ void sp_cuda_write_v(sp_cuda_cache_t *cc,
 
     cudaMemcpyAsync(scratch, d_v_vec, hd * sizeof(float),
                     cudaMemcpyDeviceToDevice, s);
-    sp_cuda_wht_inplace(scratch, hd, 1, cc->stream);
+    sp_cuda_vht2_forward(scratch, hd, 1, cc->stream);
 
     // No Möbius for V (uniform spectrum)
 
@@ -548,7 +520,7 @@ void sp_cuda_write_v(sp_cuda_cache_t *cc,
     sp_cuda_band_quantize(scratch, dest, &cc->v_bands, 1, cc->stream);
 }
 
-// Single-vector read: load → dequantize → Möbius unreorder → iWHT
+// Single-vector read: load → dequantize → Möbius unreorder → VHT2 (self-inverse)
 void sp_cuda_read_k(const sp_cuda_cache_t *cc,
                     int layer, int head, int pos,
                     float *d_k_out) {
@@ -566,8 +538,7 @@ void sp_cuda_read_k(const sp_cuda_cache_t *cc,
         sp_cuda_mobius_unreorder(d_k_out, cc->d_mobius_order, hd, 1, (void *)s);
     }
 
-    sp_cuda_iwht_inplace(d_k_out, hd, 1, (void *)s);
-    sp_cuda_nan_guard(d_k_out, hd, 1, 65504.0f, (void *)s);
+    sp_cuda_vht2_forward(d_k_out, hd, 1, (void *)s);
 }
 
 void sp_cuda_read_v(const sp_cuda_cache_t *cc,
@@ -584,8 +555,7 @@ void sp_cuda_read_v(const sp_cuda_cache_t *cc,
     sp_cuda_band_dequantize(src, d_v_out, &cc->v_bands, 1, (void *)s);
 
     // No Möbius unreorder for V
-    sp_cuda_iwht_inplace(d_v_out, hd, 1, (void *)s);
-    sp_cuda_nan_guard(d_v_out, hd, 1, 65504.0f, (void *)s);
+    sp_cuda_vht2_forward(d_v_out, hd, 1, (void *)s);
 }
 
 // ============================================================================
@@ -605,8 +575,8 @@ void sp_cuda_write_k_batch(sp_cuda_cache_t *cc,
     cudaMemcpyAsync(d_work, d_k_vecs, (size_t)n_pos * hd * sizeof(float),
                     cudaMemcpyDeviceToDevice, s);
 
-    // WHT all vectors in parallel
-    sp_cuda_wht_inplace(d_work, hd, n_pos, cc->stream);
+    // VHT2 all vectors in parallel
+    sp_cuda_vht2_forward(d_work, hd, n_pos, cc->stream);
 
     // Möbius reorder all
     if (cc->config.use_mobius_mask) {
@@ -636,7 +606,7 @@ void sp_cuda_write_v_batch(sp_cuda_cache_t *cc,
     cudaMemcpyAsync(d_work, d_v_vecs, (size_t)n_pos * hd * sizeof(float),
                     cudaMemcpyDeviceToDevice, s);
 
-    sp_cuda_wht_inplace(d_work, hd, n_pos, cc->stream);
+    sp_cuda_vht2_forward(d_work, hd, n_pos, cc->stream);
     // No Möbius for V
 
     int slot = layer * cc->config.n_heads_kv + head;
@@ -667,8 +637,7 @@ void sp_cuda_read_k_batch(const sp_cuda_cache_t *cc,
         sp_cuda_mobius_unreorder(d_k_out, cc->d_mobius_order, hd, n_pos, (void *)s);
     }
 
-    sp_cuda_iwht_inplace(d_k_out, hd, n_pos, (void *)s);
-    sp_cuda_nan_guard(d_k_out, hd, n_pos, 65504.0f, (void *)s);
+    sp_cuda_vht2_forward(d_k_out, hd, n_pos, (void *)s);
 }
 
 void sp_cuda_read_v_batch(const sp_cuda_cache_t *cc,
@@ -684,8 +653,7 @@ void sp_cuda_read_v_batch(const sp_cuda_cache_t *cc,
     const void *src = (const uint8_t *)cc->d_v_cache + base_offset;
 
     sp_cuda_band_dequantize(src, d_v_out, &cc->v_bands, n_pos, (void *)s);
-    sp_cuda_iwht_inplace(d_v_out, hd, n_pos, (void *)s);
-    sp_cuda_nan_guard(d_v_out, hd, n_pos, 65504.0f, (void *)s);
+    sp_cuda_vht2_forward(d_v_out, hd, n_pos, (void *)s);
 }
 
 // ============================================================================
@@ -706,6 +674,114 @@ void sp_cuda_print_memory(const sp_cuda_cache_t *cc) {
     fprintf(stderr, "  Baseline:   %.2f MB\n", baseline / (1024.0 * 1024.0));
     fprintf(stderr, "  Ratio:      %.1f×\n",
             (double)baseline / (double)(k_total + v_total));
+}
+
+// ============================================================================
+// Cold storage — tiered GPU ↔ CPU offload
+// ============================================================================
+
+void sp_cuda_d2h_async(void *dst_host, const void *src_device,
+                       int64_t n_bytes, void *stream) {
+    cudaMemcpyAsync(dst_host, src_device, (size_t)n_bytes,
+                    cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+}
+
+void sp_cuda_h2d_async(void *dst_device, const void *src_host,
+                       int64_t n_bytes, void *stream) {
+    cudaMemcpyAsync(dst_device, src_host, (size_t)n_bytes,
+                    cudaMemcpyHostToDevice, (cudaStream_t)stream);
+}
+
+int sp_cuda_cold_layer_init(sp_cuda_cold_layer_t *cl,
+                            int64_t cap_bytes,
+                            int packed_stride, int n_heads) {
+    if (!cl || cap_bytes <= 0 || packed_stride <= 0 || n_heads <= 0)
+        return -1;
+    memset(cl, 0, sizeof(*cl));
+
+    cudaError_t err = cudaHostAlloc(&cl->h_pinned, (size_t)cap_bytes,
+                                    cudaHostAllocDefault);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[sp-cold] cudaHostAlloc failed (%lld bytes): %s\n",
+                (long long)cap_bytes, cudaGetErrorString(err));
+        return -1;
+    }
+    cl->capacity      = cap_bytes;
+    cl->packed_stride  = packed_stride;
+    cl->n_heads        = n_heads;
+    cl->write_head     = 0;
+    cl->oldest_pos     = -1;
+    cl->newest_pos     = -1;
+    cl->ring_mode      = false;
+    cl->initialized    = true;
+    return 0;
+}
+
+void sp_cuda_cold_layer_free(sp_cuda_cold_layer_t *cl) {
+    if (!cl) return;
+    if (cl->h_pinned) {
+        cudaFreeHost(cl->h_pinned);
+        cl->h_pinned = NULL;
+    }
+    cl->initialized = false;
+}
+
+int sp_cuda_cold_writeback(sp_cuda_cold_layer_t *cl,
+                           const void *d_packed,
+                           int start_pos, int n_pos,
+                           void *stream) {
+    if (!cl || !cl->initialized || !d_packed || n_pos <= 0) return -1;
+
+    const int64_t bytes_per_pos = (int64_t)cl->n_heads * cl->packed_stride;
+    const int64_t new_bytes     = (int64_t)n_pos * bytes_per_pos;
+    const int64_t src_offset    = (int64_t)start_pos * bytes_per_pos;
+
+    // Ring-buffer wrap check
+    if (cl->write_head + new_bytes > cl->capacity) {
+        cl->write_head = 0;
+        cl->ring_mode  = true;
+    }
+
+    sp_cuda_d2h_async(cl->h_pinned + cl->write_head,
+                      (const uint8_t*)d_packed + src_offset,
+                      new_bytes, stream);
+
+    cl->write_head += new_bytes;
+    cl->newest_pos  = start_pos + n_pos - 1;
+
+    if (cl->ring_mode) {
+        const int64_t max_positions = cl->capacity / bytes_per_pos;
+        cl->oldest_pos = cl->newest_pos - max_positions + 1;
+        if (cl->oldest_pos < 0) cl->oldest_pos = 0;
+    } else {
+        if (cl->oldest_pos < 0) cl->oldest_pos = 0;
+    }
+
+    return 0;
+}
+
+int sp_cuda_cold_restore(const sp_cuda_cold_layer_t *cl,
+                         void *d_packed,
+                         int n_pos,
+                         void *stream) {
+    if (!cl || !cl->initialized || !d_packed || n_pos <= 0) return -1;
+    if (cl->ring_mode) {
+        fprintf(stderr, "[sp-cold] restore from ring-mode buffer not supported "
+                "(non-linear layout)\n");
+        return -1;
+    }
+
+    const int64_t bytes_per_pos = (int64_t)cl->n_heads * cl->packed_stride;
+    const int64_t total_bytes   = (int64_t)n_pos * bytes_per_pos;
+
+    if (total_bytes > cl->capacity) {
+        fprintf(stderr, "[sp-cold] restore: requested %lld bytes > capacity %lld\n",
+                (long long)total_bytes, (long long)cl->capacity);
+        return -1;
+    }
+
+    sp_cuda_h2d_async(d_packed, cl->h_pinned, total_bytes, stream);
+    return 0;
 }
 
 } // extern "C"

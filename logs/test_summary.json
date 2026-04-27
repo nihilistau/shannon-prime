@@ -1,0 +1,24 @@
+{
+  "date": "2026-04-17T15:28:00Z",
+  "commit_pending": "VHT2 rename + NaN guard removal",
+  "suites": [
+    { "name": "test-core",        "passed": 30, "total": 31, "note": "known synthetic-K flake (K full pipeline = 0.9894, threshold 0.990)" },
+    { "name": "test-cuda",        "passed": 7,  "total": 7,  "hardware": "RTX 2060 sm_75" },
+    { "name": "test-vulkan",      "passed": 4,  "total": 4,  "note": "CPU fallback path; GPU dispatch is deferred (VK_ERROR_DEVICE_LOST)" },
+    { "name": "test-adreno",      "passed": 14, "total": 14, "note": "NEON-scalar path; device not attached" },
+    { "name": "test-integration", "passed": 7,  "total": 7 },
+    { "name": "test-torch",       "passed": 31, "total": 31 },
+    { "name": "test-comfyui",     "passed": 25, "total": 25 },
+    { "name": "test-sqfree",      "passed": 69, "total": 69 }
+  ],
+  "total_passed": 187,
+  "total": 188,
+  "target_met": true,
+  "environment": {
+    "os": "Windows 11",
+    "shell": "bash (Git for Windows)",
+    "compiler_c": "gcc 15.2 (MinGW)",
+    "compiler_cuda": "nvcc 13.2 + MSVC 14.29",
+    "gpu": "NVIDIA GeForce RTX 2060 (sm_75)"
+  }
+}

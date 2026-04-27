@@ -8,15 +8,17 @@ LDFLAGS = -lm
 
 NVCC       = nvcc
 NVCC_ARCH  = -arch=sm_75
-NVCC_FLAGS = -O2 $(NVCC_ARCH)
+NVCC_FLAGS = -O2 $(NVCC_ARCH) -Icore
 
-CORE_SRC   = core/shannon_prime.c
-SQFREE_SRC = core/shannon_prime_sqfree.c
-CORE_HDR   = core/shannon_prime.h
+CORE_SRC       = core/shannon_prime.c core/shannon_prime_cauchy.c
+SQFREE_SRC     = core/shannon_prime_sqfree.c
+MODELPACK_SRC  = core/shannon_prime_modelpack.c
+CORE_HDR       = core/shannon_prime.h core/shannon_prime_modelpack.h
 ADRENO_SRC = backends/adreno/shannon_prime_adreno.c
 VULKAN_SRC = backends/vulkan/shannon_prime_vulkan.c
 CUDA_SRC   = backends/cuda/shannon_prime_cuda.cu
 CUDA_SQFREE_SRC = backends/cuda/shannon_prime_sqfree.cu
+CUDA_HIER_SRC   = backends/cuda/shannon_prime_hier.cu
 LLAMA_SRC  = tools/shannon_prime_llama.c
 
 # ── Vulkan SDK (optional) ────────────────────────────────────────
@@ -40,15 +42,20 @@ else
   SHADER_SPVS        =
 endif
 
-.PHONY: all test test-core test-torch test-adreno test-vulkan test-cuda \
-        test-integration test-comfyui test-sqfree test-all clean
+.PHONY: all test test-core test-torch test-adreno test-vulkan test-vulkan-dualgpu \
+        test-cuda test-cuda-advanced test-integration test-comfyui test-sqfree \
+        test-modelpack test-all clean
 
 all: test-all
 
 # ── C backends ───────────────────────────────────────────────────
-build/test_core: tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+build/test_core: tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(MODELPACK_SRC) $(CORE_HDR)
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ tests/test_core.c $(CORE_SRC) $(SQFREE_SRC) $(MODELPACK_SRC) $(LDFLAGS)
+
+build/test_modelpack: tests/test_modelpack.c $(CORE_SRC) $(MODELPACK_SRC) $(CORE_HDR)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ tests/test_modelpack.c $(CORE_SRC) $(MODELPACK_SRC) $(LDFLAGS)
 
 build/test_adreno: tests/test_adreno.c $(ADRENO_SRC) $(CORE_SRC)
 	@mkdir -p build
@@ -63,9 +70,17 @@ build/test_vulkan: tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ tests/test_vulkan.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS) $(VULKAN_LIB)
 
-build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+build/test_vulkan_dualgpu: tests/test_vulkan_dualgpu.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(SHADER_SPVS)
 	@mkdir -p build
-	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
+	$(CC) $(CFLAGS) $(VULKAN_CFLAGS) -o $@ tests/test_vulkan_dualgpu.c $(VULKAN_SRC) $(CORE_SRC) $(SQFREE_SRC) $(LDFLAGS) $(VULKAN_LIB)
+
+build/test_cuda: tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+	@mkdir -p build
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
+
+build/test_cuda_advanced: tests/test_cuda_advanced.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) $(CORE_HDR)
+	@mkdir -p build
+	$(NVCC) $(NVCC_FLAGS) -o $@ tests/test_cuda_advanced.c $(CUDA_SRC) $(CUDA_SQFREE_SRC) $(CUDA_HIER_SRC) $(CORE_SRC) $(SQFREE_SRC) -lcudart
 
 build/test_integration: tests/test_integration.c $(LLAMA_SRC) $(CORE_SRC)
 	@mkdir -p build
@@ -76,6 +91,10 @@ test-core: build/test_core
 	@echo "── Core math (31 tests) ──"
 	@./build/test_core
 
+test-modelpack: build/test_modelpack
+	@echo "── Model-pack registry ──"
+	@./build/test_modelpack
+
 test-adreno: build/test_adreno
 	@echo "── Adreno/ARM backend (14 tests) ──"
 	@./build/test_adreno
@@ -84,9 +103,17 @@ test-vulkan: build/test_vulkan
 	@echo "── Vulkan backend (4 tests) ──"
 	@./build/test_vulkan
 
+test-vulkan-dualgpu: build/test_vulkan_dualgpu
+	@echo "── Vulkan dual-GPU (14 tests) ──"
+	@./build/test_vulkan_dualgpu
+
 test-cuda: build/test_cuda
 	@echo "── CUDA backend (7 tests) ──"
 	@./build/test_cuda
+
+test-cuda-advanced: build/test_cuda_advanced
+	@echo "── CUDA advanced (sqfree/hier/cold/stress) ──"
+	@./build/test_cuda_advanced
 
 test-integration: build/test_integration
 	@echo "── llama.cpp integration (7 tests) ──"

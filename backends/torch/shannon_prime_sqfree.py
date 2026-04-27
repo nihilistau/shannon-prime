@@ -9,12 +9,12 @@
 """
 Squarefree prime-Hartley basis + Möbius CSR predictor + spinor sheet bit.
 
-This module extends the WHT-based ship config (shannon_prime_torch.py) with
+This module extends the VHT2-based ship config (shannon_prime_torch.py) with
 the aggressive compression path validated on Qwen3-8B Q8 hd=128:
 
     K+μ+3bit+spinor 3/3/3/3/3:  PPL 7.32 @ 3.3× (matches MOBIUS default 7.31 @ 2.6×)
 
-The key insight: the Möbius predictor gives r≈0 on the WHT basis (WHT²=I
+The key insight: the Möbius predictor gives r≈0 on the p=2 VHT2 basis (VHT2²=I
 scrambles divisibility structure). On a squarefree prime-Hartley basis it
 gives r=0.40-0.58, and the spinor sheet bit captures the systematic sign
 errors at the causal-mask boundary for an additional compression win.
@@ -26,7 +26,7 @@ Usage:
     cache.write_k(layer=0, head=0, pos=0, k_vec=tensor)
     k_recon = cache.read_k(layer=0, head=0, pos=0)
 
-This path is opt-in. The WHT ship config in shannon_prime_torch.py remains
+This path is opt-in. The VHT2 ship config in shannon_prime_torch.py remains
 the default for production deployment.
 """
 
@@ -353,7 +353,7 @@ def dequantize_residual(levels: torch.Tensor, nbits: int,
 @dataclass
 class SqfreeCompressed:
     """Compressed representation of a single K or V vector."""
-    # Skeleton: banded-quantized WHT/Vilenkin coefficients at skeleton indices
+    # Skeleton: banded-quantized VHT2 coefficients at skeleton indices
     skel_scales: List[torch.Tensor]     # Per-band fp16 scales
     skel_quants: List[torch.Tensor]     # Per-band int8 quantized values
 
@@ -364,7 +364,7 @@ class SqfreeCompressed:
     # Spinor sheet bit
     sheet_bits: Optional[torch.Tensor] = None        # (n_res,) bool
 
-    # NaN guard
+    # Per-vector max-abs reference (used for residual scale recovery).
     orig_max_abs: float = 0.0
 
 
@@ -550,10 +550,6 @@ class SqfreeShadowCache:
 
         # 5. Unpad
         out = sqfree_unpad(full, self.head_dim)
-
-        # 6. NaN guard
-        out = torch.clamp(out, -65504.0, 65504.0)
-        out = torch.nan_to_num(out, nan=0.0)
 
         return out
 

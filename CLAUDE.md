@@ -8,8 +8,35 @@ Transform (VHT2)** — a staged, orthonormal generalization of the Walsh-Hadamar
 Transform that extends cleanly to non-power-of-2 dimensions. VHT2 composes
 with Möbius-ordered coefficient reordering and per-band quantization to deliver
 3.4–3.8× KV compression at <1.25% PPL cost in the ship configuration, or up
-to 3.3× at equivalent quality on Q8+ backbones via the sqfree+spinor aggressive
+to 2.8× at equivalent quality on Q8+ backbones via the sqfree+spinor aggressive
 variant of the same pipeline.
+
+## Sibling Repositories
+
+Two sibling repos depend on this one via git submodule and are
+where most active integration work happens:
+
+- **`D:/F/shannon-prime-repos/shannon-prime-engine`** — standalone
+  inference binary that owns the compressed KV layout end-to-end.
+  Stage 5b: full forward pass + greedy chat work on Llama-3 / Qwen3.
+  The bug-free reference measurement surface — every PPL number
+  measured through the llama hook should be re-measured here.
+  Documented in `docs/PRIME-ENGINE.md`. Build at
+  `build/bin/sp-engine.exe`.
+- **`D:/F/llama-cpp-sp/`** — the llama.cpp fork carrying the
+  shannon-prime post-decode hook. Inherits 30+ archs but every
+  measurement carries a hook-surface footnote.
+
+When the user asks for inference results, defaults, or
+correctness-grade numbers, prefer the engine path. When they need
+to test against a specific exotic model architecture llama.cpp
+already supports, the hook is the right tool.
+
+The canonical PE family in the engine is **PrimePE-RoPE-ALiBi**
+(`PeMode` enum: Standard / PrimePe / PrimePeAlibi / AlibiOnly).
+The lattice math is the three-tier composite/prime allocation from
+`prime_rope.h`, alpha-blended with identity so `pe_alpha=0` is
+byte-identical to standard geometric RoPE.
 
 **VHT2 with p = 2 is the Walsh-Hadamard Transform.** Everywhere in the code —
 torch reference, C core, GPU kernels, integrations — the single transform is
@@ -24,11 +51,11 @@ spectral structure that underpins the Möbius predictor.
   known random-data edge case — real K vectors with RoPE hit 0.997+)
 - Core math validated: VHT2 self-inverse round-trip on power-of-2 and sqfree
   dims, Möbius function, banded quant, sqfree prime-Hartley, Knight CSR mask,
-  N-bit residual, spinor sheet bit, scaling law
+  N-bit residual, spinor sheet bit, scaling law, disk serialization round-trip
 - Production-validated on desktop (Qwen3-8B), mobile (Dolphin 1B / S22 Ultra),
   and video gen (Wan 2.2 TI2V-5B / ComfyUI)
 - Ship config: 3.4–3.8× KV compression at <1.25% PPL cost
-- Aggressive config (sqfree+spinor on Q8+ @ hd=128): 3.3× at MOBIUS-default quality
+- Aggressive config (sqfree+spinor on Q8+ @ hd=128, 5,4,4,4,5): 2.8× at MOBIUS-default quality
 
 ## Two Configurations of the Same Pipeline
 
@@ -36,8 +63,8 @@ spectral structure that underpins the Möbius predictor.
 ```
 Write: raw KV → VHT2 forward → Möbius reorder (K only, self-attn)
        → Band quantize (5/5/4/3 for K, flat 3 for V) → Store
-Read:  Load → Band dequantize → Möbius unreorder → VHT2 forward (= inverse)
-       → NaN guard → KV
+Read:  Load → Band dequantize (non-finite scale ⇒ zero band)
+       → Möbius unreorder → VHT2 forward (= inverse) → KV
 ```
 K (post-RoPE) concentrates 80%+ energy in the first VHT2 bands; V (content)
 spreads uniformly. K gets 4-band Möbius-ordered quantization, V gets flat 3-bit.
@@ -55,11 +82,17 @@ Read:  Load → Band dequant skeleton → Möbius predict → Spinor correct
 Uses the same VHT2 transform on a sqfree-padded dimension so the Möbius
 predictor gets r = 0.40–0.58 (vs ≈ 0 on pure power-of-2). The spinor bit is
 the SU(2) double-cover correction for the causal-mask boundary. On Qwen3-8B Q8
-hd=128: PPL 7.32 @ 3.3× (matches MOBIUS default 7.31 @ 2.6×, +27% compression).
+hd=128 at 5,4,4,4,5: PPL matches MOBIUS default at +8% compression (2.8× vs
+2.6×). A **pre-v1.03 bug** in `sp_sqfree_cache_init` hard-coded the 5-band
+5,4,4,4,5 allocation and silently ignored caller K_BITS, which made an earlier
+"3,3,3,3,3 @ 3.3× / PPL 7.32" measurement appear — it was actually running
+5,4,4,4,5. The fix that made K_BITS take effect (v1.03, `47a2c0b`) exposed
+that true 3,3,3,3,3 on the Knight skeleton is catastrophic (PPL 16–43 on
+Qwen3-8B ctx=2048 chunks=2). The real Pareto point is 5,4,4,4,5.
 
 **Q8+ feature.** On Q3 and below, scaling-law γ=1.5 on weight precision says
 the spinor's 1-bit correction is washed out by W-matrix quantization noise;
-use the WHT ship path for heavily quantized models.
+use the VHT2 ship path for heavily quantized models.
 
 ## Build and Test
 
@@ -90,8 +123,11 @@ make test-sqfree  # Sqfree + spinor path (PyTorch, 69 tests)
   hits 0.984.
 - Treat any part of this as theoretical or unimplemented. If you find yourself
   writing "this would need to be..." — check if it's already in the codebase.
-- Remove or weaken the NaN guard. It's defense-in-depth for aggressive configs.
-- Apply the sqfree+spinor path to Q4 or lower models. Use the WHT ship path.
+- Re-introduce a blanket output NaN guard. The read path now produces finite
+  values by construction — the non-finite scale check in `sp_band_dequantize`
+  is the one surviving guard and lives at the root cause. If a new code path
+  regresses into producing NaN, **fix the origin**, don't add another clamp.
+- Apply the sqfree+spinor path to Q4 or lower models. Use the VHT2 ship path.
 
 ### CRITICAL INVARIANTS (never violate):
 1. **VHT2 is self-inverse**: VHT2(VHT2(x)) = x. Error < 1e-5 at power-of-2,
@@ -99,6 +135,11 @@ make test-sqfree  # Sqfree + spinor path (PyTorch, 69 tests)
    is already normalised by 1/√p.
 2. **Möbius reorder + unreorder = identity**. Error exactly 0.
 3. **3-bit floor on any band**. 2-bit is catastrophic. Never go below 3.
+   Specifically: 2-bit on the *first* bands (which quantise the highest-energy
+   VHT2 coefficients) kills PPL on Qwen3-8B (~270–430 vs baseline ~8.7). 2-bit
+   on *tail* bands after a 3+ anchor is survivable but still Pareto-dominated
+   by the 5-band 5/4/4/4/5 and 3/3/3/3/3 torus-aligned sqfree defaults
+   (`v1.06` ran the full 10-band sweep; see `logs/qwen3_band_anchor_*.log`).
 4. **V vectors get flat quantization** (no banding) in self-attention. In
    cross-attention both K and V get matching banded allocation.
 5. **K gets Möbius reorder, V does not (self-attention). Both get reorder
@@ -117,15 +158,27 @@ make test-sqfree  # Sqfree + spinor path (PyTorch, 69 tests)
 
 ## Backend Notes (GPU kernels)
 
-CUDA, Vulkan, and Adreno backends currently run the classical WHT butterfly
-(no 1/√p per stage) and divide by N on the inverse path — this is
-*mathematically equivalent* to VHT2 after BandedQuantizer's per-band amax
-normalization absorbs the 1/√N spectrum scale. Backend shadow caches are
-per-device (not shared with the CPU path), so round-trip reconstructions are
-interoperable where it matters (output vectors agree; only intermediate
-spectrum magnitudes differ by 1/√N). Porting the GPU kernels to literal
-staged-Hartley form is a cosmetic follow-up — it would not change any
-user-facing number.
+All backends now run the literal VHT2 with 1/√p per stage (self-inverse, no
+1/N on reconstruction). Per-band amax normalisation in BandedQuantizer makes
+the spectrum magnitudes invariant to the transform scale, so this cleanup is
+behaviour-neutral on the output side and simplifies cross-backend debugging.
+
+**FP16 scale fix (2026-04-22):** Both CUDA `kernel_band_quantize_simple` and
+CPU `sp_band_quantize` now recompute `inv_scale` from the stored fp16 scale
+value, eliminating the quantize/dequantize asymmetry that caused subtle
+round-trip errors when the fp32 scale differed from its fp16 representation.
+
+**Cold storage (CUDA):** `sp_cuda_cold_layer_t` provides ring-buffer GPU→CPU
+offload for least-recently-used cache layers, enabling KV caches larger than
+GPU memory. Controlled via `enable_cold_storage` / `cold_writeback` /
+`cold_restore` on the engine's KvCache.
+
+Vulkan compute is currently routed through the CPU staged VHT2 inside the
+host wrappers (`vk_compress_one` / `vk_decompress_one`) because the GPU
+dispatch hits `VK_ERROR_DEVICE_LOST` at the first `vkWaitForFences` on
+RTX 2060; pipelines are still created so `test_vulkan` exercises the full
+init path, only the submit is skipped. Debugging the shader hang is tracked
+separately and needs RenderDoc on the target GPU.
 
 ## WHY These Specific Choices (Do Not "Optimize" Without Understanding)
 
@@ -138,6 +191,17 @@ user-facing number.
   anchors) get more bits than the middle interpolation bands, matching the
   variance profile of the Knight-ranked skeleton.
 
+- **10-band is not a winning topology**, despite v1.03's infrastructure
+  (`SP_MAX_BANDS=16`, `sp_band_span`, `tools/sp_auto_bands.py`,
+  `SHANNON_PRIME_DUMP_VILENKIN`) supporting it. Measured on Qwen3-8B Q8 at
+  ctx=4096 chunks=8: 10×3 uniform PPL=11.83, 10×2 uniform PPL=428.78
+  (catastrophic), 10×(4,4,4,4,4,3,3,3,3,3) PPL=10.08 — all Pareto-dominated
+  by the 5-band 5/4/4/4/5 (PPL 8.81) and 3/3/3/3/3 (PPL 8.83) defaults.
+  Band-boundary cost on the Knight skeleton exceeds per-band granularity
+  gain once you cross 5 bands. The 10-band support in the code is valid
+  infrastructure (needed for future research + hd=256 pad_dim=330 where the
+  spectrum has more resolvable structure), not a recommended config.
+
 - **3-bit residual** is the Shannon saturation point. The μ-inversion residual
   distribution has ~8 meaningful quantization levels. Measured:
   1→2 bit = 29× PPL drop, 2→3 bit = 2.1× drop, 3→4 bit = flat.
@@ -148,10 +212,13 @@ user-facing number.
   half-Möbius "shredding" and only works when the basis preserves divisibility
   structure (sqfree VHT2, not pure power-of-2 VHT2).
 
-- The **NaN guard** exists because aggressive bit configs (4/4/3 and below on
-  hd=64) produce NaN at chunk 2+ despite healthy single-chunk correlations.
-  Ship config (5/4/4) is NaN-safe, but the guard is defense-in-depth for users
-  who override defaults.
+- **No output NaN guard.** Previously a blanket `nan_to_num + clamp` ran on
+  every read path as defense-in-depth for aggressive bit configs (4/4/3 and
+  below on hd=64). It was removed in favour of a root-cause guard: if the
+  fp16 per-band scale round-trips to a non-finite value (the real origin of
+  the cascading NaN), `sp_band_dequantize` zeros the band. Ship config
+  (5/4/4) produces finite outputs without this branch ever firing; aggressive
+  configs now surface any remaining NaN instead of silently masking it.
 
 - **Cross-attention in Wan** models has NO RoPE on K/V. Both K and V get
   Möbius reorder and matching bit allocation. This is DIFFERENT from
@@ -193,10 +260,14 @@ print(f"Predicted: +{(ratio-1)*100:.2f}% PPL")  # +1.0%
 ```
 core/                      Backend-agnostic C: VHT2, Möbius, banded quant,
                            sqfree pad, Knight mask CSR, residual quant,
-                           spinor, shadow cache
+                           spinor, shadow cache, disk serialization
+                           (sp_shadow/sqfree/hier_cache_save/load,
+                            VHT2 v2 binary format SP_CACHE_MAGIC 0x56485432,
+                            sp_fnv1a_hash model validation)
 backends/
   cuda/                    NVIDIA GPU kernels (butterfly at p=2, band quant,
-                           Möbius CSR predict, spinor extract/reconstruct)
+                           Möbius CSR predict, spinor extract/reconstruct,
+                           hierarchical cache kernels, cold storage offload)
   vulkan/                  Vulkan compute shaders + CPU fallback
                            (vilenkin.comp, knight_predict.comp,
                             mobius_reorder.comp, band_quantize.comp)
@@ -217,17 +288,32 @@ tests/                     8 test suites
 docs/                      Full documentation
 ```
 
+### Engine Integration Surface (shannon-prime-engine)
+
+The engine consumes core + CUDA backend through these integration points:
+
+- **ForwardContext scheduler bridge**: `alloc_graph` / `compute_graph` —
+  allocates and dispatches the compressed KV forward pass as a graph node.
+- **KvCache disk I/O**: `save_to_disk` / `load_from_disk` — delegates to
+  `sp_shadow_cache_save/load`, `sp_sqfree_cache_save/load`,
+  `sp_hier_cache_save/load` in core (VHT2 v2 binary format).
+- **KvCache cold storage**: `enable_cold_storage` / `cold_writeback` /
+  `cold_restore` — drives `sp_cuda_cold_layer_t` ring-buffer offload.
+- **sp_cuda_hier_cache_t**: GPU-resident hierarchical prediction cache
+  used by the engine's multi-resolution attention path.
+
 ## Key Files
 
 | File | What It Does | Test Coverage |
 |------|-------------|---------------|
 | core/shannon_prime.h | Full public API | test_core.c |
-| core/shannon_prime.c | C reference (VHT2 + WHT-compat aliases) | test_core.c |
+| core/shannon_prime.c | C reference (VHT2 only, no WHT aliases) | test_core.c |
 | core/shannon_prime_sqfree.c | Sqfree + spinor C implementation | test_core.c (sqfree section) |
 | backends/torch/shannon_prime_torch.py | PyTorch (vht2, ShadowCache) | test_torch.py |
 | backends/torch/shannon_prime_sqfree.py | PyTorch sqfree+spinor path | test_sqfree.py |
-| backends/cuda/shannon_prime_cuda.cu | CUDA WHT-butterfly kernels | test_cuda.c |
+| backends/cuda/shannon_prime_cuda.cu | CUDA VHT2 p=2 butterfly + sqfree dispatch | test_cuda.c |
 | backends/cuda/shannon_prime_sqfree.cu | CUDA Vilenkin+spinor kernels | test_cuda.c (sqfree section) |
+| backends/cuda/shannon_prime_hier.cu | GPU-resident hierarchical cache (kernel_hier_predict, kernel_hier_deviation, kernel_residual_magnitude, kernel_quantize_residual); sp_cuda_hier_cache_t, sp_cuda_cold_layer_t ring-buffer GPU→CPU offload | test_cuda.c |
 | backends/vulkan/shannon_prime_vulkan.c | Vulkan + CPU fallback | test_vulkan.c |
 | backends/vulkan/shaders/vilenkin.comp | Vulkan VHT2 shader | test_vulkan.c |
 | backends/vulkan/shaders/knight_predict.comp | Vulkan CSR+spinor shader | test_vulkan.c |
@@ -276,7 +362,13 @@ When `SQFREE=1`:
 |--------|-----|--------|-------------|
 | MOBIUS default 5/5/5/5/5 | 7.31 | 0.999 | 2.6× |
 | K+μ+3bit+spinor 5/4/4/4/5 | 7.30 | 0.988 | 2.8× |
-| K+μ+3bit+spinor 3/3/3/3/3 | 7.32 | 0.972 | 3.3× |
+| ~~K+μ+3bit+spinor 3/3/3/3/3~~ | ~~7.32~~ | ~~0.972~~ | ~~3.3×~~ |
+
+> The 3/3/3/3/3 row above was an artifact of a pre-v1.03 bug where
+> `sp_sqfree_cache_init` silently remapped K_BITS to the 5,4,4,4,5 default.
+> Post-v1.03, true 3/3/3/3/3 on the Knight skeleton is catastrophic (PPL
+> ~16–43 on Qwen3-8B at ctx=2048 chunks=2). The effective sqfree Pareto
+> winner is 5,4,4,4,5 at 2.8×.
 
 ### Scaling law fit
 All 9 calibration points within ±20% of K = 4700.

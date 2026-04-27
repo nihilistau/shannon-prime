@@ -17,7 +17,7 @@ optimized for. VHT2 exploits this structure for better compression
 than generic quantization — on the specific tensors that have it.
 
 Strategy:
-  - W_K, W_Q: VHT2 spectral compression (WHT → Möbius → banded quant)
+  - W_K, W_Q: VHT2 spectral compression (VHT2 → Möbius → banded quant)
     These have RoPE-induced spectral structure in head_dim rows.
   - W_V, W_O, FFN: Standard quantization (no RoPE structure)
   - Norms, embeddings: Keep at higher precision (standard practice)
@@ -65,7 +65,7 @@ if HAS_TORCH:
 def analyze_tensor_spectrum(tensor: 'torch.Tensor', name: str,
                            head_dim: int = 128) -> dict:
     """
-    Analyze WHT spectral concentration of a weight tensor.
+    Analyze VHT2 spectral concentration of a weight tensor.
 
     For W_K/W_Q: reshape to (n_heads, head_dim, model_dim), analyze each
     head's projection vectors (each row of head_dim length).
