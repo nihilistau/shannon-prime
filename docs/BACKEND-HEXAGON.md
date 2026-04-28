@@ -61,36 +61,176 @@ If any of those are missing, ignore. They're orthogonal to building DSP code.
 
 ## Setup checklist (one-time)
 
-1. **Open a fresh `cmd` (not PowerShell)** and run:
-   ```
-   "C:\Qualcomm\Hexagon_SDK\5.5.6.0\setup_sdk_env.cmd"
-   ```
-   This sets `HEXAGON_SDK_ROOT`, prepends the Hexagon CMake to PATH, and points to the v87 compiler tree.
+**Strong recommendation: use WSL2 with Ubuntu 20.04 LTS**, not native Windows. The Hexagon SDK is primarily Linux-targeted; the Windows build pipeline has multiple known issues (documented below). Most Qualcomm engineers develop on Ubuntu, so the SDK's Linux paths are well-trodden while the Windows paths trip on small bugs. WSL2 lives next to Windows, shares the filesystem via `/mnt/c`, and lets adb-over-USB or adb-over-WiFi reach the phone identically to native Windows.
 
-2. **Verify the toolchain** is reachable:
-   ```
-   hexagon-clang --version
-   ```
-   Should print something like `clang version X.X.X (Hexagon ToolsX.Y.Z)`. If "command not found" the env setup didn't take.
+If you must work on native Windows, see the "Windows setup gotchas" section below for the workarounds.
 
-3. **Set DSP arch for V69** (S22 Ultra):
-   ```
-   set DEFAULT_DSP_ARCH=v69
-   ```
-   The default in `setup_sdk_env.cmd` is `v65`, which won't have all the HVX intrinsics SP wants. Override before building.
+### WSL2 / Ubuntu 20.04 path (recommended)
 
-4. **Build the calculator example** to verify FastRPC works end-to-end:
-   ```
-   cd %HEXAGON_SDK_ROOT%\examples\calculator
-   make tree V=hexagon_Release_dynamic_toolv87_v69
-   ```
-   This builds the DSP-side .so and the ARM-side .so. If both produce binaries without errors, the SDK is functional.
+#### One-time check: do you already have WSL + Ubuntu?
 
-5. **For phone deployment**, you'll also need:
-   - Android Studio (for the host-side app shell)
-   - `adb` on PATH (Android Debug Bridge)
-   - S22 Ultra in USB Debugging mode
-   - Optional: a Qualcomm signature for the DSP binary if running outside dev mode (the SDK ships a default dev signature in `tools/elfsigner/`)
+```powershell
+wsl --status
+wsl --list --verbose
+```
+
+If you see **Ubuntu-20.04 — Stopped — WSL2** (or similar) you're good. Skip to step 2. If not, install:
+
+```powershell
+wsl --install -d Ubuntu-20.04
+# (one-time first launch will prompt for username + password)
+```
+
+#### Step 1 — Start the distro and update apt
+
+```powershell
+wsl -d Ubuntu-20.04
+```
+
+You should land at a `username@host:~$` prompt. Update apt and install the dependencies the Hexagon SDK install scripts assume:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake make python3 python3-pip default-jdk \
+    git curl wget xz-utils libncurses5 libncursesw5 lib32stdc++6 zlib1g lib32z1
+```
+
+`libncurses5` and `lib32stdc++6` are the legacy 32-bit libs the bundled Hexagon Tools sometimes need on modern Ubuntu. Worth installing once even though you may not hit the dependency until later milestones.
+
+#### Step 2 — Download the Hexagon SDK Linux variant
+
+Two ways:
+
+**A. Via Qualcomm Package Manager (QPM3)** — recommended, handles the EULA flow automatically:
+
+```bash
+# Download from https://qpm.qualcomm.com (requires free Qualcomm account login)
+# Pick "Hexagon SDK 5.5.6.0 Linux" - delivered as an installer .bin
+chmod +x qualcomm_hexagon_sdk_5.5.6.0.bin
+./qualcomm_hexagon_sdk_5.5.6.0.bin
+# Default install path: ~/Qualcomm/Hexagon_SDK/5.5.6.0/
+```
+
+**B. Reuse the Windows install via /mnt/c** — saves the download but requires the Windows install to be functional (most things ARE there; only the broken WinNT bits we hit in the gotchas section don't matter for Linux):
+
+```bash
+# Inside WSL, reference the Windows-side install directly
+export HEXAGON_SDK_ROOT="/mnt/c/Qualcomm/Hexagon_SDK/5.5.6.0"
+ls $HEXAGON_SDK_ROOT/setup_sdk_env.source    # confirm Linux setup exists
+```
+
+The reuse path works because the Linux variants of qaic / hexagon-clang / cmake all live inside the SDK install regardless of host OS — Qualcomm ships everything cross-platform; only the entry-point scripts diverge. If the Windows install is missing the `setup_sdk_env.source` (Linux equivalent), you'll need approach A.
+
+#### Step 3 — Source the Linux env script
+
+```bash
+source $HEXAGON_SDK_ROOT/setup_sdk_env.source
+```
+
+This sets `HEXAGON_SDK_ROOT`, `DEFAULT_DSP_ARCH`, prepends the toolchain to PATH, and (unlike the Windows version) actually completes without trying to rebuild qaic.
+
+Override the DSP arch for V69 (the S22 Ultra's chip):
+
+```bash
+export DEFAULT_DSP_ARCH=v69
+```
+
+#### Step 4 — Verify the toolchain
+
+```bash
+hexagon-clang --version           # should print QuIC LLVM Hexagon Clang version 8.7.06
+qaic                              # should print qaic IDL compiler usage
+make --version                    # should print GNU Make 4.x
+```
+
+If any of these "command not found", the env didn't take. Common cause: setup_sdk_env.source needs to be sourced (`source`/`.`), not executed (`./`). Re-run with `source`.
+
+#### Step 5 — Build the calculator example
+
+```bash
+cd $HEXAGON_SDK_ROOT/examples/calculator
+make tree V=hexagon_Release_dynamic_toolv87_v69
+```
+
+If both the ARM-side and DSP-side `.so` files produce without errors, the SDK is functional. Output goes to `hexagon_Release_toolv87_v69/ship/`.
+
+#### Step 6 — Push to the S22 Ultra
+
+You can use Windows-side adb from inside WSL by referencing it via `/mnt/c`:
+
+```bash
+alias adb='/mnt/c/Users/Knack/AppData/Local/Android/Sdk/platform-tools/adb.exe'
+adb connect 192.168.8.110:42441   # or whatever port wireless ADB is using
+adb devices                       # should show the SM-S908E
+```
+
+Or install adb inside WSL (`sudo apt install adb`) — both work; using the Windows one means you don't have two adb daemons running on different ports.
+
+Push the built binaries:
+
+```bash
+# DSP-side .so goes to /vendor/lib/rfsa/dsp/sdk/ on the device
+# Host-side .so goes wherever your Android app expects them
+adb push hexagon_Release_toolv87_v69/ship/libcalculator_skel.so /data/local/tmp/
+adb push hexagon_Release_toolv87_v69/ship/libcalculator.so /data/local/tmp/
+adb shell ls -la /data/local/tmp/lib*.so
+```
+
+(Production deployment needs a signed DSP binary; dev mode allows the SDK's default test signature.)
+
+For phone deployment from this point forward:
+   - S22 Ultra in USB Debugging mode (or wireless ADB on a known port — current session was 192.168.8.110:42441, port rotates per pairing)
+   - Optional: Qualcomm signature for the DSP binary if running outside dev mode (the SDK ships a default dev signature in `tools/elfsigner/`)
+
+### Windows setup gotchas (if you must)
+
+The following issues were observed on Hexagon SDK 5.5.6.0 + Windows 10/11. Workarounds inline.
+
+1. **`setup_sdk_env.cmd` fails with "No rule to make target Ubuntu18/qaic".**
+   The setup script tries to "install" qaic by running its Makefile, but the Makefile's Linux branch is hardcoded to Ubuntu18 (the SDK only ships Ubuntu20 + WinNT prebuilts), and the Windows branch isn't picked up because `make` (gow's bundled GNU Make 3.81) doesn't see `OS=Windows_NT` in some shell contexts.
+   **Workaround**: pre-create `ipc/fastrpc/qaic/bin/` and copy `WinNT/qaic.exe` into it (and a copy named just `qaic` without extension, because some downstream rules drop the `.exe`). Skip the setup script, set env vars manually instead — see step 3 below.
+
+2. **gow-0.8.0/bin/bash.exe is too minimal for the example Makefiles.**
+   The bundled GNU-on-Windows shell ships bash but not `ls`, `head`, `grep`, etc. — those are separate `.exe` files in the same directory but they don't get picked up because the bash startup PATH is short. Result: every Makefile invocation prints `bash.exe: warning: could not find /tmp` and downstream commands fail with "command not found".
+   **Workaround**: create `C:\tmp` (the warning goes away with `/tmp` resolvable). For missing utilities, install Git for Windows or MSYS2 and prepend that bash to PATH before gow's.
+
+3. **`make tree V=...` silently exits.**
+   The example Makefiles include shell expansions that break under gow's bash. PowerShell's stateless invocation model also doesn't help — env vars set in one command don't persist to the next.
+   **Workaround**: assemble the entire env+make invocation as a single `cmd /c` call so all state lives in one shell.
+
+4. **PowerShell `$env:HEXAGON_SDK_ROOT` doesn't substitute in `Set-Location` correctly when PATH is mid-mutation.**
+   Race condition between PATH update and path resolution.
+   **Workaround**: use literal paths or do the cd before mutating PATH.
+
+If, after applying all of the above, you still hit issues — switch to WSL2. The Linux path "just works" with the SDK's primary support tier.
+
+### Manual Windows env setup (if you've worked around all of the above)
+
+```powershell
+$sdk = "C:\Qualcomm\Hexagon_SDK\5.5.6.0"
+$env:HEXAGON_SDK_ROOT = $sdk
+$env:DEFAULT_HEXAGON_TOOLS_ROOT = "$sdk/tools/HEXAGON_Tools/8.7.06"
+$env:DEFAULT_DSP_ARCH = "v69"
+$env:DEFAULT_BUILD = "ReleaseG"
+$env:DEFAULT_HLOS_ARCH = "64"
+$env:DEFAULT_TOOLS_VARIANT = "toolv87"
+$env:DEFAULT_NO_QURT_INC = "0"
+$env:DEFAULT_TREE = "1"
+$env:SDK_SETUP_ENV = "1"
+$env:PATH = "$sdk\tools\HEXAGON_Tools\8.7.06\Tools\bin;" +
+            "$sdk\ipc\fastrpc\qaic\bin;" +
+            "$sdk\tools\utils\gow-0.8.0\bin;" +
+            "$sdk\tools\cmake-3.22.2-windows-x86_64\bin;" +
+            "$sdk\tools\wrapperTools;" +
+            "$sdk\build\cmake\WinNT;" +
+            "C:\Python311;" +
+            $env:PATH
+
+# Verify (these three should all succeed):
+& hexagon-clang --version    # QuIC LLVM Hexagon Clang version 8.7.06
+& qaic                       # qaic IDL compiler
+& make --version             # GNU Make 3.81
+```
 
 ---
 
