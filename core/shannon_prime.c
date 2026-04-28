@@ -755,11 +755,15 @@ int sp_shadow_cache_init(sp_shadow_cache_t *sc, const sp_config_t *cfg) {
     memset(sc, 0, sizeof(*sc));
     memcpy(&sc->config, cfg, sizeof(sp_config_t));
 
-    // Initialize band configs
-    sp_band_config_init(&sc->k_bands, cfg->head_dim,
-                        cfg->k_n_bands, cfg->k_band_bits);
-    sp_band_config_init(&sc->v_bands, cfg->head_dim,
-                        cfg->v_n_bands, cfg->v_band_bits);
+    // Initialize band configs. Use _ext to honour ternary masks; when
+    // cfg->[kv]_ternary_mask is 0 (the default for callers initialised via
+    // sp_config_init), behaviour is identical to sp_band_config_init.
+    sp_band_config_init_ext(&sc->k_bands, cfg->head_dim,
+                            cfg->k_n_bands, cfg->k_band_bits,
+                            cfg->k_ternary_mask);
+    sp_band_config_init_ext(&sc->v_bands, cfg->head_dim,
+                            cfg->v_n_bands, cfg->v_band_bits,
+                            cfg->v_ternary_mask);
 
     // Initialize Möbius mask
     if (cfg->use_mobius_mask) {

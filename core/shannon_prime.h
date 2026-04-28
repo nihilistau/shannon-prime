@@ -100,6 +100,14 @@ typedef struct {
     int      v_n_bands;          // Number of V bands (default 1)
     int      v_band_bits[SP_MAX_BANDS]; // Bits per V band (default 3)
 
+    // Ternary noise-tail mask. Bit b set ⇒ band b is ternary {-1,0,+1}
+    // at 2 bpp regardless of the corresponding *_band_bits[b] value. The
+    // strange-attractor stack 5/5/4/1.58 preset sets bit 3 in
+    // k_ternary_mask. Default 0 (no ternary bands) preserves all
+    // existing callers' behaviour.
+    uint32_t k_ternary_mask;
+    uint32_t v_ternary_mask;
+
     // Möbius partition mask
     bool     use_mobius_mask;    // Reorder coefficients squarefree-first
     int      skeleton_k;         // VHT2 skeleton size for K (must == head_dim)
