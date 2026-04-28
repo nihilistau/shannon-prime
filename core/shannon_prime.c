@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <float.h>
+#include <limits.h>
 
 // ============================================================================
 // Utilities
@@ -1236,6 +1237,93 @@ static int sp_write_cache_header(FILE *f, int packed_stride, int n_pos,
     return (fwrite(hdr, sizeof(hdr), 1, f) == 1) ? 0 : -1;
 }
 
+// Compute per-band per-(head,pos) record byte size (2-byte fp16 scale +
+// ceil(band_size * effective_bits / 8)). effective_bits is 2 for ternary
+// bands, else band_bits[b]. Returns 0 if band index is out of range.
+static int sp_band_record_bytes(const sp_band_config_t *bc, int b) {
+    if (b < 0 || b >= bc->n_bands) return 0;
+    int off, sz;
+    sp_band_span(bc, b, &off, &sz);
+    int eff_bits = (bc->ternary_band_mask & (1u << b)) ? 2 : bc->band_bits[b];
+    int data_bytes = (sz * eff_bits + 7) / 8;
+    return 2 + data_bytes;
+}
+
+// Write 64-byte v3 band-major header. Bumps version to
+// SP_CACHE_VERSION_BAND_MAJOR. Stores n_bands at slot 8 and the first
+// 7 band offsets (in bytes from file start) at slots 9-15. Caps disk
+// persistence at 7 bands; configs with more bands fall back to writing
+// v2 headers via the existing helper.
+static int sp_write_cache_header_v3(FILE *f, int packed_stride, int n_pos,
+                                    int n_heads, int cache_type,
+                                    uint64_t model_hash,
+                                    int n_bands,
+                                    const uint32_t band_offsets[],
+                                    int n_band_offsets) {
+    uint32_t hdr[16] = {0};
+    hdr[0] = SP_CACHE_MAGIC;
+    hdr[1] = SP_CACHE_VERSION_BAND_MAJOR;
+    hdr[2] = (uint32_t)packed_stride;
+    hdr[3] = (uint32_t)n_pos;
+    hdr[4] = (uint32_t)n_heads;
+    hdr[5] = (uint32_t)cache_type;
+    hdr[6] = (uint32_t)(model_hash & 0xFFFFFFFF);
+    hdr[7] = (uint32_t)(model_hash >> 32);
+    hdr[8] = (uint32_t)n_bands;
+    int slots = (n_band_offsets > 7) ? 7 : n_band_offsets;
+    for (int b = 0; b < slots; b++) {
+        hdr[9 + b] = band_offsets[b];
+    }
+    return (fwrite(hdr, sizeof(hdr), 1, f) == 1) ? 0 : -1;
+}
+
+// Read v3 header. Returns 0 on v3 OK, -1 on bad magic / read failure,
+// -2 on hash mismatch in strict mode, +1 on v2 (caller should fall back
+// to legacy reader). Out parameters populated for v3; v2 path leaves
+// n_bands_out and band_offsets unset.
+static int sp_read_cache_header_v3(FILE *f, int *packed_stride, int *n_pos,
+                                   int *n_heads, int *cache_type,
+                                   uint64_t expected_hash,
+                                   int *n_bands_out,
+                                   uint32_t band_offsets_out[7]) {
+    uint32_t hdr[16] = {0};
+    if (fread(hdr, sizeof(hdr), 1, f) != 1)        return -1;
+    if (hdr[0] != SP_CACHE_MAGIC)                    return -1;
+
+    if (hdr[1] == SP_CACHE_VERSION) {
+        // Caller asked for v3 but file is legacy v2 — signal fallback.
+        return 1;
+    }
+    if (hdr[1] != SP_CACHE_VERSION_BAND_MAJOR)       return -1;
+
+    *packed_stride = (int)hdr[2];
+    *n_pos         = (int)hdr[3];
+    *n_heads       = (int)hdr[4];
+    *cache_type    = (int)hdr[5];
+    if (n_bands_out) *n_bands_out = (int)hdr[8];
+    if (band_offsets_out) {
+        for (int b = 0; b < 7; b++) band_offsets_out[b] = hdr[9 + b];
+    }
+
+    if (expected_hash != 0) {
+        uint64_t disk_hash = (uint64_t)hdr[6] | ((uint64_t)hdr[7] << 32);
+        if (disk_hash != 0 && disk_hash != expected_hash) {
+            fprintf(stderr, "[sp-disk] model hash mismatch: disk=%llx expected=%llx\n",
+                    (unsigned long long)disk_hash,
+                    (unsigned long long)expected_hash);
+            const char *strict_env = getenv("SP_DISK_HASH_STRICT");
+            const int  warn_only   = strict_env && strict_env[0] == '0';
+            if (!warn_only) {
+                fprintf(stderr, "[sp-disk] refusing to load: hash mismatch is "
+                        "fatal (set SP_DISK_HASH_STRICT=0 to load anyway)\n");
+                return -2;
+            }
+            fprintf(stderr, "[sp-disk] SP_DISK_HASH_STRICT=0 — loading anyway\n");
+        }
+    }
+    return 0;
+}
+
 // Read and validate 64-byte VHT2 v2 header
 static int sp_read_cache_header(FILE *f, int *packed_stride, int *n_pos,
                                 int *n_heads, int *cache_type,
@@ -1291,74 +1379,221 @@ int sp_shadow_cache_save(const sp_shadow_cache_t *sc,
 
     const int n_layer = sc->config.n_layers;
     const int n_head  = sc->config.n_heads_kv;
-    const int k_bytes = sc->k_bands.total_bytes;
-    const int v_bytes = sc->v_bands.total_bytes;
 
     for (int il = 0; il < n_layer; il++) {
         // Determine positions written for this layer
         int layer_pos = (n_pos > 0) ? n_pos : (sc->seq_len ? sc->seq_len[il] : 0);
         if (layer_pos <= 0) continue;
 
-        // Save K
-        {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
-            FILE *f = fopen(path, "wb");
-            if (!f) {
-                fprintf(stderr, "[sp-disk] cannot write %s\n", path);
-                return -1;
-            }
-            if (sp_write_cache_header(f, k_bytes, layer_pos, n_head, 0, model_hash) != 0) {
-                fclose(f); return -1;
-            }
-            for (int ih = 0; ih < n_head; ih++) {
-                int slot = il * n_head + ih;
-                const uint8_t *cache_ptr = sc->k_cache[slot];
-                for (int p = 0; p < layer_pos; p++) {
-                    if (fwrite(cache_ptr + (size_t)p * k_bytes, k_bytes, 1, f) != 1) {
-                        fclose(f); return -1;
-                    }
-                }
-            }
-            fclose(f);
-        }
+        // Helper macro for K and V — same band-major write pattern, parameterised
+        // on which bands struct + cache pointer + path suffix.
+        #define SAVE_KV_BAND_MAJOR(bc, cache_array, suffix, type_id)                         \
+            do {                                                                              \
+                char path[1024];                                                              \
+                snprintf(path, sizeof(path), "%s.l%d." suffix ".vht2", prefix, il);          \
+                FILE *f = fopen(path, "wb");                                                  \
+                if (!f) {                                                                     \
+                    fprintf(stderr, "[sp-disk] cannot write %s\n", path);                    \
+                    return -1;                                                                \
+                }                                                                             \
+                const int n_b = (bc).n_bands;                                                 \
+                if (n_b > 7) {                                                                \
+                    /* Too many bands for v3 header (caps at 7). Fall back to v2. */         \
+                    if (sp_write_cache_header(f, (bc).total_bytes, layer_pos, n_head,        \
+                                               (type_id), model_hash) != 0) {                 \
+                        fclose(f); return -1;                                                 \
+                    }                                                                         \
+                    for (int ih = 0; ih < n_head; ih++) {                                     \
+                        int slot = il * n_head + ih;                                          \
+                        const uint8_t *cache_ptr = (cache_array)[slot];                       \
+                        for (int p = 0; p < layer_pos; p++) {                                 \
+                            if (fwrite(cache_ptr + (size_t)p * (bc).total_bytes,             \
+                                       (bc).total_bytes, 1, f) != 1) {                       \
+                                fclose(f); return -1;                                         \
+                            }                                                                 \
+                        }                                                                     \
+                    }                                                                         \
+                } else {                                                                      \
+                    /* v3 band-major path */                                                  \
+                    int rec_off[8] = {0};                                                     \
+                    int rec_bytes_band[8] = {0};                                              \
+                    for (int b = 0; b < n_b; b++) {                                           \
+                        rec_bytes_band[b] = sp_band_record_bytes(&(bc), b);                  \
+                        rec_off[b + 1] = rec_off[b] + rec_bytes_band[b];                      \
+                    }                                                                         \
+                    uint32_t band_offs[7] = {0};                                              \
+                    uint32_t off_in_file = 64;                                                \
+                    for (int b = 0; b < n_b; b++) {                                           \
+                        band_offs[b] = off_in_file;                                           \
+                        off_in_file += (uint32_t)((size_t)rec_bytes_band[b] *                \
+                                                  (size_t)n_head * (size_t)layer_pos);       \
+                    }                                                                         \
+                    if (sp_write_cache_header_v3(f, (bc).total_bytes, layer_pos, n_head,     \
+                                                  (type_id), model_hash, n_b,                 \
+                                                  band_offs, n_b) != 0) {                     \
+                        fclose(f); return -1;                                                 \
+                    }                                                                         \
+                    for (int b = 0; b < n_b; b++) {                                           \
+                        for (int ih = 0; ih < n_head; ih++) {                                 \
+                            int slot = il * n_head + ih;                                      \
+                            const uint8_t *cache_ptr = (cache_array)[slot];                   \
+                            for (int p = 0; p < layer_pos; p++) {                             \
+                                const uint8_t *src = cache_ptr +                              \
+                                    (size_t)p * (bc).total_bytes + rec_off[b];               \
+                                if (fwrite(src, rec_bytes_band[b], 1, f) != 1) {              \
+                                    fclose(f); return -1;                                     \
+                                }                                                             \
+                            }                                                                 \
+                        }                                                                     \
+                    }                                                                         \
+                }                                                                             \
+                fclose(f);                                                                    \
+            } while (0)
 
-        // Save V
-        {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
-            FILE *f = fopen(path, "wb");
-            if (!f) {
-                fprintf(stderr, "[sp-disk] cannot write %s\n", path);
-                return -1;
-            }
-            if (sp_write_cache_header(f, v_bytes, layer_pos, n_head, 0, model_hash) != 0) {
-                fclose(f); return -1;
-            }
-            for (int ih = 0; ih < n_head; ih++) {
-                int slot = il * n_head + ih;
-                const uint8_t *cache_ptr = sc->v_cache[slot];
-                for (int p = 0; p < layer_pos; p++) {
-                    if (fwrite(cache_ptr + (size_t)p * v_bytes, v_bytes, 1, f) != 1) {
-                        fclose(f); return -1;
-                    }
-                }
-            }
-            fclose(f);
-        }
+        SAVE_KV_BAND_MAJOR(sc->k_bands, sc->k_cache, "k", 0);
+        SAVE_KV_BAND_MAJOR(sc->v_bands, sc->v_cache, "v", 0);
+
+        #undef SAVE_KV_BAND_MAJOR
     }
     return 0;
+}
+
+// Internal helper: load one (layer, K-or-V) file. Handles v2 (per-vec
+// interleaved) and v3 (band-major) layouts by sniffing the version.
+// max_bands clamps how many bands of v3 files are read (others are
+// zeroed in the cache); v2 files ignore max_bands and load fully.
+// Returns: positive n_pos on success, 0 to skip layer, -1 on error,
+// -2 on strict-mode hash mismatch.
+static int sp_load_layer_kv(FILE *f, sp_shadow_cache_t *sc, int il,
+                            int n_head, const sp_band_config_t *bc,
+                            uint8_t **cache_array, uint64_t expected_hash,
+                            int max_bands, const char *kv_label) {
+    const int total_bytes = bc->total_bytes;
+
+    int pstr, n_pos, n_hd, ctype, n_bands_disk = 0;
+    uint32_t band_offs[7] = {0};
+    int hrc = sp_read_cache_header_v3(f, &pstr, &n_pos, &n_hd, &ctype,
+                                      expected_hash, &n_bands_disk, band_offs);
+    if (hrc == -2) return -2;       // strict-mode hash mismatch
+    if (hrc == -1) {                // bad magic / read fail
+        fprintf(stderr, "[sp-disk] %s layer %d: bad header\n", kv_label, il);
+        return 0;
+    }
+    if (hrc == 1) {
+        // v2 fallback: file has the legacy per-vec layout. fseek back to
+        // start and re-read with the v2 reader. v2 ignores max_bands —
+        // it has to read all bytes per vec because they're interleaved.
+        fseek(f, 0, SEEK_SET);
+        int v2_hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+        if (v2_hrc == -2) return -2;
+        if (v2_hrc != 0) {
+            fprintf(stderr, "[sp-disk] %s layer %d: v2 header bad\n", kv_label, il);
+            return 0;
+        }
+        if (pstr != total_bytes || n_hd != n_head) {
+            fprintf(stderr, "[sp-disk] %s layer %d: v2 config mismatch\n",
+                    kv_label, il);
+            return 0;
+        }
+        for (int ih = 0; ih < n_head; ih++) {
+            int slot = il * n_head + ih;
+            uint8_t *cache_ptr = cache_array[slot];
+            for (int p = 0; p < n_pos; p++) {
+                if (fread(cache_ptr + (size_t)p * total_bytes, total_bytes, 1, f) != 1) {
+                    fprintf(stderr, "[sp-disk] %s layer %d head %d: v2 read truncated\n",
+                            kv_label, il, ih);
+                    break;
+                }
+            }
+        }
+        return n_pos;
+    }
+
+    // v3 band-major path
+    if (pstr != total_bytes || n_hd != n_head) {
+        fprintf(stderr, "[sp-disk] %s layer %d: v3 config mismatch (disk pstr=%d n_hd=%d, "
+                "expected pstr=%d n_hd=%d)\n",
+                kv_label, il, pstr, n_hd, total_bytes, n_head);
+        return 0;
+    }
+    if (n_bands_disk != bc->n_bands) {
+        fprintf(stderr, "[sp-disk] %s layer %d: v3 n_bands mismatch (disk=%d expected=%d)\n",
+                kv_label, il, n_bands_disk, bc->n_bands);
+        return 0;
+    }
+
+    // Compute per-band record sizes + offsets within a packed vec.
+    int rec_off[8] = {0};
+    int rec_bytes_band[8] = {0};
+    for (int b = 0; b < bc->n_bands; b++) {
+        rec_bytes_band[b] = sp_band_record_bytes(bc, b);
+        rec_off[b + 1] = rec_off[b] + rec_bytes_band[b];
+    }
+
+    // Clamp max_bands.
+    int read_n = max_bands;
+    if (read_n < 0) read_n = 0;
+    if (read_n > bc->n_bands) read_n = bc->n_bands;
+
+    // Zero the cache regions for bands [read_n, n_bands) so partial reads
+    // don't leave stale data from a prior load. Only zero the per-band
+    // segments — the bands we WILL read overwrite themselves.
+    if (read_n < bc->n_bands) {
+        for (int b = read_n; b < bc->n_bands; b++) {
+            for (int ih = 0; ih < n_head; ih++) {
+                int slot = il * n_head + ih;
+                uint8_t *cache_ptr = cache_array[slot];
+                for (int p = 0; p < n_pos; p++) {
+                    memset(cache_ptr + (size_t)p * total_bytes + rec_off[b],
+                           0, (size_t)rec_bytes_band[b]);
+                }
+            }
+        }
+    }
+
+    // Read bands [0, read_n) from disk into the cache. Each band's region
+    // on disk is contiguous: head 0 pos 0..n-1, head 1 pos 0..n-1, etc.
+    for (int b = 0; b < read_n; b++) {
+        if (b < 7) {
+            // Use the recorded offset (matches how the writer laid it out)
+            if (fseek(f, (long)band_offs[b], SEEK_SET) != 0) {
+                fprintf(stderr, "[sp-disk] %s layer %d band %d: fseek failed\n",
+                        kv_label, il, b);
+                return 0;
+            }
+        }
+        for (int ih = 0; ih < n_head; ih++) {
+            int slot = il * n_head + ih;
+            uint8_t *cache_ptr = cache_array[slot];
+            for (int p = 0; p < n_pos; p++) {
+                uint8_t *dst = cache_ptr + (size_t)p * total_bytes + rec_off[b];
+                if (fread(dst, rec_bytes_band[b], 1, f) != 1) {
+                    fprintf(stderr, "[sp-disk] %s layer %d band %d head %d: "
+                            "read truncated at pos %d\n",
+                            kv_label, il, b, ih, p);
+                    break;
+                }
+            }
+        }
+    }
+
+    return n_pos;
 }
 
 int sp_shadow_cache_load(sp_shadow_cache_t *sc,
                          const char *prefix,
                          uint64_t expected_hash) {
+    return sp_shadow_cache_load_partial(sc, prefix, expected_hash, INT_MAX);
+}
+
+int sp_shadow_cache_load_partial(sp_shadow_cache_t *sc,
+                                 const char *prefix,
+                                 uint64_t expected_hash,
+                                 int max_bands) {
     if (!sc || !prefix) return -1;
 
     const int n_layer = sc->config.n_layers;
     const int n_head  = sc->config.n_heads_kv;
-    const int k_bytes = sc->k_bands.total_bytes;
-    const int v_bytes = sc->v_bands.total_bytes;
     int max_loaded = 0;
 
     for (int il = 0; il < n_layer; il++) {
@@ -1367,45 +1602,16 @@ int sp_shadow_cache_load(sp_shadow_cache_t *sc,
             char path[1024];
             snprintf(path, sizeof(path), "%s.l%d.k.vht2", prefix, il);
             FILE *f = fopen(path, "rb");
-            if (!f) continue;  // Layer not on disk — skip
-
-            int pstr, n_pos, n_hd, ctype;
-            int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
-            if (hrc == -2) {
-                // Strict-mode hash mismatch — abort entire load.
-                fclose(f); return -1;
-            }
-            if (hrc != 0) {
-                fprintf(stderr, "[sp-disk] K layer %d: bad header in %s\n", il, path);
-                fclose(f); continue;
-            }
-            if (pstr != k_bytes) {
-                fprintf(stderr, "[sp-disk] K layer %d: stride mismatch (disk=%d expected=%d)\n",
-                        il, pstr, k_bytes);
-                fclose(f); continue;
-            }
-            if (n_hd != n_head) {
-                fprintf(stderr, "[sp-disk] K layer %d: head count mismatch (disk=%d expected=%d)\n",
-                        il, n_hd, n_head);
-                fclose(f); continue;
-            }
-
-            for (int ih = 0; ih < n_head; ih++) {
-                int slot = il * n_head + ih;
-                uint8_t *cache_ptr = sc->k_cache[slot];
-                for (int p = 0; p < n_pos; p++) {
-                    if (fread(cache_ptr + (size_t)p * k_bytes, k_bytes, 1, f) != 1) {
-                        fprintf(stderr, "[sp-disk] K layer %d head %d: read truncated at pos %d\n",
-                                il, ih, p);
-                        break;
-                    }
-                }
-            }
-            if (sc->seq_len) {
-                sc->seq_len[il] = n_pos;
-            }
-            if (n_pos > max_loaded) max_loaded = n_pos;
+            if (!f) continue;
+            int n_pos = sp_load_layer_kv(f, sc, il, n_head, &sc->k_bands,
+                                          sc->k_cache, expected_hash,
+                                          max_bands, "K");
             fclose(f);
+            if (n_pos == -2) return -1;     // strict hash mismatch — abort
+            if (n_pos > 0) {
+                if (sc->seq_len) sc->seq_len[il] = n_pos;
+                if (n_pos > max_loaded) max_loaded = n_pos;
+            }
         }
 
         // Load V
@@ -1414,29 +1620,11 @@ int sp_shadow_cache_load(sp_shadow_cache_t *sc,
             snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
             FILE *f = fopen(path, "rb");
             if (!f) continue;
-
-            int pstr, n_pos, n_hd, ctype;
-            int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
-            if (hrc == -2) {
-                fclose(f); return -1;
-            }
-            if (hrc != 0) {
-                fprintf(stderr, "[sp-disk] V layer %d: bad header in %s\n", il, path);
-                fclose(f); continue;
-            }
-            if (pstr != v_bytes || n_hd != n_head) {
-                fprintf(stderr, "[sp-disk] V layer %d: config mismatch\n", il);
-                fclose(f); continue;
-            }
-
-            for (int ih = 0; ih < n_head; ih++) {
-                int slot = il * n_head + ih;
-                uint8_t *cache_ptr = sc->v_cache[slot];
-                for (int p = 0; p < n_pos; p++) {
-                    if (fread(cache_ptr + (size_t)p * v_bytes, v_bytes, 1, f) != 1) break;
-                }
-            }
+            int n_pos = sp_load_layer_kv(f, sc, il, n_head, &sc->v_bands,
+                                          sc->v_cache, expected_hash,
+                                          max_bands, "V");
             fclose(f);
+            if (n_pos == -2) return -1;
         }
     }
     return max_loaded;

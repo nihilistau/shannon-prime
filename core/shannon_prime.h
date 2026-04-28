@@ -1038,7 +1038,14 @@ void sp_config_print(const sp_config_t *cfg);
 //   SP_STORE_COLD_ONLY — CPU pinned only (no GPU copy)
 
 #define SP_CACHE_MAGIC    0x56485432u  // "VHT2"
-#define SP_CACHE_VERSION  2
+
+// Cache file version. v2 was per-(head,pos) interleaved bands. v3 is
+// band-major (band 0 across all heads/positions, then band 1, etc.) so
+// partial loaders can fseek directly to a band's region without reading
+// irrelevant high-band bytes. The shadow-cache writer uses v3; sqfree
+// and hier writers stay on v2 until their loaders are migrated.
+#define SP_CACHE_VERSION       2  // legacy / sqfree / hier
+#define SP_CACHE_VERSION_BAND_MAJOR 3  // shadow cache band-major layout
 
 enum {
     SP_STORE_GPU_ONLY  = 0,
@@ -1061,6 +1068,26 @@ int sp_shadow_cache_save(const sp_shadow_cache_t *sc,
 int sp_shadow_cache_load(sp_shadow_cache_t *sc,
                          const char *prefix,
                          uint64_t expected_hash);
+
+// Progressive (partial) load — read only the first `max_bands` bands from
+// disk, leaving the higher bands' regions of the in-memory cache zeroed.
+// Requires v3 (band-major) format; v2 files are rejected with -1 because
+// per-(head,pos) interleaved bands can't be partially read without
+// touching every byte. max_bands is clamped into [0, n_bands].
+//
+// The IO win: with v3 band-major layout, reading bands [0, max_bands)
+// only touches the first sum(band_b region size) bytes of the file. On
+// NVMe, that's a single contiguous read; on Optane / shared-memory
+// tiers, it's a sub-millisecond pop. Compose with the System 1 fast path
+// for attention: read band 0 from RAM, short-circuit if the dot product
+// is determined; otherwise call this with max_bands=2 etc. as needed.
+//
+// Returns number of positions loaded (the n_pos stored in the header)
+// or -1 on error.
+int sp_shadow_cache_load_partial(sp_shadow_cache_t *sc,
+                                 const char *prefix,
+                                 uint64_t expected_hash,
+                                 int max_bands);
 
 // Save/load for sqfree cache (same format, different packed_stride).
 int sp_sqfree_cache_save(const sp_sqfree_cache_t *sc,
