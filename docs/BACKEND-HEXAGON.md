@@ -61,36 +61,90 @@ If any of those are missing, ignore. They're orthogonal to building DSP code.
 
 ## Setup checklist (one-time)
 
-1. **Open a fresh `cmd` (not PowerShell)** and run:
-   ```
-   "C:\Qualcomm\Hexagon_SDK\5.5.6.0\setup_sdk_env.cmd"
-   ```
-   This sets `HEXAGON_SDK_ROOT`, prepends the Hexagon CMake to PATH, and points to the v87 compiler tree.
+**Strong recommendation: use WSL2 with Ubuntu 20.04 LTS**, not native Windows. The Hexagon SDK is primarily Linux-targeted; the Windows build pipeline has multiple known issues (documented below). Most Qualcomm engineers develop on Ubuntu, so the SDK's Linux paths are well-trodden while the Windows paths trip on small bugs. WSL2 lives next to Windows, shares the filesystem via `/mnt/c`, and lets adb-over-USB or adb-over-WiFi reach the phone identically to native Windows.
 
-2. **Verify the toolchain** is reachable:
+If you must work on native Windows, see the "Windows setup gotchas" section below for the workarounds.
+
+### WSL2 / Ubuntu 20.04 path (recommended)
+
+1. **Install WSL2 + Ubuntu 20.04** if you don't have it:
    ```
+   wsl --install -d Ubuntu-20.04
+   ```
+
+2. **Install the SDK inside WSL**, not at `C:\Qualcomm`. The Linux installer is on Qualcomm's Package Manager (QPM3) site or as a tarball. The qaic prebuilts under `ipc/fastrpc/qaic/Ubuntu20/` are the ones the Linux setup script picks up.
+
+3. **From WSL, source the env script**:
+   ```bash
+   source $HEXAGON_SDK_ROOT/setup_sdk_env.source
+   ```
+
+4. **Verify the toolchain**:
+   ```bash
    hexagon-clang --version
    ```
-   Should print something like `clang version X.X.X (Hexagon ToolsX.Y.Z)`. If "command not found" the env setup didn't take.
+   Should print `QuIC LLVM Hexagon Clang version 8.7.06` (or whatever your SDK version is).
 
-3. **Set DSP arch for V69** (S22 Ultra):
-   ```
-   set DEFAULT_DSP_ARCH=v69
-   ```
-   The default in `setup_sdk_env.cmd` is `v65`, which won't have all the HVX intrinsics SP wants. Override before building.
-
-4. **Build the calculator example** to verify FastRPC works end-to-end:
-   ```
-   cd %HEXAGON_SDK_ROOT%\examples\calculator
+5. **Build the calculator example**:
+   ```bash
+   cd $HEXAGON_SDK_ROOT/examples/calculator
    make tree V=hexagon_Release_dynamic_toolv87_v69
    ```
    This builds the DSP-side .so and the ARM-side .so. If both produce binaries without errors, the SDK is functional.
 
-5. **For phone deployment**, you'll also need:
-   - Android Studio (for the host-side app shell)
-   - `adb` on PATH (Android Debug Bridge)
-   - S22 Ultra in USB Debugging mode
-   - Optional: a Qualcomm signature for the DSP binary if running outside dev mode (the SDK ships a default dev signature in `tools/elfsigner/`)
+6. **For phone deployment** (still works from WSL via `/mnt/c/Users/.../platform-tools/adb.exe` or by installing adb in WSL itself):
+   - S22 Ultra in USB Debugging mode (or wireless ADB on a known port)
+   - Optional: Qualcomm signature for the DSP binary if running outside dev mode (the SDK ships a default dev signature in `tools/elfsigner/`)
+
+### Windows setup gotchas (if you must)
+
+The following issues were observed on Hexagon SDK 5.5.6.0 + Windows 10/11. Workarounds inline.
+
+1. **`setup_sdk_env.cmd` fails with "No rule to make target Ubuntu18/qaic".**
+   The setup script tries to "install" qaic by running its Makefile, but the Makefile's Linux branch is hardcoded to Ubuntu18 (the SDK only ships Ubuntu20 + WinNT prebuilts), and the Windows branch isn't picked up because `make` (gow's bundled GNU Make 3.81) doesn't see `OS=Windows_NT` in some shell contexts.
+   **Workaround**: pre-create `ipc/fastrpc/qaic/bin/` and copy `WinNT/qaic.exe` into it (and a copy named just `qaic` without extension, because some downstream rules drop the `.exe`). Skip the setup script, set env vars manually instead — see step 3 below.
+
+2. **gow-0.8.0/bin/bash.exe is too minimal for the example Makefiles.**
+   The bundled GNU-on-Windows shell ships bash but not `ls`, `head`, `grep`, etc. — those are separate `.exe` files in the same directory but they don't get picked up because the bash startup PATH is short. Result: every Makefile invocation prints `bash.exe: warning: could not find /tmp` and downstream commands fail with "command not found".
+   **Workaround**: create `C:\tmp` (the warning goes away with `/tmp` resolvable). For missing utilities, install Git for Windows or MSYS2 and prepend that bash to PATH before gow's.
+
+3. **`make tree V=...` silently exits.**
+   The example Makefiles include shell expansions that break under gow's bash. PowerShell's stateless invocation model also doesn't help — env vars set in one command don't persist to the next.
+   **Workaround**: assemble the entire env+make invocation as a single `cmd /c` call so all state lives in one shell.
+
+4. **PowerShell `$env:HEXAGON_SDK_ROOT` doesn't substitute in `Set-Location` correctly when PATH is mid-mutation.**
+   Race condition between PATH update and path resolution.
+   **Workaround**: use literal paths or do the cd before mutating PATH.
+
+If, after applying all of the above, you still hit issues — switch to WSL2. The Linux path "just works" with the SDK's primary support tier.
+
+### Manual Windows env setup (if you've worked around all of the above)
+
+```powershell
+$sdk = "C:\Qualcomm\Hexagon_SDK\5.5.6.0"
+$env:HEXAGON_SDK_ROOT = $sdk
+$env:DEFAULT_HEXAGON_TOOLS_ROOT = "$sdk/tools/HEXAGON_Tools/8.7.06"
+$env:DEFAULT_DSP_ARCH = "v69"
+$env:DEFAULT_BUILD = "ReleaseG"
+$env:DEFAULT_HLOS_ARCH = "64"
+$env:DEFAULT_TOOLS_VARIANT = "toolv87"
+$env:DEFAULT_NO_QURT_INC = "0"
+$env:DEFAULT_TREE = "1"
+$env:SDK_SETUP_ENV = "1"
+$env:PATH = "$sdk\tools\HEXAGON_Tools\8.7.06\Tools\bin;" +
+            "$sdk\ipc\fastrpc\qaic\bin;" +
+            "$sdk\tools\utils\gow-0.8.0\bin;" +
+            "$sdk\tools\cmake-3.22.2-windows-x86_64\bin;" +
+            "$sdk\tools\wrapperTools;" +
+            "$sdk\build\cmake\WinNT;" +
+            "C:\Python311;" +
+            $env:PATH
+
+# Verify (these three should all succeed):
+& hexagon-clang --version    # QuIC LLVM Hexagon Clang version 8.7.06
+& qaic                       # qaic IDL compiler
+& make --version             # GNU Make 3.81
+```
 
 ---
 
