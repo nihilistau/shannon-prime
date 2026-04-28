@@ -540,6 +540,88 @@ void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
     }
 }
 
+void sp_band_dequantize_partial(const uint8_t *in, float *vht2_coeffs,
+                                const sp_band_config_t *bc,
+                                int max_bands) {
+    // Clamp max_bands into the valid range. Zero is valid (returns the
+    // all-zero vector); n_bands is valid (equivalent to sp_band_dequantize).
+    if (max_bands < 0)            max_bands = 0;
+    if (max_bands > bc->n_bands)  max_bands = bc->n_bands;
+
+    int offset = 0;
+
+    for (int b = 0; b < bc->n_bands; b++) {
+        int band_off, band_sz;
+        sp_band_span(bc, b, &band_off, &band_sz);
+        float *band = vht2_coeffs + band_off;
+
+        if (b >= max_bands) {
+            // Skip-path: zero this band's coefficients in place. Don't
+            // touch the input bytes for this band — the offset cursor
+            // doesn't matter past the last band we read, since we're
+            // returning early.
+            for (int i = 0; i < band_sz; i++) band[i] = 0.0f;
+            continue;
+        }
+
+        // ── Ternary noise-tail path (mirrors sp_band_dequantize) ──────────
+        if (bc->ternary_band_mask & (1u << b)) {
+            uint16_t scale_f16 = (uint16_t)in[offset]
+                               | ((uint16_t)in[offset + 1] << 8);
+            float scale = sp_f16_to_f32(scale_f16);
+            if (!isfinite(scale)) scale = 0.0f;
+            offset += 2;
+
+            uint64_t bit_buffer = 0;
+            int      bit_pos    = 0;
+            int      byte_idx   = offset;
+            for (int i = 0; i < band_sz; i++) {
+                while (bit_pos < 2) {
+                    bit_buffer |= ((uint64_t)in[byte_idx++] << bit_pos);
+                    bit_pos += 8;
+                }
+                uint32_t u = (uint32_t)(bit_buffer & 0x3u);
+                bit_buffer >>= 2;
+                bit_pos -= 2;
+                int q = (int)u - 1;
+                if (q < -1 || q > 1) q = 0;
+                band[i] = (float)q * scale;
+            }
+            offset = byte_idx;
+            continue;
+        }
+
+        // ── Regular signed-int band path (mirrors sp_band_dequantize) ─────
+        int bits = bc->band_bits[b];
+        int max_val = (1 << (bits - 1)) - 1;
+        uint32_t mask = (1u << bits) - 1;
+
+        uint16_t scale_f16 = (uint16_t)in[offset] | ((uint16_t)in[offset + 1] << 8);
+        float scale = sp_f16_to_f32(scale_f16);
+        if (!isfinite(scale)) scale = 0.0f;
+        offset += 2;
+
+        uint64_t bit_buffer = 0;
+        int      bit_pos = 0;
+        int      byte_idx = offset;
+
+        for (int i = 0; i < band_sz; i++) {
+            while (bit_pos < bits) {
+                bit_buffer |= ((uint64_t)in[byte_idx++] << bit_pos);
+                bit_pos += 8;
+            }
+            uint32_t u = (uint32_t)(bit_buffer & mask);
+            bit_buffer >>= bits;
+            bit_pos -= bits;
+            int q = (int)u - max_val;
+            band[i] = (float)q * scale;
+        }
+
+        int data_bits = band_sz * bits;
+        offset += (data_bits + 7) / 8;
+    }
+}
+
 // ============================================================================
 // Vilenkin-Hartley Transform
 // ============================================================================
