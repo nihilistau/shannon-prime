@@ -1,14 +1,15 @@
 # Shannon-Prime + Speculative Decoding
 
-llama.cpp ships speculative decoding via the `-md` flag (draft model) and `--draft-max` (max proposed tokens per step). Shannon-Prime layers on top without any patches to the speculative path itself — the same `SHANNON_PRIME_*` environment variables that compress the target's KV cache automatically apply to the draft model's KV cache too.
+llama.cpp ships speculative decoding via the `-md` flag (draft model) and `--draft-max` (max proposed tokens per step). Shannon-Prime supports the speculative path with per-model SP compression: the target gets one shadow cache, the draft gets its own, and the two can be tuned independently via the role-aware env-var schema.
 
-This document covers what works today, recommended draft/target pairs, suggested SP settings for each role, and the roadmap for differential compression (where the draft can be quantised more aggressively than the target because draft errors are recoverable).
+This document covers what works today, recommended draft/target pairs, suggested SP settings for each role, and the differential-compression workflow (where the draft is quantised more aggressively than the target because draft errors are recoverable on target verification).
 
-## What Works Today
+## What Works Today (v2.14.0-sp2 and later)
 
-Speculative decoding with shared SP compression is fully functional with the existing `b8861-full-engine` patch. No additional code is required.
+Speculative decoding with per-model SP compression is functional via the `b8861-full-engine` patch. No additional code is required at the call site.
 
 ```bash
+SHANNON_PRIME_ENABLED=1 \
 ./llama-cli \
   -m  qwen2.5-7b-instruct-q4_k_m.gguf \
   -md qwen2.5-0.5b-instruct-q8_0.gguf \
@@ -17,11 +18,15 @@ Speculative decoding with shared SP compression is fully functional with the exi
   -n 256
 ```
 
-With `SHANNON_PRIME_ENABLED=1` set in the environment, both the 7B target and the 0.5B draft run under SP-compressed KV cache. The speculative loop's accept/reject logic operates on the model's logits, which are unaffected by KV compression beyond the baseline PPL hit. Acceptance rates we've observed in informal testing remain within a percentage point of fp16-baseline acceptance.
+With `SHANNON_PRIME_ENABLED=1` set in the environment, both the 7B target and the 0.5B draft initialise their own SP shadow caches with model-specific dimensions. The speculative loop's accept/reject logic operates on the model's logits, which are affected by KV compression only by the baseline per-model PPL hit (typically <1% on the ship preset).
 
-### Why this works without a patch
+### How it works under the hood
 
-Speculative decoding loads two `llama_context` objects but uses the same KV-cache machinery for both. The shadow-cache hook in `sp_llama_init` reads `SHANNON_PRIME_ENABLED` from the environment when the *first* context initialises, and applies the same compression policy to the *second*. Both contexts therefore inherit the same band allocation, Möbius mask, and any optional features (PrimePE, sqfree, hierarchical) the user has enabled.
+Each `llama_context` initialisation calls `llama_sp_maybe_init(&model, n_ctx)`. The patch maintains a `std::unordered_map<const llama_model*, sp_per_model>` keyed on the model pointer — every distinct model gets its own SP context, head dimensions, and shadow cache. Teardown is per-model on `~llama_context`. Two models, two SP states, no cross-contamination.
+
+### ⚠ Pre-v2.14.0-sp2 caveat
+
+Earlier releases (including the very first `v2.14.0-sp1` tag) had a single global SP context. Under speculative decoding (`-md`), only the first-loaded model received SP; the second-loaded (draft) either bypassed SP or — if dimensions happened to match — corrupted the target's cache. If you're on `v2.14.0-sp1` and using `-md`, upgrade to `v2.14.0-sp2` or later before relying on the documented numbers below.
 
 ## Recommended Draft/Target Pairs
 
@@ -49,28 +54,28 @@ If you want to push the draft harder while keeping the target safe — see "Diff
 
 ## Differential Compression
 
-The SP architecture has a free win waiting for speculative deployments: the draft's KV cache is the *cheapest* place to push compression hard, because draft errors are recoverable on target verification. A draft quantised to ternary or 1-bit bands that loses a few percent of acceptance is still net-positive if the gain in draft tok/sec exceeds the verification rejection cost.
+The SP architecture has a structural win for speculative deployments: the draft's KV cache is the *cheapest* place to push compression hard, because draft errors are recoverable on target verification. A draft quantised to ternary or 1-bit bands that loses a few percent of acceptance is still net-positive if the gain in draft tok/sec exceeds the verification rejection cost.
 
-### What's implemented today
+### Workflow (v2.14.0-sp2 and later)
 
-The bridge ships with a role-aware initialiser that lets a caller compress the draft and target contexts differently:
-
-```c
-sp_llama_ctx_t *target = sp_llama_init_with_role(&p, SP_LLAMA_ROLE_TARGET);
-sp_llama_ctx_t *draft  = sp_llama_init_with_role(&q, SP_LLAMA_ROLE_DRAFT);
-```
-
-When a context is initialised with `SP_LLAMA_ROLE_DRAFT`, every `SHANNON_PRIME_X` env-var lookup tries `SHANNON_PRIME_DRAFT_X` first and falls back to `SHANNON_PRIME_X` if unset. So you can:
+Opt in with `SHANNON_PRIME_SPEC=1`. The patch then assigns the first-initialised model `SP_LLAMA_ROLE_TARGET` and the second-initialised model `SP_LLAMA_ROLE_DRAFT`, matching llama.cpp's deterministic init order under `-md` (target first, draft second). Each role looks up its own env vars:
 
 ```bash
 # Target uses the ship default; draft drops to ternary K and 1-bit V.
 SHANNON_PRIME_ENABLED=1 \
+SHANNON_PRIME_SPEC=1 \
 SHANNON_PRIME_K_BITS=5,5,4,3 \
 SHANNON_PRIME_V_BITS=3 \
 SHANNON_PRIME_DRAFT_K_BITS=2,1 \
 SHANNON_PRIME_DRAFT_V_BITS=1 \
 ./llama-cli -m target.gguf -md draft.gguf ...
 ```
+
+When a context is initialised with `SP_LLAMA_ROLE_DRAFT`, every `SHANNON_PRIME_X` env-var lookup tries `SHANNON_PRIME_DRAFT_X` first and falls back to `SHANNON_PRIME_X` if unset. The target keeps the global vars; only the draft sees the prefixed overrides.
+
+`SP_LLAMA_ROLE_DEFAULT` bypasses the prefixed lookup entirely — it's what you get with `SHANNON_PRIME_SPEC` unset (or for any non-speculative single-model run). Existing single-model callers see no behavioural change.
+
+### Preset shortcut
 
 A `SHANNON_PRIME_DRAFT_PRESET` shortcut covers the common cases without per-band knob fiddling:
 
@@ -80,15 +85,20 @@ A `SHANNON_PRIME_DRAFT_PRESET` shortcut covers the common cases without per-band
 | `ternary`    | K=2,2 V=2 | ~7×  | 2–8%  |
 | `ship`       | (no-op — keep ship defaults) | 3.4× | ~0% |
 
-`SP_LLAMA_ROLE_DEFAULT` and `SP_LLAMA_ROLE_TARGET` both bypass the prefixed lookup, so existing callers see no behavioural change.
+```bash
+# Same effect as setting DRAFT_K_BITS=2,1 DRAFT_V_BITS=1 explicitly.
+SHANNON_PRIME_ENABLED=1 SHANNON_PRIME_SPEC=1 \
+SHANNON_PRIME_DRAFT_PRESET=aggressive \
+./llama-cli -m target.gguf -md draft.gguf ...
+```
 
-### What's still pending
+### Diagnostic output
 
-The bridge API is in place but the llama.cpp patch (`patches/llama-cpp-b8861-full-engine.patch`) still calls `sp_llama_init(...)` for both contexts. To wire differential compression end-to-end, the patch needs to detect the speculative draft init path and route it through `sp_llama_init_with_role(..., SP_LLAMA_ROLE_DRAFT)` instead. That's a focused surgical edit on the patch's `llama_kv_cache_init` (or equivalent) — tracking it as a separate work item.
+With `SHANNON_PRIME_VERBOSE=1` set, you'll see two `[Shannon-Prime]` init lines on startup — one tagged `[target]` and one tagged `[draft]`. If you only see one, either the patch isn't wired (upgrade to `v2.14.0-sp2`+) or `SHANNON_PRIME_SPEC=1` wasn't set so both contexts hit `ROLE_DEFAULT`. If you see a third "init #3 > 2 — falling back to ROLE_DEFAULT" warning, your driver is loading more than two models with `SHANNON_PRIME_SPEC=1` set; turn it off if you don't actually want target/draft role disambiguation.
 
-Until the patch wires through, setting `SHANNON_PRIME_DRAFT_*` env vars has no effect — both contexts hit the `ROLE_DEFAULT` path and read the global names. The header API and the env schema are the staging ground for the patch wiring.
+### When to NOT use differential compression
 
-Tracking issue: see `FUTURE-WORK.md` section 8a in the workspace root.
+The aggressive draft preset is only a win when the draft cost is already a meaningful fraction of total wall-clock. For very small drafts (0.5B → 7B), the draft is already cheap; the marginal speedup from extra-compressed draft KV is small (low single-digit percent). For larger draft / target ratios (8B → 70B) the marginal speedup is larger because the draft KV cache dominates the smaller model's runtime more.
 
 ## Operational Tips
 
