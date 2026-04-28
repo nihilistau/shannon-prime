@@ -203,6 +203,24 @@ typedef struct {
     // n_bands-1 has `head_dim - band_size * (n_bands - 1)` coefficients.
     // Callers iterate through sp_band_span(bc, b, &off, &sz) rather than
     // computing `b * band_size` directly.
+
+    // Ternary noise-tail mask. Bit b set ⇒ band b is quantised to {-1, 0, +1}
+    // (≈1.58 bits/coefficient information content) regardless of band_bits[b].
+    // The strange-attractor stack predicts the noise tail (typically band 3 in
+    // a 5/5/4/3 ship configuration) is statistically indistinguishable from
+    // ternary, so it can be stored at ~1.58 bpp without measurable quality
+    // loss. This C-level implementation packs at 2 bpp (4 trits/byte) for
+    // simplicity — the tighter 5-trits-per-byte packing (true 1.58 bpp via
+    // base-3 encoding) is a future optimisation that doesn't change the API.
+    //
+    // Ternary bands ignore band_bits[b] for both encoding (scale = amax,
+    // deadband at 0.5*amax) and decoding. They share the fp16 scale header
+    // with regular bands. SP_MAX_BANDS is bounded well under 32 so a
+    // uint32_t mask is sufficient.
+    //
+    // Set via sp_band_config_init_ext(); sp_band_config_init() leaves the
+    // mask at zero, preserving existing callers' behaviour.
+    uint32_t ternary_band_mask;
 } sp_band_config_t;
 
 // Resolve the [offset, size) span of band `b` in the coefficient vector.
@@ -216,9 +234,20 @@ static inline void sp_band_span(const sp_band_config_t *bc, int b,
     *size_out   = sz;
 }
 
-// Compute band configuration from config.
+// Compute band configuration from config. Equivalent to
+// sp_band_config_init_ext(bc, head_dim, n_bands, band_bits, 0u) — no
+// ternary bands. Existing callers keep their current behaviour.
 void sp_band_config_init(sp_band_config_t *bc, int head_dim,
                          int n_bands, const int *band_bits);
+
+// Extended initialiser that accepts a ternary band mask (bit b set ⇒
+// band b is quantised to {-1, 0, +1} at 2 bpp). Used by the strange-
+// attractor stack ternary noise-tail (5/5/4/1.58 — band 3 ternary on top
+// of the 5/5/4/3 ship preset). The mask must reference only valid bands;
+// bits beyond n_bands are ignored.
+void sp_band_config_init_ext(sp_band_config_t *bc, int head_dim,
+                             int n_bands, const int *band_bits,
+                             uint32_t ternary_band_mask);
 
 // Quantize VHT2 coefficients into banded format.
 // vht2_coeffs: input (head_dim floats, already VHT2'd and optionally reordered)

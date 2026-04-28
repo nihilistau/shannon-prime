@@ -317,17 +317,28 @@ void sp_mobius_unreorder(float *vht2_coeffs, const sp_mobius_mask_t *mask) {
 
 void sp_band_config_init(sp_band_config_t *bc, int head_dim,
                          int n_bands, const int *band_bits) {
-    bc->n_bands   = n_bands;
-    bc->head_dim  = head_dim;
-    bc->band_size = head_dim / n_bands;
+    sp_band_config_init_ext(bc, head_dim, n_bands, band_bits, 0u);
+}
+
+void sp_band_config_init_ext(sp_band_config_t *bc, int head_dim,
+                             int n_bands, const int *band_bits,
+                             uint32_t ternary_band_mask) {
+    bc->n_bands           = n_bands;
+    bc->head_dim          = head_dim;
+    bc->band_size         = head_dim / n_bands;
+    bc->ternary_band_mask = ternary_band_mask;
 
     int total = 0;
     for (int b = 0; b < n_bands; b++) {
         bc->band_bits[b] = band_bits[b];
         int off, sz;
         sp_band_span(bc, b, &off, &sz);
-        // Per band: 2 bytes (fp16 scale) + ceil(sz * bits / 8) bytes
-        int data_bits = sz * band_bits[b];
+        // Per band: 2 bytes (fp16 scale) + ceil(sz * eff_bits / 8) bytes
+        // where eff_bits is 2 for ternary bands (deadband {-1,0,+1} packed
+        // 4-per-byte) or band_bits[b] for regular signed-int bands.
+        const int is_ternary = (ternary_band_mask & (1u << b)) ? 1 : 0;
+        const int eff_bits = is_ternary ? 2 : band_bits[b];
+        int data_bits  = sz * eff_bits;
         int data_bytes = (data_bits + 7) / 8;
         total += 2 + data_bytes; // fp16 scale + packed data
     }
@@ -342,6 +353,53 @@ void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
         int band_off, band_sz;
         sp_band_span(bc, b, &band_off, &band_sz);
         const float *band = vht2_coeffs + band_off;
+
+        // ── Ternary noise-tail path ──────────────────────────────────────
+        // Bit b set in the ternary mask ⇒ quantise to {-1, 0, +1} via a
+        // deadband at 0.5*amax. Scale = amax (no max_val division). 2 bits
+        // per coefficient, mapping -1→0, 0→1, +1→2 for storage. The fp16
+        // scale header is identical to the signed-int path so format
+        // consumers can read the scale uniformly.
+        if (bc->ternary_band_mask & (1u << b)) {
+            float amax = 0.0f;
+            for (int i = 0; i < band_sz; i++) {
+                float a = fabsf(band[i]);
+                if (a > amax) amax = a;
+            }
+
+            uint16_t scale_f16 = sp_f32_to_f16(amax);
+            out[offset]     = scale_f16 & 0xFF;
+            out[offset + 1] = (scale_f16 >> 8) & 0xFF;
+            offset += 2;
+
+            // Recover the fp16-rounded scale for the threshold so encode
+            // and decode agree byte-for-byte (same logic as the signed
+            // path's inv_scale round-trip).
+            float scale_stored = sp_f16_to_f32(scale_f16);
+            float threshold    = 0.5f * scale_stored;
+
+            uint64_t bit_buffer = 0;
+            int      bit_pos    = 0;
+            for (int i = 0; i < band_sz; i++) {
+                int q = 0;
+                if      (band[i] >  threshold) q = 1;
+                else if (band[i] < -threshold) q = -1;
+                // Store as 2-bit unsigned, offset by 1: -1→0, 0→1, +1→2.
+                uint32_t u = (uint32_t)(q + 1);
+                bit_buffer |= ((uint64_t)u << bit_pos);
+                bit_pos += 2;
+                while (bit_pos >= 8) {
+                    out[offset++] = (uint8_t)(bit_buffer & 0xFF);
+                    bit_buffer >>= 8;
+                    bit_pos -= 8;
+                }
+            }
+            if (bit_pos > 0) {
+                out[offset++] = (uint8_t)(bit_buffer & 0xFF);
+            }
+            continue;
+        }
+
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1; // e.g. 5-bit → 15
 
@@ -408,6 +466,38 @@ void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
         int band_off, band_sz;
         sp_band_span(bc, b, &band_off, &band_sz);
         float *band = vht2_coeffs + band_off;
+
+        // ── Ternary noise-tail path ──────────────────────────────────────
+        // Mirrors the encode-side ternary branch. Reads the fp16 scale,
+        // unpacks 2 bits/coeff into {0,1,2}, maps back to {-1,0,+1}·scale.
+        if (bc->ternary_band_mask & (1u << b)) {
+            uint16_t scale_f16 = (uint16_t)in[offset]
+                               | ((uint16_t)in[offset + 1] << 8);
+            float scale = sp_f16_to_f32(scale_f16);
+            if (!isfinite(scale)) scale = 0.0f;
+            offset += 2;
+
+            uint64_t bit_buffer = 0;
+            int      bit_pos    = 0;
+            int      byte_idx   = offset;
+            for (int i = 0; i < band_sz; i++) {
+                while (bit_pos < 2) {
+                    bit_buffer |= ((uint64_t)in[byte_idx++] << bit_pos);
+                    bit_pos += 8;
+                }
+                uint32_t u = (uint32_t)(bit_buffer & 0x3u);
+                bit_buffer >>= 2;
+                bit_pos -= 2;
+                // u ∈ {0, 1, 2} → {-1, 0, +1}. Any other value (would only
+                // happen on corrupted input) maps to 0.
+                int q = (int)u - 1;
+                if (q < -1 || q > 1) q = 0;
+                band[i] = (float)q * scale;
+            }
+            offset = byte_idx;
+            continue;
+        }
+
         int bits = bc->band_bits[b];
         int max_val = (1 << (bits - 1)) - 1;
         uint32_t mask = (1u << bits) - 1;
