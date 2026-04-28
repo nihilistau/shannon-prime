@@ -554,6 +554,99 @@ static void test_banded_quant_non_divisible(void) {
 }
 
 // ============================================================================
+// Ternary noise-tail round-trip (5/5/4/1.58 — band 3 quantised to {-1,0,+1}
+// at 2 bpp). Validates sp_band_config_init_ext + the ternary branches in
+// sp_band_quantize / sp_band_dequantize. Three properties:
+//
+//   1. total_bytes accounting: ternary band 3 (size 16 at hd=64) costs
+//      2 bytes scale + ceil(16*2/8) = 4 bytes data = 6 bytes per vec,
+//      versus 2 + ceil(16*3/8) = 8 bytes for 3-bit signed. Net 2 byte
+//      saving per vec.
+//   2. Round-trip preserves sign structure: every reconstructed coeff
+//      lies in {-amax, 0, +amax} where amax was the input band's amax.
+//   3. Reconstruction correlation is bounded — for a smooth sinusoidal
+//      band the ternary path should still recover ≥0.7 corr (much
+//      lower than the 3-bit path's 0.95+, which is the whole point —
+//      ternary is meant for the noise tail where high correlation
+//      doesn't carry information anyway).
+static void test_banded_quant_ternary(void) {
+    printf("\n== Banded Quant Ternary (5/5/4/1.58 noise-tail) ==\n");
+
+    const int hd      = 64;
+    const int n_bands = 4;
+    int bits[4] = {5, 5, 4, 3};   // band 3 's bits[3]=3 ignored under ternary
+    const uint32_t ternary_mask = 1u << 3;   // band 3 only
+
+    sp_band_config_t bc;
+    sp_band_config_init_ext(&bc, hd, n_bands, bits, ternary_mask);
+
+    char msg[256];
+
+    // Property 1: byte accounting. Each band has size 16. Bands 0-2 pay
+    // 2 + ceil(16*bits/8) bytes; band 3 (ternary) pays 2 + ceil(16*2/8) = 6.
+    int expected = 0;
+    for (int b = 0; b < n_bands; b++) {
+        int eff_bits = (b == 3) ? 2 : bits[b];
+        expected += 2 + (16 * eff_bits + 7) / 8;
+    }
+    snprintf(msg, sizeof(msg),
+             "total_bytes=%d (expected %d for 5/5/4/[2-bpp ternary])",
+             bc.total_bytes, expected);
+    CHECK(bc.total_bytes == expected, msg);
+    snprintf(msg, sizeof(msg), "ternary_band_mask=0x%x (expect 0x8)", bc.ternary_band_mask);
+    CHECK(bc.ternary_band_mask == 0x8u, msg);
+
+    // Property 2 + 3: round-trip a deterministic input and check the
+    // reconstructed band 3 lies in {-amax, 0, +amax}, with corr > 0.7.
+    float orig[64];
+    for (int i = 0; i < hd; i++) {
+        // Bands 0-2 (idx 0..47): smooth sinusoid (compressible).
+        // Band 3 (idx 48..63): noisier sinusoid + small offset.
+        if (i < 48) orig[i] = 0.5f * sinf(0.13f * (float)i);
+        else        orig[i] = 0.3f * sinf(0.71f * (float)i) + 0.05f;
+    }
+
+    float recon[64];
+    uint8_t buf[256];
+    sp_band_quantize(orig, buf, &bc);
+    sp_band_dequantize(buf, recon, &bc);
+
+    // Find band-3 amax (after fp16 round-trip, so use the encoded value
+    // which is what the decoder sees).
+    float amax_in = 0.0f;
+    for (int i = 48; i < 64; i++) {
+        float a = fabsf(orig[i]);
+        if (a > amax_in) amax_in = a;
+    }
+    // amax goes through fp16 once, so reconstructed values are
+    // {-amax_f16, 0, +amax_f16} for some round of amax_in. Tolerance
+    // 1e-2 is comfortable above fp16 ULP at this magnitude.
+    int n_neg = 0, n_zero = 0, n_pos = 0, n_other = 0;
+    for (int i = 48; i < 64; i++) {
+        float v = recon[i];
+        if      (fabsf(v) < 1e-3f)               n_zero++;
+        else if (fabsf(v - amax_in) < 1e-2f)     n_pos++;
+        else if (fabsf(v + amax_in) < 1e-2f)     n_neg++;
+        else                                     n_other++;
+    }
+    snprintf(msg, sizeof(msg),
+             "band 3 reconstruction in {-amax, 0, +amax}: pos=%d zero=%d neg=%d other=%d",
+             n_pos, n_zero, n_neg, n_other);
+    CHECK(n_other == 0, msg);
+
+    float corr = sp_correlation_f32(orig + 48, recon + 48, 16);
+    snprintf(msg, sizeof(msg),
+             "band 3 corr after ternary round-trip: %.4f (need > 0.7)", corr);
+    CHECK(corr > 0.7f, msg);
+
+    // Sanity: bands 0-2 (regular signed-int path) still reconstruct well.
+    float corr_head = sp_correlation_f32(orig, recon, 48);
+    snprintf(msg, sizeof(msg),
+             "bands 0-2 corr (5/5/4 path unchanged): %.4f (need > 0.95)", corr_head);
+    CHECK(corr_head > 0.95f, msg);
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -574,6 +667,7 @@ int main(void) {
     test_compression_ratios();
     test_vilenkin_successive();
     test_banded_quant_non_divisible();
+    test_banded_quant_ternary();
 
     printf("\n==================================\n");
     printf("Results: %d/%d passed\n", tests_passed, tests_run);
