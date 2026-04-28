@@ -47,15 +47,46 @@ For the pairs above, the existing **Ship default** preset (`SHANNON_PRIME_K_BITS
 
 If you want to push the draft harder while keeping the target safe — see "Differential Compression" below.
 
-## Differential Compression — Roadmap
+## Differential Compression
 
 The SP architecture has a free win waiting for speculative deployments: the draft's KV cache is the *cheapest* place to push compression hard, because draft errors are recoverable on target verification. A draft quantised to ternary or 1-bit bands that loses a few percent of acceptance is still net-positive if the gain in draft tok/sec exceeds the verification rejection cost.
 
-Today the bridge can't apply different SP defaults to the target and the draft because env-var lookup is process-wide. Differential compression requires:
+### What's implemented today
 
-1. **Role-aware init** — a `sp_llama_init_with_role(params, ROLE)` API where ROLE ∈ {TARGET, DRAFT}. Implementation reads `SHANNON_PRIME_DRAFT_*` env vars first when role is DRAFT, then falls back to the existing `SHANNON_PRIME_*` vars.
-2. **Patch surgery in llama.cpp's speculative init** — the existing `b8861-full-engine.patch` calls `sp_llama_init(...)` once. Speculative integration needs the patch to detect that it's initialising the draft context and call `sp_llama_init_with_role(..., ROLE_DRAFT)`.
-3. **Draft preset shortcut** — `SHANNON_PRIME_DRAFT_PRESET=aggressive` picks `K_BITS=2,1`, `V_BITS=1` for the draft. One env var, no per-band knob fiddling.
+The bridge ships with a role-aware initialiser that lets a caller compress the draft and target contexts differently:
+
+```c
+sp_llama_ctx_t *target = sp_llama_init_with_role(&p, SP_LLAMA_ROLE_TARGET);
+sp_llama_ctx_t *draft  = sp_llama_init_with_role(&q, SP_LLAMA_ROLE_DRAFT);
+```
+
+When a context is initialised with `SP_LLAMA_ROLE_DRAFT`, every `SHANNON_PRIME_X` env-var lookup tries `SHANNON_PRIME_DRAFT_X` first and falls back to `SHANNON_PRIME_X` if unset. So you can:
+
+```bash
+# Target uses the ship default; draft drops to ternary K and 1-bit V.
+SHANNON_PRIME_ENABLED=1 \
+SHANNON_PRIME_K_BITS=5,5,4,3 \
+SHANNON_PRIME_V_BITS=3 \
+SHANNON_PRIME_DRAFT_K_BITS=2,1 \
+SHANNON_PRIME_DRAFT_V_BITS=1 \
+./llama-cli -m target.gguf -md draft.gguf ...
+```
+
+A `SHANNON_PRIME_DRAFT_PRESET` shortcut covers the common cases without per-band knob fiddling:
+
+| Preset value | Expands to | Compression | Expected acceptance hit |
+|---|---|---|---|
+| `aggressive` | K=2,1 V=1 | ~10× | 5–15% |
+| `ternary`    | K=2,2 V=2 | ~7×  | 2–8%  |
+| `ship`       | (no-op — keep ship defaults) | 3.4× | ~0% |
+
+`SP_LLAMA_ROLE_DEFAULT` and `SP_LLAMA_ROLE_TARGET` both bypass the prefixed lookup, so existing callers see no behavioural change.
+
+### What's still pending
+
+The bridge API is in place but the llama.cpp patch (`patches/llama-cpp-b8861-full-engine.patch`) still calls `sp_llama_init(...)` for both contexts. To wire differential compression end-to-end, the patch needs to detect the speculative draft init path and route it through `sp_llama_init_with_role(..., SP_LLAMA_ROLE_DRAFT)` instead. That's a focused surgical edit on the patch's `llama_kv_cache_init` (or equivalent) — tracking it as a separate work item.
+
+Until the patch wires through, setting `SHANNON_PRIME_DRAFT_*` env vars has no effect — both contexts hit the `ROLE_DEFAULT` path and read the global names. The header API and the env schema are the staging ground for the patch wiring.
 
 Tracking issue: see `FUTURE-WORK.md` section 8a in the workspace root.
 
