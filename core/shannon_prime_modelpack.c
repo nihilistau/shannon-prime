@@ -60,6 +60,11 @@ static const sp_model_preset_t g_presets[] = {
         .recommend_hierarchical = true,   // 35B-A3B: scaling law projects <0.1% PPL hier hit
         .graph_size_mult       = 384,     // MoE routing overhead: 40 layers × MoE expansion
         .recommend_fp8         = true,    // smooth V distributions benefit from fp8 range
+        // Qwen3.6 hybrid + dense Qwen 2.5 share the Qwen tokeniser; 1.5B is
+        // the smallest dense Qwen 3.x with stable acceptance against a 35B
+        // hybrid target. 0.5B works but acceptance dips to ~55%.
+        .suggested_draft   = "Qwen2.5-1.5B-Instruct",
+        .suggested_draft_acceptance = 0.65f,
         .status            = SP_PRESET_PROVISIONAL,
     },
 
@@ -81,6 +86,8 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = true,
         .recommend_spinor  = true,
+        .suggested_draft   = "Qwen2.5-1.5B-Instruct",
+        .suggested_draft_acceptance = 0.65f,
         .status            = SP_PRESET_PROVISIONAL,
     },
 
@@ -100,6 +107,11 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = true,
         .recommend_spinor  = false,
+        // Qwen 2.5 0.5B is the canonical small-draft for the dense Qwen
+        // family. Same vocab across 0.5B/1.5B/3B/7B/14B/32B/72B targets,
+        // 65-75% acceptance in informal testing on 7B/14B targets.
+        .suggested_draft   = "Qwen2.5-0.5B-Instruct",
+        .suggested_draft_acceptance = 0.70f,
         .status            = SP_PRESET_PROVISIONAL,
     },
 
@@ -124,6 +136,10 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = true,
         .recommend_spinor  = false,
+        // Gemma 4 inherits gemma3's draft suggestion until calibration
+        // numbers diverge — same family, same tokeniser.
+        .suggested_draft   = "gemma-2-2b-it",
+        .suggested_draft_acceptance = 0.60f,
         .status            = SP_PRESET_PROVISIONAL,
     },
 
@@ -145,6 +161,11 @@ static const sp_model_preset_t g_presets[] = {
         .recommend_spinor  = false,
         .graph_size_mult       = 320,     // 48 layers on 12B variant; default 256 overflows
         .recommend_hierarchical = true,   // 12B+: scaling law projects competitive with ship
+        // Gemma 2 2B-it is the smallest draft with the gemma vocab; on
+        // gemma-3-12b targets acceptance dips toward 55% on long-form
+        // code generation.
+        .suggested_draft   = "gemma-2-2b-it",
+        .suggested_draft_acceptance = 0.60f,
         .status            = SP_PRESET_PROVISIONAL,
     },
 
@@ -170,6 +191,10 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = false,
         .recommend_spinor  = false,
+        // phi-3-mini is the standard Phi family draft. Acceptance hovers
+        // around 65-70% on phi-4 / phi-3.1-medium targets at default temp.
+        .suggested_draft   = "Phi-3-mini-4k-instruct",
+        .suggested_draft_acceptance = 0.65f,
         .status            = SP_PRESET_CALIBRATED,
     },
 
@@ -191,6 +216,11 @@ static const sp_model_preset_t g_presets[] = {
         .use_mobius        = true,
         .recommend_sqfree  = false,    // ship path is strong enough
         .recommend_spinor  = false,
+        // Llama 3.2 1B is the official small-draft for Llama 3.x.
+        // Acceptance 60-70% on 8B targets, 55-65% on 70B (where the
+        // capability gap is wider).
+        .suggested_draft   = "Llama-3.2-1B-Instruct",
+        .suggested_draft_acceptance = 0.65f,
         .status            = SP_PRESET_PROVISIONAL,
     },
 };
@@ -285,4 +315,15 @@ int sp_model_preset_describe(const sp_model_preset_t *preset,
                     preset->recommend_spinor ? "recommended" : "off",
                     preset->status == SP_PRESET_CALIBRATED
                         ? "CALIBRATED" : "PROVISIONAL");
+}
+
+const char *sp_model_preset_suggested_draft(const sp_model_preset_t *preset,
+                                            float *acceptance_out)
+{
+    if (!preset) {
+        if (acceptance_out) *acceptance_out = 0.0f;
+        return NULL;
+    }
+    if (acceptance_out) *acceptance_out = preset->suggested_draft_acceptance;
+    return preset->suggested_draft;
 }

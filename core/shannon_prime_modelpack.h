@@ -86,6 +86,26 @@ typedef struct {
     // (typically: smooth V-cache distributions where fp8's dynamic range wins)
     bool  recommend_fp8;
 
+    // Recommended draft model for speculative decoding.
+    //
+    // suggested_draft is a free-form hint string — typically a substring of
+    // a GGUF filename or a human-friendly model designation that the user
+    // should look for in their model directory. Examples:
+    //   "qwen2.5-0.5b-instruct-q8_0.gguf"   exact filename hint
+    //   "Qwen2.5-0.5B"                      family + size hint
+    //   ""                                   empty = no recommendation
+    //
+    // Same family + tokeniser is the only hard requirement at the API
+    // layer. This field exists so a future auto-select-draft helper can
+    // suggest a draft to the user based on the resolved preset; the
+    // current registry just stores the recommendation as documentation.
+    //
+    // suggested_draft_acceptance is a coarse expected-acceptance hint
+    // (0.0..1.0) for the suggested draft on this target. 0.0 means
+    // "no published number". Used purely for reporting / UX hints.
+    const char *suggested_draft;
+    float       suggested_draft_acceptance;
+
     // Status
     sp_preset_status_t status;
 } sp_model_preset_t;
@@ -121,6 +141,15 @@ int sp_model_preset_count(void);
 // would have been written, C-standard snprintf style).
 int sp_model_preset_describe(const sp_model_preset_t *preset,
                              char *out, size_t size);
+
+// Get the suggested draft model for a target preset. Returns the
+// `suggested_draft` string (NULL or empty when the preset has no
+// recommendation). `acceptance_out` is filled with the expected
+// acceptance hint (0.0..1.0; 0.0 means "no published number"); pass
+// NULL to ignore. Pure accessor — no allocation, returned pointer
+// aliases preset's static storage.
+const char *sp_model_preset_suggested_draft(const sp_model_preset_t *preset,
+                                            float *acceptance_out);
 
 #ifdef __cplusplus
 }
