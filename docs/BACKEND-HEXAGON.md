@@ -67,33 +67,119 @@ If you must work on native Windows, see the "Windows setup gotchas" section belo
 
 ### WSL2 / Ubuntu 20.04 path (recommended)
 
-1. **Install WSL2 + Ubuntu 20.04** if you don't have it:
-   ```
-   wsl --install -d Ubuntu-20.04
-   ```
+#### One-time check: do you already have WSL + Ubuntu?
 
-2. **Install the SDK inside WSL**, not at `C:\Qualcomm`. The Linux installer is on Qualcomm's Package Manager (QPM3) site or as a tarball. The qaic prebuilts under `ipc/fastrpc/qaic/Ubuntu20/` are the ones the Linux setup script picks up.
+```powershell
+wsl --status
+wsl --list --verbose
+```
 
-3. **From WSL, source the env script**:
-   ```bash
-   source $HEXAGON_SDK_ROOT/setup_sdk_env.source
-   ```
+If you see **Ubuntu-20.04 — Stopped — WSL2** (or similar) you're good. Skip to step 2. If not, install:
 
-4. **Verify the toolchain**:
-   ```bash
-   hexagon-clang --version
-   ```
-   Should print `QuIC LLVM Hexagon Clang version 8.7.06` (or whatever your SDK version is).
+```powershell
+wsl --install -d Ubuntu-20.04
+# (one-time first launch will prompt for username + password)
+```
 
-5. **Build the calculator example**:
-   ```bash
-   cd $HEXAGON_SDK_ROOT/examples/calculator
-   make tree V=hexagon_Release_dynamic_toolv87_v69
-   ```
-   This builds the DSP-side .so and the ARM-side .so. If both produce binaries without errors, the SDK is functional.
+#### Step 1 — Start the distro and update apt
 
-6. **For phone deployment** (still works from WSL via `/mnt/c/Users/.../platform-tools/adb.exe` or by installing adb in WSL itself):
-   - S22 Ultra in USB Debugging mode (or wireless ADB on a known port)
+```powershell
+wsl -d Ubuntu-20.04
+```
+
+You should land at a `username@host:~$` prompt. Update apt and install the dependencies the Hexagon SDK install scripts assume:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential cmake make python3 python3-pip default-jdk \
+    git curl wget xz-utils libncurses5 libncursesw5 lib32stdc++6 zlib1g lib32z1
+```
+
+`libncurses5` and `lib32stdc++6` are the legacy 32-bit libs the bundled Hexagon Tools sometimes need on modern Ubuntu. Worth installing once even though you may not hit the dependency until later milestones.
+
+#### Step 2 — Download the Hexagon SDK Linux variant
+
+Two ways:
+
+**A. Via Qualcomm Package Manager (QPM3)** — recommended, handles the EULA flow automatically:
+
+```bash
+# Download from https://qpm.qualcomm.com (requires free Qualcomm account login)
+# Pick "Hexagon SDK 5.5.6.0 Linux" - delivered as an installer .bin
+chmod +x qualcomm_hexagon_sdk_5.5.6.0.bin
+./qualcomm_hexagon_sdk_5.5.6.0.bin
+# Default install path: ~/Qualcomm/Hexagon_SDK/5.5.6.0/
+```
+
+**B. Reuse the Windows install via /mnt/c** — saves the download but requires the Windows install to be functional (most things ARE there; only the broken WinNT bits we hit in the gotchas section don't matter for Linux):
+
+```bash
+# Inside WSL, reference the Windows-side install directly
+export HEXAGON_SDK_ROOT="/mnt/c/Qualcomm/Hexagon_SDK/5.5.6.0"
+ls $HEXAGON_SDK_ROOT/setup_sdk_env.source    # confirm Linux setup exists
+```
+
+The reuse path works because the Linux variants of qaic / hexagon-clang / cmake all live inside the SDK install regardless of host OS — Qualcomm ships everything cross-platform; only the entry-point scripts diverge. If the Windows install is missing the `setup_sdk_env.source` (Linux equivalent), you'll need approach A.
+
+#### Step 3 — Source the Linux env script
+
+```bash
+source $HEXAGON_SDK_ROOT/setup_sdk_env.source
+```
+
+This sets `HEXAGON_SDK_ROOT`, `DEFAULT_DSP_ARCH`, prepends the toolchain to PATH, and (unlike the Windows version) actually completes without trying to rebuild qaic.
+
+Override the DSP arch for V69 (the S22 Ultra's chip):
+
+```bash
+export DEFAULT_DSP_ARCH=v69
+```
+
+#### Step 4 — Verify the toolchain
+
+```bash
+hexagon-clang --version           # should print QuIC LLVM Hexagon Clang version 8.7.06
+qaic                              # should print qaic IDL compiler usage
+make --version                    # should print GNU Make 4.x
+```
+
+If any of these "command not found", the env didn't take. Common cause: setup_sdk_env.source needs to be sourced (`source`/`.`), not executed (`./`). Re-run with `source`.
+
+#### Step 5 — Build the calculator example
+
+```bash
+cd $HEXAGON_SDK_ROOT/examples/calculator
+make tree V=hexagon_Release_dynamic_toolv87_v69
+```
+
+If both the ARM-side and DSP-side `.so` files produce without errors, the SDK is functional. Output goes to `hexagon_Release_toolv87_v69/ship/`.
+
+#### Step 6 — Push to the S22 Ultra
+
+You can use Windows-side adb from inside WSL by referencing it via `/mnt/c`:
+
+```bash
+alias adb='/mnt/c/Users/Knack/AppData/Local/Android/Sdk/platform-tools/adb.exe'
+adb connect 192.168.8.110:42441   # or whatever port wireless ADB is using
+adb devices                       # should show the SM-S908E
+```
+
+Or install adb inside WSL (`sudo apt install adb`) — both work; using the Windows one means you don't have two adb daemons running on different ports.
+
+Push the built binaries:
+
+```bash
+# DSP-side .so goes to /vendor/lib/rfsa/dsp/sdk/ on the device
+# Host-side .so goes wherever your Android app expects them
+adb push hexagon_Release_toolv87_v69/ship/libcalculator_skel.so /data/local/tmp/
+adb push hexagon_Release_toolv87_v69/ship/libcalculator.so /data/local/tmp/
+adb shell ls -la /data/local/tmp/lib*.so
+```
+
+(Production deployment needs a signed DSP binary; dev mode allows the SDK's default test signature.)
+
+For phone deployment from this point forward:
+   - S22 Ultra in USB Debugging mode (or wireless ADB on a known port — current session was 192.168.8.110:42441, port rotates per pairing)
    - Optional: Qualcomm signature for the DSP binary if running outside dev mode (the SDK ships a default dev signature in `tools/elfsigner/`)
 
 ### Windows setup gotchas (if you must)
