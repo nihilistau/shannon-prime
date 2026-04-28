@@ -147,6 +147,14 @@ nvcc -O2 -o llama-server \
 | Aggressive | 4,4,4,3 | 3 | 3.8× | +0.39% PPL | Very memory-constrained |
 | Mobile | 4,3,3,3 | 3 | 4.3× | +1.98% PPL | Mobile devices |
 | Floor | 3,3,3,3 | 3 | 4.6× | +3.90% PPL | Extreme compression |
+| Spec-draft (target) | 5,5,4,3 | 3 | 3.4× | Beats fp16 | Speculative target — same as Ship default |
+| Spec-draft (draft, future) | 2,1 | 1 | ~10× | Bounded by acceptance | Speculative draft only — see `SPECULATIVE-DECODING.md` |
+
+The `Spec-draft (draft, future)` row reflects the differential-compression roadmap. Today both target and draft share the same SP compression because env vars are process-wide; the aggressive draft preset becomes selectable per-context once the role-aware init API lands (FUTURE-WORK section 8a).
+
+### Speculative Decoding
+
+llama.cpp's `-md` (draft model) flag works with shannon-prime-llama out of the box — both target and draft are routed through the same SP shadow cache. See [`SPECULATIVE-DECODING.md`](SPECULATIVE-DECODING.md) for recommended draft/target pairs, observed acceptance rates, and the differential-compression roadmap.
 
 **Never go below 3-bit on any band.** 2-bit is catastrophic.
 
