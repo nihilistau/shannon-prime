@@ -1170,7 +1170,27 @@ static int sp_read_cache_header(FILE *f, int *packed_stride, int *n_pos,
             fprintf(stderr, "[sp-disk] model hash mismatch: disk=%llx expected=%llx\n",
                     (unsigned long long)disk_hash,
                     (unsigned long long)expected_hash);
-            // Warning only — non-blocking (same as Archimedes)
+            // Strict by default — refuse to load to protect against silent
+            // garbage output from a cross-model load. Escape hatch is
+            // SP_DISK_HASH_STRICT=0 (matches the prior Archimedes-style
+            // warn-only behaviour for advanced users who know what they're
+            // doing). Default flipped from warn-only after the disk-cache
+            // smoke test exposed the API/impl divergence: the C++ wrapper
+            // doc in kv_cache.h:143-147 says mismatch returns -1 from the
+            // load — strict mode honours that contract.
+            //
+            // Returns -2 (vs -1 for "corrupt file") so the layer loop in
+            // sp_*_cache_load can distinguish "abort whole load" from
+            // "skip this layer". Hash mismatch is a security boundary;
+            // a corrupt single-layer file is recoverable best-effort.
+            const char *strict_env = getenv("SP_DISK_HASH_STRICT");
+            const int  warn_only   = strict_env && strict_env[0] == '0';
+            if (!warn_only) {
+                fprintf(stderr, "[sp-disk] refusing to load: hash mismatch is "
+                        "fatal (set SP_DISK_HASH_STRICT=0 to load anyway)\n");
+                return -2;
+            }
+            fprintf(stderr, "[sp-disk] SP_DISK_HASH_STRICT=0 — loading anyway\n");
         }
     }
     return 0;
@@ -1264,7 +1284,12 @@ int sp_shadow_cache_load(sp_shadow_cache_t *sc,
             if (!f) continue;  // Layer not on disk — skip
 
             int pstr, n_pos, n_hd, ctype;
-            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+            int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+            if (hrc == -2) {
+                // Strict-mode hash mismatch — abort entire load.
+                fclose(f); return -1;
+            }
+            if (hrc != 0) {
                 fprintf(stderr, "[sp-disk] K layer %d: bad header in %s\n", il, path);
                 fclose(f); continue;
             }
@@ -1305,7 +1330,11 @@ int sp_shadow_cache_load(sp_shadow_cache_t *sc,
             if (!f) continue;
 
             int pstr, n_pos, n_hd, ctype;
-            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+            int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+            if (hrc == -2) {
+                fclose(f); return -1;
+            }
+            if (hrc != 0) {
                 fprintf(stderr, "[sp-disk] V layer %d: bad header in %s\n", il, path);
                 fclose(f); continue;
             }
@@ -1402,8 +1431,9 @@ int sp_sqfree_cache_load(sp_sqfree_cache_t *sc,
         if (!f) continue;
 
         int pstr, n_pos, n_hd, ctype;
-        if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
-            || pstr != k_bytes || n_hd != n_head) {
+        int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+        if (hrc == -2) { fclose(f); return -1; }   // strict-mode hash mismatch — abort
+        if (hrc != 0 || pstr != k_bytes || n_hd != n_head) {
             fprintf(stderr, "[sp-disk] sqfree K layer %d: config mismatch\n", il);
             fclose(f); continue;
         }
@@ -1418,7 +1448,9 @@ int sp_sqfree_cache_load(sp_sqfree_cache_t *sc,
         snprintf(path, sizeof(path), "%s.l%d.v.vht2", prefix, il);
         f = fopen(path, "rb");
         if (!f) continue;
-        if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0) {
+        hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+        if (hrc == -2) { fclose(f); return -1; }
+        if (hrc != 0) {
             fclose(f); continue;
         }
         for (int ih = 0; ih < n_head; ih++) {
@@ -1531,8 +1563,9 @@ int sp_hier_cache_load(sp_hier_cache_t *sc,
             if (!f) continue;
 
             int pstr, n_pos, n_hd, ctype;
-            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
-                || pstr != k_bpp || n_hd != n_head) {
+            int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+            if (hrc == -2) { fclose(f); return -1; }   // strict-mode hash mismatch — abort
+            if (hrc != 0 || pstr != k_bpp || n_hd != n_head) {
                 fclose(f); continue;
             }
             for (int ih = 0; ih < n_head; ih++) {
@@ -1550,8 +1583,9 @@ int sp_hier_cache_load(sp_hier_cache_t *sc,
             if (!f) continue;
 
             int pstr, n_pos, n_hd, ctype;
-            if (sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash) != 0
-                || pstr != v_bpp || n_hd != n_head) {
+            int hrc = sp_read_cache_header(f, &pstr, &n_pos, &n_hd, &ctype, expected_hash);
+            if (hrc == -2) { fclose(f); return -1; }
+            if (hrc != 0 || pstr != v_bpp || n_hd != n_head) {
                 fclose(f); continue;
             }
             for (int ih = 0; ih < n_head; ih++) {
