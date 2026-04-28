@@ -108,6 +108,19 @@ typedef struct {
     uint32_t k_ternary_mask;
     uint32_t v_ternary_mask;
 
+    // FP8 (E4M3FN) banded quantization toggle. When true, backends with
+    // an fp8 path (the engine's CUDA backend via shannon_prime_fp8.cu,
+    // gated on SP_FP8 / SP_ENGINE_FP8 compile flags) substitute fp8
+    // quantisation for the int8 path on bands where it helps —
+    // primarily V cache, where the smooth distribution favours fp8's
+    // higher dynamic range.
+    //
+    // Backends without an fp8 path (CPU shadow cache, Adreno, current
+    // Vulkan) are expected to log a warning and fall back to int.
+    // Treated as advisory at the config layer; downstream backends
+    // decide what to do with it. Default false preserves the int path.
+    bool     use_fp8;
+
     // Möbius partition mask
     bool     use_mobius_mask;    // Reorder coefficients squarefree-first
     int      skeleton_k;         // VHT2 skeleton size for K (must == head_dim)
