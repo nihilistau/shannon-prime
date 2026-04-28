@@ -647,6 +647,117 @@ static void test_banded_quant_ternary(void) {
 }
 
 // ============================================================================
+// Progressive band reads — sp_band_dequantize_partial. Reconstructs only
+// the first `max_bands` bands of a banded-quantised vector; bands beyond
+// that get zeroed. Two properties:
+//
+//   1. max_bands == n_bands gives byte-identical output to
+//      sp_band_dequantize (the partial path is a strict superset).
+//   2. correlation vs the original input rises monotonically with
+//      max_bands. Energy is concentrated in the early bands (the whole
+//      point of the SP banded layout), so reading more bands strictly
+//      adds information.
+//
+// Used by the disk-paged tier loader: read band 0 from RAM, attention
+// short-circuits if the dot product is determined; otherwise read band 1
+// from disk, repeat. This test pins the math contract; the IO win comes
+// later (phase 2: per-band-major disk format).
+static void test_band_dequantize_partial(void) {
+    printf("\n== Banded Quant Partial Read ==\n");
+
+    const int hd = 128;
+    const int n_bands = 4;
+    int bits[4] = {5, 5, 4, 3};
+
+    sp_band_config_t bc;
+    sp_band_config_init(&bc, hd, n_bands, bits);
+
+    // Generate a deterministic test vector with concentrated low-frequency
+    // energy (matches what real K cache looks like after VHT2). Smooth
+    // sinusoid passes through VHT2 cleanly; the early bands carry most
+    // of the signal.
+    float orig[128];
+    for (int i = 0; i < hd; i++) {
+        orig[i] = 0.6f * sinf(0.083f * (float)i)
+                + 0.2f * sinf(0.41f  * (float)i);
+    }
+
+    float vht2[128];
+    memcpy(vht2, orig, sizeof(orig));
+    sp_vht2_forward_f32(vht2, hd);
+
+    uint8_t buf[256];
+    sp_band_quantize(vht2, buf, &bc);
+
+    // Reconstruct at increasing max_bands and check correlation rises.
+    float prev_corr = -2.0f;   // -2 sentinel ensures first iteration accepts
+    for (int mb = 0; mb <= n_bands; mb++) {
+        float coeffs[128];
+        sp_band_dequantize_partial(buf, coeffs, &bc, mb);
+        // Inverse VHT2 (self-inverse: just call again)
+        float recon[128];
+        memcpy(recon, coeffs, sizeof(recon));
+        sp_vht2_forward_f32(recon, hd);
+
+        float corr = sp_correlation_f32(orig, recon, hd);
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "max_bands=%d: corr=%.4f (%s)",
+                 mb, corr,
+                 mb == 0 ? "all-zero output, corr undefined ≈ 0"
+                         : "rising");
+        if (mb == 0) {
+            // All-zero output: correlation is undefined or near zero; we
+            // accept either. Just check it didn't return NaN.
+            CHECK(isfinite(corr), msg);
+        } else {
+            CHECK(corr >= prev_corr - 0.01f, msg);   // tiny tolerance for fp noise
+        }
+        prev_corr = corr;
+    }
+
+    // Property 1: max_bands == n_bands matches sp_band_dequantize byte-for-byte
+    {
+        float full_partial[128];
+        float full_normal[128];
+        sp_band_dequantize_partial(buf, full_partial, &bc, n_bands);
+        sp_band_dequantize         (buf, full_normal,  &bc);
+        int matches = 1;
+        for (int i = 0; i < hd; i++) {
+            if (full_partial[i] != full_normal[i]) { matches = 0; break; }
+        }
+        CHECK(matches, "max_bands == n_bands matches sp_band_dequantize byte-for-byte");
+    }
+
+    // Property: max_bands == 0 produces all-zero output
+    {
+        float zero_out[128];
+        for (int i = 0; i < hd; i++) zero_out[i] = 1.0f;   // sentinel
+        sp_band_dequantize_partial(buf, zero_out, &bc, 0);
+        int all_zero = 1;
+        for (int i = 0; i < hd; i++) {
+            if (zero_out[i] != 0.0f) { all_zero = 0; break; }
+        }
+        CHECK(all_zero, "max_bands == 0 produces all-zero output");
+    }
+
+    // Property: max_bands clamps to [0, n_bands] (negative + over-range)
+    {
+        float r_neg[128]; float r_over[128]; float r_full[128];
+        sp_band_dequantize_partial(buf, r_neg,  &bc, -5);
+        sp_band_dequantize_partial(buf, r_over, &bc, 999);
+        sp_band_dequantize_partial(buf, r_full, &bc, n_bands);
+        int neg_zero = 1;
+        for (int i = 0; i < hd; i++) {
+            if (r_neg[i] != 0.0f) { neg_zero = 0; break; }
+        }
+        int over_full = (memcmp(r_over, r_full, sizeof(r_full)) == 0);
+        CHECK(neg_zero, "max_bands < 0 clamps to 0 (all-zero output)");
+        CHECK(over_full, "max_bands > n_bands clamps to n_bands (full output)");
+    }
+}
+
+// ============================================================================
 // PrimePE — lattice-aligned RoPE frequency factors. The math core ships
 // integration evidence (kv_cache_is_a_view, paper appendix) but no unit
 // coverage; these tests catch a future refactor regressing the API
@@ -844,6 +955,7 @@ int main(void) {
     test_vilenkin_successive();
     test_banded_quant_non_divisible();
     test_banded_quant_ternary();
+    test_band_dequantize_partial();
     test_primepe_factors();
 
     printf("\n==================================\n");

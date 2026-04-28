@@ -282,6 +282,29 @@ void sp_band_quantize(const float *vht2_coeffs, uint8_t *out,
 void sp_band_dequantize(const uint8_t *in, float *vht2_coeffs,
                         const sp_band_config_t *bc);
 
+// Progressive (partial) dequantize — read only the first `max_bands` bands.
+// Coefficients in bands [0, max_bands) are reconstructed normally.
+// Coefficients in bands [max_bands, n_bands) are written as 0.0f.
+// max_bands must be in [0, bc->n_bands]; max_bands == bc->n_bands gives
+// the same result as sp_band_dequantize. max_bands == 0 zeroes the
+// whole vector.
+//
+// Used by the progressive read path: reconstruct K/V at low fidelity from
+// just band 0 (highest-energy coefficients), add bands 1..N on demand
+// when attention needs more resolution. The input buffer layout is
+// unchanged — bands are still packed contiguously — so this just stops
+// reading early and zeros the unread coefficient positions.
+//
+// The cost saving is in the dequantize math (skipping the unread bands'
+// bit-unpack inner loop) and in the inverse VHT2 that follows: zero
+// coefficients in the high bands collapse butterfly contributions to
+// near-zero on the real-data half of the spectrum, which the compiler
+// + cache hierarchy can exploit. For full IO savings on disk-paged
+// caches, pair with the per-band-major disk layout (phase 2).
+void sp_band_dequantize_partial(const uint8_t *in, float *vht2_coeffs,
+                                const sp_band_config_t *bc,
+                                int max_bands);
+
 // ============================================================================
 // FP8 / FP4 banded quantization (GPU-only, compile-time gated)
 // ============================================================================
