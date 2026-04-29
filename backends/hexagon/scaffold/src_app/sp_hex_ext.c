@@ -412,12 +412,52 @@ int sp_hex_disk_tier_proof(int head_dim) {
            (void *)packed_rpc, bc.total_bytes,
            (void *)out_fp16, sizeof(uint16_t) * head_dim);
 
-    // ── This memcpy is the only "extra" copy. In the production disk
-    // reader, this becomes:  fread(packed_rpc, 1, bc.total_bytes, fp);
-    // — same destination buffer, same operation, just the bytes come
-    // from UFS instead of from packed_host. The DSP doesn't see this
-    // copy; it just sees the rpcmem pointer.
-    memcpy(packed_rpc, packed_host, bc.total_bytes);
+    // ── Write the packed bytes to disk, then fread back into the rpcmem
+    // buffer. Demonstrates the actual production disk-tier path on
+    // Android: bytes round-trip through UFS, land in rpcmem, the DSP
+    // processes from the same physical pages without ever seeing the
+    // intermediate file. The rpcmem buffer is the destination of fread,
+    // not a separate copy buffer.
+    const char *disk_path = "/data/local/tmp/sp_hex/sp_disk_proof.bin";
+    {
+        FILE *fp = fopen(disk_path, "wb");
+        if (!fp) {
+            printf("[disk] fopen(%s, wb) failed\n", disk_path);
+            rpcmem_free(packed_rpc); rpcmem_free(out_fp16);
+            free(coeffs_host); free(packed_host); free(recon_host);
+            sp_hexagon_free(ctx);
+            return 1;
+        }
+        size_t wrote = fwrite(packed_host, 1, bc.total_bytes, fp);
+        fclose(fp);
+        if (wrote != (size_t)bc.total_bytes) {
+            printf("[disk] fwrite short: %zu of %d\n", wrote, bc.total_bytes);
+            rpcmem_free(packed_rpc); rpcmem_free(out_fp16);
+            free(coeffs_host); free(packed_host); free(recon_host);
+            sp_hexagon_free(ctx);
+            return 1;
+        }
+    }
+    {
+        FILE *fp = fopen(disk_path, "rb");
+        if (!fp) {
+            printf("[disk] fopen(%s, rb) failed\n", disk_path);
+            rpcmem_free(packed_rpc); rpcmem_free(out_fp16);
+            free(coeffs_host); free(packed_host); free(recon_host);
+            sp_hexagon_free(ctx);
+            return 1;
+        }
+        size_t read = fread(packed_rpc, 1, bc.total_bytes, fp);
+        fclose(fp);
+        if (read != (size_t)bc.total_bytes) {
+            printf("[disk] fread short: %zu of %d\n", read, bc.total_bytes);
+            rpcmem_free(packed_rpc); rpcmem_free(out_fp16);
+            free(coeffs_host); free(packed_host); free(recon_host);
+            sp_hexagon_free(ctx);
+            return 1;
+        }
+        printf("[disk] fread %zu bytes from %s into rpcmem\n", read, disk_path);
+    }
 
     // ── DSP-side partial dequantize. max_bands=-1 means "all bands" —
     // identical to a full sp_band_dequantize.
