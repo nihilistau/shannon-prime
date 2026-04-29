@@ -61,9 +61,11 @@ struct sp_hexagon_ctx_s {
     // DSP gets the same physical pages via SMMU translation. malloc'd
     // pointers fall back to a marshal copy across the host/DSP boundary.
     //
-    // Reusing one allocation across all round_trip calls also avoids
-    // the rpcmem_alloc/_free overhead per call (each is several µs of
-    // kernel ION-buffer setup + SMMU map/unmap).
+    // Two-deep ping-pong: scratch_*_f32[0] and [1]. The round_trip path
+    // alternates between them so an upcoming caller can prefetch into
+    // [i^1] (e.g., fread the next packed band) while the DSP is still
+    // chewing on [i]. Without this, the I/O and compute pipelines
+    // serialise — disk read latency stacks on top of DSP cycles.
     //
     // RPCMEM_HEAP_ID_SYSTEM = non-contiguous physical memory routed
     // through the cDSP's SMMU. The contiguous heap (HEAP_ID_CONTIG=22)
@@ -73,9 +75,10 @@ struct sp_hexagon_ctx_s {
     // Allocations come back 4 KB-aligned (one physical page minimum),
     // which is also the SMMU translation granularity — no extra page-
     // table walks for the kernels' inner loops.
-    float          *scratch_in_f32;     // rpcmem, head_dim_max * 4 bytes
-    float          *scratch_out_f32;    // rpcmem, head_dim_max * 4 bytes
-    size_t          scratch_bytes;      // size of each scratch buffer
+    float          *scratch_in_f32[2];   // [0]/[1] alternated per round_trip
+    float          *scratch_out_f32[2];
+    size_t          scratch_bytes;       // size of each scratch buffer
+    int             scratch_idx;         // 0 or 1 — flipped per call
 };
 
 // Largest head_dim the engine accommodates without re-allocating.
@@ -161,39 +164,50 @@ sp_hexagon_ctx_t *sp_hexagon_init(const sp_config_t *cfg) {
         return NULL;
     }
 
-    // Pre-allocate the FastRPC-shared scratch. RPCMEM_TRY_MAP_STATIC
-    // tells the FastRPC runtime to pre-map this buffer into the DSP's
-    // address space at allocation time so the first round_trip call
-    // doesn't pay a one-shot map-on-first-use latency.
+    // Pre-allocate the FastRPC-shared scratch — two-deep for ping-pong.
+    // RPCMEM_TRY_MAP_STATIC tells the FastRPC runtime to pre-map at
+    // allocation time so the first round_trip doesn't pay a one-shot
+    // map-on-first-use latency.
     ctx->scratch_bytes = SP_HEXAGON_HEAD_DIM_MAX * sizeof(float);
     int alloc_flags = RPCMEM_DEFAULT_FLAGS | RPCMEM_TRY_MAP_STATIC;
-    ctx->scratch_in_f32  = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
-                                                  alloc_flags,
-                                                  (int)ctx->scratch_bytes);
-    ctx->scratch_out_f32 = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
-                                                  alloc_flags,
-                                                  (int)ctx->scratch_bytes);
-    if (!ctx->scratch_in_f32 || !ctx->scratch_out_f32) {
+    int alloc_ok = 1;
+    for (int b = 0; b < 2; ++b) {
+        ctx->scratch_in_f32[b]  = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         alloc_flags,
+                                                         (int)ctx->scratch_bytes);
+        ctx->scratch_out_f32[b] = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         alloc_flags,
+                                                         (int)ctx->scratch_bytes);
+        if (!ctx->scratch_in_f32[b] || !ctx->scratch_out_f32[b]) {
+            alloc_ok = 0;
+            break;
+        }
+    }
+    if (!alloc_ok) {
         fprintf(stderr, "[Shannon-Prime] hexagon: rpcmem_alloc scratch "
                         "failed; falling back to non-zero-copy\n");
-        // Non-fatal — round_trip will malloc-allocate per call as a
-        // fallback. Leave scratch pointers NULL to signal that path.
-        if (ctx->scratch_in_f32)  rpcmem_free(ctx->scratch_in_f32);
-        if (ctx->scratch_out_f32) rpcmem_free(ctx->scratch_out_f32);
-        ctx->scratch_in_f32  = NULL;
-        ctx->scratch_out_f32 = NULL;
-        ctx->scratch_bytes   = 0;
+        // Non-fatal — round_trip will use stack scratch as fallback.
+        for (int b = 0; b < 2; ++b) {
+            if (ctx->scratch_in_f32[b])  rpcmem_free(ctx->scratch_in_f32[b]);
+            if (ctx->scratch_out_f32[b]) rpcmem_free(ctx->scratch_out_f32[b]);
+            ctx->scratch_in_f32[b]  = NULL;
+            ctx->scratch_out_f32[b] = NULL;
+        }
+        ctx->scratch_bytes = 0;
     } else {
-        ctx->bytes_in_use = ctx->scratch_bytes * 2;
+        ctx->bytes_in_use = ctx->scratch_bytes * 4;  // 2 in + 2 out
     }
+    ctx->scratch_idx = 0;
 
     return ctx;
 }
 
 void sp_hexagon_free(sp_hexagon_ctx_t *ctx) {
     if (!ctx) return;
-    if (ctx->scratch_in_f32)  rpcmem_free(ctx->scratch_in_f32);
-    if (ctx->scratch_out_f32) rpcmem_free(ctx->scratch_out_f32);
+    for (int b = 0; b < 2; ++b) {
+        if (ctx->scratch_in_f32[b])  rpcmem_free(ctx->scratch_in_f32[b]);
+        if (ctx->scratch_out_f32[b]) rpcmem_free(ctx->scratch_out_f32[b]);
+    }
     if (ctx->fastrpc_handle != (remote_handle64)-1) {
         sp_hex_close(ctx->fastrpc_handle);
     }
@@ -247,16 +261,17 @@ static int sp_hex_round_trip_one(sp_hexagon_ctx_t *ctx,
     float  stack_out[SP_HEXAGON_HEAD_DIM_MAX]
         __attribute__((aligned(128)));
 
-    if (ctx->scratch_in_f32 && ctx->scratch_out_f32) {
-        // Zero-copy path: rpcmem-backed scratch reused across calls,
-        // FastRPC bypasses the marshal copy, DSP processes from shared
-        // physical pages directly.
-        in_f32  = ctx->scratch_in_f32;
-        out_f32 = ctx->scratch_out_f32;
+    int idx = ctx->scratch_idx;
+    if (ctx->scratch_in_f32[idx] && ctx->scratch_out_f32[idx]) {
+        // Zero-copy ping-pong path: alternate between [0] and [1] each
+        // call. A caller running an explicit pipeline can prefetch into
+        // ctx->scratch_in_f32[idx ^ 1] (e.g., fread the next packed
+        // band) while this call is running on the DSP.
+        in_f32  = ctx->scratch_in_f32[idx];
+        out_f32 = ctx->scratch_out_f32[idx];
+        ctx->scratch_idx = idx ^ 1;
     } else {
-        // Fallback path: stack scratch, FastRPC will marshal-copy the
-        // input across the IPC boundary and copy the output back. Slower
-        // but correct.
+        // Fallback path: stack scratch, FastRPC will marshal-copy.
         in_f32  = stack_in;
         out_f32 = stack_out;
     }
