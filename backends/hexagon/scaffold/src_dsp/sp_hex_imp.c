@@ -14,12 +14,12 @@
 #include "HAP_farf.h"
 #include "HAP_vtcm_mgr.h"      // HAP_request_VTCM / HAP_release_VTCM / queries
 #include "HAP_perf.h"          // HAP_perf_get_pcycles for the bench IDL
-#include "qurt_hvx.h"          // qurt_hvx_lock / unlock — required before HVX
+#include "qurt_hvx.h"          // qurt_hvx_lock / unlock ? required before HVX
 #include "sp_hex.h"            // qaic-generated header from sp_hex.idl
 #include "sp_hex_kernels.h"    // forwards to SP math core
 #include "shannon_prime.h"     // sp_band_config_t / sp_band_quantize / etc.
 
-// Forward decl — defined in sp_hex_kernels_hvx.c when HVX is available.
+// Forward decl ? defined in sp_hex_kernels_hvx.c when HVX is available.
 // Used directly by the bench IDL to time the HVX path in isolation,
 // vs sp_hex_vht2_f32 which dispatches and would obscure the comparison.
 #ifdef __HVX__
@@ -29,7 +29,7 @@ void sp_hex_vht2_f32_hvx_qf32(float *data, int n);
 
 // Per-session DSP context. Held behind the FastRPC handle that sp_hex_open
 // returns; sp_hex_close releases everything. Sized to fit a few small
-// pieces of state — VTCM pointer, region size, anything else the kernels
+// pieces of state ? VTCM pointer, region size, anything else the kernels
 // will need at the session level.
 //
 // VTCM is V69's tightly-coupled SRAM (~8 MB total on this DSP variant).
@@ -39,7 +39,7 @@ void sp_hex_vht2_f32_hvx_qf32(float *data, int n);
 typedef struct {
     void   *vtcm_ptr;       // NULL if acquisition failed
     int     vtcm_bytes;     // 0 if no region; else bytes acquired
-    int     hvx_locked;     // 1 if qurt_hvx_lock succeeded — required
+    int     hvx_locked;     // 1 if qurt_hvx_lock succeeded ? required
                             //   before any HVX instruction executes on
                             //   this thread; without it, vector ops
                             //   fault and FastRPC returns a transport
@@ -63,7 +63,7 @@ int sp_hex_open(const char *uri, remote_handle64 *handle) {
     if (!sess) return -1;
 
     // Lock the HVX context for this thread. Required before any HVX
-    // instruction executes — without this lock, the first vector op
+    // instruction executes ? without this lock, the first vector op
     // throws a fault and FastRPC returns a transport error to the host.
     // V69 is 128-byte (1024-bit) HVX so we ask for QURT_HVX_MODE_128B.
     // 0 on success; negative if HVX is unavailable for any reason.
@@ -71,7 +71,7 @@ int sp_hex_open(const char *uri, remote_handle64 *handle) {
     sess->hvx_locked = (hvx_rc == 0);
 
     // Try to acquire a VTCM region. single_page_flag=1 asks for one
-    // contiguous physical page — fine for 64 KB which is well under
+    // contiguous physical page ? fine for 64 KB which is well under
     // the V69 page granularity. NULL return means "couldn't get one";
     // the session is still usable, kernels just run against DDR.
     sess->vtcm_ptr = HAP_request_VTCM(SP_HEX_VTCM_BYTES, /*single_page=*/1);
@@ -137,7 +137,7 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
     if ((head_dim & (head_dim - 1)) != 0) return -1;  // pow2 only
     if (iterations < 1) return -1;
 
-    // Cycle bench — scalar reference vs HVX-qf32 (the numerically correct
+    // Cycle bench ? scalar reference vs HVX-qf32 (the numerically correct
     // HVX path). The IEEE-HVX kernel is structurally broken on V69 so we
     // time qf32; user can A/B by editing the kernel call below.
     float input[1024] __attribute__((aligned(128)));
@@ -185,7 +185,7 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
 //   in_vec  --VHT2-->  coeffs  --quantize-->  packed bytes
 //   packed  --dequantize-->  coeffs  --VHT2-->  out_vec
 // VHT2 is self-inverse so the second VHT2 is the inverse. Reconstruction
-// error matches what the math core produces on CPU for the same input —
+// error matches what the math core produces on CPU for the same input ?
 // not fp32 epsilon (that's the no-quantize path).
 int sp_hex_round_trip_f32(remote_handle64 h,
                            const float *in_vec, int in_len,
@@ -222,18 +222,18 @@ int sp_hex_round_trip_f32(remote_handle64 h,
         return -1;
     }
 
-    // 1. Copy in, VHT2 forward via dispatcher (currently scalar — HVX
+    // 1. Copy in, VHT2 forward via dispatcher (currently scalar ? HVX
     // VHT2 has a precision drift issue noted in sp_hex_kernels.c).
     memcpy(coeffs, in_vec, sizeof(float) * head_dim);
     sp_hex_vht2_f32(coeffs, head_dim);
 
-    // 2. Quantize via dispatcher — HVX path activates for head_dim ≥ 128
+    // 2. Quantize via dispatcher ? HVX path activates for head_dim ? 128
     // multiple-of-128, ternary mask zero (the default).
     int packed_used = 0;
     sp_hex_band_quantize_scalar(coeffs, head_dim, packed, sizeof(packed),
                                 &packed_used);
 
-    // 3. Dequantize back to coeffs (still scalar — HVX dequantize TODO).
+    // 3. Dequantize back to coeffs (still scalar ? HVX dequantize TODO).
     sp_band_dequantize(packed, coeffs, &bc);
 
     // 4. VHT2 inverse via dispatcher.
@@ -276,3 +276,100 @@ int sp_hex_band_dequantize(remote_handle64 h,
     return sp_hex_band_dequantize_scalar(in, in_len, head_dim, max_bands,
                                           out_coeffs);
 }
+
+// compress_f32 ? full encode pipeline in one FastRPC dispatch.
+// Mirrors the first half of sp_hex_round_trip_f32 (memcpy, VHT2, quantize)
+// without the dequantize+inverse-VHT2 tail. Used by the host's
+// sp_hexagon_cache_write_{k,v} to land a per-position raw fp32 vector
+// into compressed bytes in one call.
+//
+// The packed_used out-param tells the host exactly how many bytes were
+// written into out_packed. Today this is bc.total_bytes for the {5,5,4,3}
+// ship config ? fixed for a given head_dim ? but exposing it explicitly
+// future-proofs against per-call band-config changes.
+int sp_hex_compress_f32(remote_handle64 h,
+                         const float *in_vec, int in_len,
+                         int head_dim,
+                         unsigned char *out_packed, int out_capacity,
+                         int *packed_used) {
+    (void)h;
+    if (!packed_used) return -1;
+    *packed_used = 0;
+    if (in_len != head_dim) {
+        FARF(ERROR, "[sp_hex] compress: length mismatch in=%d hd=%d",
+             in_len, head_dim);
+        return -1;
+    }
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        FARF(ERROR, "[sp_hex] compress: head_dim=%d must be pow2 in [8,1024]",
+             head_dim);
+        return -1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    if (bc.total_bytes > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress: packed=%d > capacity=%d",
+             bc.total_bytes, out_capacity);
+        return -1;
+    }
+
+    // 128-byte aligned for HVX vmem (the dispatcher routes large enough
+    // head_dim through HVX and the kernels do strict-alignment loads).
+    float coeffs[1024] __attribute__((aligned(128)));
+
+    memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+    sp_hex_vht2_f32(coeffs, head_dim);
+
+    int written = 0;
+    int rc = sp_hex_band_quantize_scalar(coeffs, head_dim, out_packed,
+                                          out_capacity, &written);
+    if (rc != 0) {
+        FARF(ERROR, "[sp_hex] compress: band_quantize rc=%d", rc);
+        return rc;
+    }
+    *packed_used = written;
+    return 0;
+}
+
+// decompress_f32 ? full decode pipeline in one FastRPC dispatch.
+// Mirrors the second half of sp_hex_round_trip_f32 (band_dequantize,
+// then VHT2 self-inverse). Used by the host's sp_hexagon_cache_read_*
+// wrappers. max_bands < 0 (or >= n_bands) means "all bands"; 0 <=
+// max_bands < n_bands triggers the partial-fidelity reconstruction
+// path used by the phase 3 attention short-circuit.
+int sp_hex_decompress_f32(remote_handle64 h,
+                           const unsigned char *packed_in, int packed_len,
+                           int head_dim, int max_bands,
+                           float *out_vec, int out_len) {
+    (void)h;
+    if (out_len != head_dim) {
+        FARF(ERROR, "[sp_hex] decompress: out_len=%d != head_dim=%d",
+             out_len, head_dim);
+        return -1;
+    }
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        FARF(ERROR, "[sp_hex] decompress: head_dim=%d must be pow2 in [8,1024]",
+             head_dim);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+
+    int rc = sp_hex_band_dequantize_scalar(packed_in, packed_len, head_dim,
+                                            max_bands, coeffs);
+    if (rc != 0) {
+        FARF(ERROR, "[sp_hex] decompress: band_dequantize rc=%d", rc);
+        return rc;
+    }
+    // VHT2 is self-inverse ? applying it again returns to the original
+    // basis. The HVX-qf32 kernel is bit-equivalent to scalar within
+    // fp32 epsilon, so this matches the round-trip path's reconstruction.
+    sp_hex_vht2_f32(coeffs, head_dim);
+    memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+    return 0;
+}
+

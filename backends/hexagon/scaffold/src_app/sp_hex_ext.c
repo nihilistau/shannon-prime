@@ -459,6 +459,14 @@ int sp_hex_disk_tier_proof(int head_dim) {
         printf("[disk] fread %zu bytes from %s into rpcmem\n", read, disk_path);
     }
 
+    // ── Defensive cache-clean barrier. FastRPC's marshal does an
+    // implicit cache_clean_invalidate, so today's test passes without
+    // this — but production streaming readers that fill rpcmem AFTER
+    // session init should add an explicit barrier between the host
+    // write and the FastRPC dispatch. ARMv8 DMB ISH drains in-flight
+    // stores; cached-mapped ION (rpcmem default) needs no more.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+
     // ── DSP-side partial dequantize. max_bands=-1 means "all bands" —
     // identical to a full sp_band_dequantize.
     int rc = sp_hexagon_band_dequantize_partial(ctx, packed_rpc,
@@ -500,6 +508,180 @@ int sp_hex_disk_tier_proof(int head_dim) {
     rpcmem_free(packed_rpc);
     rpcmem_free(out_fp16);
     free(coeffs_host); free(packed_host); free(recon_host);
+    sp_hexagon_free(ctx);
+    return test_err;
+}
+#endif  // SP_HEXAGON_FASTRPC
+
+// ----------------------------------------------------------------------------
+// Per-element validation harness for compress_f32 / decompress_f32.
+//
+// THE LESSON: from the 2026-04-29 V69 IEEE-HVX debugging episode, round-trip
+// RMS alone is NOT sufficient. Two paths can produce the same RMS while
+// differing wildly per-element. A proper kernel-vs-reference comparator
+// must be per-element absolute, not just an aggregate scalar.
+//
+// What this exercises:
+//   Path A (DSP): compress_f32(in_vec)  →  packed
+//                 decompress_f32(packed) →  out_vec
+//
+//   Path B (host scalar reference): the same VHT2 + sp_band_quantize +
+//                 sp_band_dequantize + VHT2-inverse pipeline, all on the
+//                 host CPU, no FastRPC.
+//
+// The two outputs must agree per-element to within fp16 narrowing ULP
+// (≈5e-3 on values of order 1.0). Anything larger is either a numerical
+// bug in compress/decompress on the DSP or a layout mismatch.
+//
+// Returns 0 on pass, non-zero on regression.
+// ----------------------------------------------------------------------------
+
+#ifndef SP_HEXAGON_FASTRPC
+int sp_hex_compress_decompress_validate(int head_dim) { (void)head_dim; return 0; }
+#else
+int sp_hex_compress_decompress_validate(int head_dim) {
+    printf("\n[validate] === compress_f32 / decompress_f32 per-element validate ===\n");
+
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        printf("[validate] head_dim=%d invalid (must be pow2 in [8,1024])\n",
+               head_dim);
+        return 1;
+    }
+
+    sp_config_t cfg;
+    sp_config_init(&cfg, head_dim, /*n_layers=*/1, /*n_heads_kv=*/1);
+
+    sp_hexagon_ctx_t *ctx = sp_hexagon_init(&cfg);
+    if (!ctx) {
+        printf("[validate] sp_hexagon_init returned NULL\n");
+        return 1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+
+    // rpcmem-backed in/out for the DSP path (zero-copy).
+    int alloc_flags = RPCMEM_DEFAULT_FLAGS | RPCMEM_TRY_MAP_STATIC;
+    float   *in_vec    = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                            alloc_flags, sizeof(float) * head_dim);
+    uint8_t *packed_rpc = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                            alloc_flags, bc.total_bytes);
+    float   *out_dsp   = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                            alloc_flags, sizeof(float) * head_dim);
+    float   *out_host  = (float   *)malloc(sizeof(float) * head_dim);
+    uint8_t *packed_host = (uint8_t *)malloc(bc.total_bytes);
+
+    if (!in_vec || !packed_rpc || !out_dsp || !out_host || !packed_host) {
+        printf("[validate] alloc failed\n");
+        if (in_vec)      rpcmem_free(in_vec);
+        if (packed_rpc)  rpcmem_free(packed_rpc);
+        if (out_dsp)     rpcmem_free(out_dsp);
+        free(out_host); free(packed_host);
+        sp_hexagon_free(ctx);
+        return 1;
+    }
+
+    fill_deterministic(in_vec, head_dim);
+
+    // ── Path A: DSP via compress_f32 + decompress_f32, two FastRPC calls.
+    int packed_used = 0;
+    int rc = sp_hex_compress_f32(/*handle=*/(remote_handle64)-1, /* unused */
+                                  in_vec, head_dim, head_dim,
+                                  packed_rpc, bc.total_bytes, &packed_used);
+    // Note: we have to dig the FastRPC handle out of ctx — it's opaque from
+    // the engine API surface, so the cleanest path is to call through the
+    // engine's per-position cache. But for a tight per-element comparator
+    // we want to call compress_f32 / decompress_f32 directly. Use the same
+    // sp_hex_open path as sp_hex_process to get a fresh handle.
+    {
+        // Open a private handle for this validation rather than threading
+        // through ctx — keeps the test isolated.
+        char uri_buf[128];
+        snprintf(uri_buf, sizeof(uri_buf), "%s%s", sp_hex_URI, CDSP_DOMAIN);
+        remote_handle64 priv = -1;
+        int orc = sp_hex_open(uri_buf, &priv);
+        if (orc != 0) {
+            printf("[validate] sp_hex_open private handle failed rc=%d\n", orc);
+            rpcmem_free(in_vec); rpcmem_free(packed_rpc); rpcmem_free(out_dsp);
+            free(out_host); free(packed_host);
+            sp_hexagon_free(ctx);
+            return orc;
+        }
+        rc = sp_hex_compress_f32(priv, in_vec, head_dim, head_dim,
+                                  packed_rpc, bc.total_bytes, &packed_used);
+        if (rc != 0) {
+            printf("[validate] compress_f32 rc=0x%x\n", rc);
+            sp_hex_close(priv);
+            rpcmem_free(in_vec); rpcmem_free(packed_rpc); rpcmem_free(out_dsp);
+            free(out_host); free(packed_host);
+            sp_hexagon_free(ctx);
+            return rc;
+        }
+        if (packed_used != bc.total_bytes) {
+            printf("[validate] compress_f32 packed_used=%d expected=%d\n",
+                   packed_used, bc.total_bytes);
+        }
+        rc = sp_hex_decompress_f32(priv, packed_rpc, bc.total_bytes,
+                                    head_dim, /*max_bands=*/-1,
+                                    out_dsp, head_dim);
+        sp_hex_close(priv);
+        if (rc != 0) {
+            printf("[validate] decompress_f32 rc=0x%x\n", rc);
+            rpcmem_free(in_vec); rpcmem_free(packed_rpc); rpcmem_free(out_dsp);
+            free(out_host); free(packed_host);
+            sp_hexagon_free(ctx);
+            return rc;
+        }
+    }
+
+    // ── Path B: host scalar reference — same pipeline on CPU.
+    float coeffs[1024] __attribute__((aligned(16)));
+    memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+    sp_vht2_forward_f32(coeffs, head_dim);
+    sp_band_quantize(coeffs, packed_host, &bc);
+    sp_band_dequantize(packed_host, coeffs, &bc);
+    sp_vht2_forward_f32(coeffs, head_dim);  // self-inverse
+    memcpy(out_host, coeffs, sizeof(float) * head_dim);
+
+    // ── Per-element comparator. The lesson: don't trust RMS alone.
+    float worst = 0.0f;
+    int   worst_idx = -1;
+    double sse = 0.0;
+    for (int i = 0; i < head_dim; ++i) {
+        float d = out_dsp[i] - out_host[i];
+        if (d < 0) d = -d;
+        if (d > worst) { worst = d; worst_idx = i; }
+        sse += (double)d * (double)d;
+    }
+    float rms = (float)sqrt(sse / head_dim);
+    printf("[validate] head_dim=%d  worst=%.3e@i=%d  rms=%.3e\n",
+           head_dim, worst, worst_idx, rms);
+
+    // Tolerance: matching scalar paths is bit-equivalent except for fp32
+    // rounding accumulation through the band layout. ~1e-5 max-abs on
+    // head_dim ≤ 1024 is the target. Loosen to 1e-3 to leave headroom
+    // for the qf32 boundary conversion path's worst case (3.8e-6 at
+    // head_dim=1024 per the 2026-04-29 measurements).
+    int test_err = 0;
+    if (worst > 1e-3f) {
+        printf("[validate] ERROR: per-element worst %.3e exceeds 1e-3 — "
+               "compress/decompress diverged from host reference at i=%d "
+               "(dsp=%.6f host=%.6f). The lesson: a per-element comparator "
+               "catches this where round-trip RMS would not.\n",
+               worst, worst_idx, out_dsp[worst_idx], out_host[worst_idx]);
+        test_err = 1;
+    } else {
+        printf("[validate] Success — DSP compress/decompress matches host "
+               "reference per-element within 1e-3\n");
+    }
+
+    rpcmem_free(in_vec);
+    rpcmem_free(packed_rpc);
+    rpcmem_free(out_dsp);
+    free(out_host);
+    free(packed_host);
     sp_hexagon_free(ctx);
     return test_err;
 }

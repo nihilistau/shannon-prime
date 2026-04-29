@@ -22,23 +22,23 @@
 #include "remote.idl"
 
 // All vectors are fp32 contiguous arrays. head_dim must be a power of 2
-// and at least 8 (matches SP math core invariants — see core/shannon_prime.h).
+// and at least 8 (matches SP math core invariants ? see core/shannon_prime.h).
 //
 // Smoke-test entry: round_trip_f32 takes an input vector and returns the
-// reconstruction after the full SP pipeline (VHT2 forward → band quantize
-// → band dequantize → VHT2 inverse). Numerically reversible to fp32 epsilon
+// reconstruction after the full SP pipeline (VHT2 forward ? band quantize
+// ? band dequantize ? VHT2 inverse). Numerically reversible to fp32 epsilon
 // only when no quantization is applied; for production band configs this
 // reproduces the same reconstruction error profile as the math core.
 //
-// Open/close lifecycle is inherited from remote_handle64 — the FastRPC layer
+// Open/close lifecycle is inherited from remote_handle64 ? the FastRPC layer
 // generates sp_hex_open / sp_hex_close that the host calls before the first
 // method invocation and after the last.
 
 interface sp_hex : remote_handle64 {
 
    // -------------------------------------------------------------------
-   // Smoke-test entry — exercises VHT2 forward + inverse end-to-end.
-   // For the scaffold, no quantization is applied; out_vec ≈ in_vec to
+   // Smoke-test entry ? exercises VHT2 forward + inverse end-to-end.
+   // For the scaffold, no quantization is applied; out_vec ? in_vec to
    // fp32 epsilon. Returns 0 on success.
    // -------------------------------------------------------------------
    long round_trip_f32(in sequence<float> in_vec,
@@ -53,7 +53,7 @@ interface sp_hex : remote_handle64 {
    long vht2_forward(rout sequence<float> data, in long n);
 
    // -------------------------------------------------------------------
-   // Band quantize: VHT2 coefficients → packed banded int8 bytes with
+   // Band quantize: VHT2 coefficients ? packed banded int8 bytes with
    // per-band scales prepended. Layout matches sp_band_quantize in the
    // SP math core (see core/shannon_prime.h:276). For the scaffold the
    // DSP-side impl is a scalar reference; an HVX kernel replaces it once
@@ -79,10 +79,10 @@ interface sp_hex : remote_handle64 {
    // open landed a region (otherwise HVX kernels run against DDR with
    // no perf benefit). Returns:
    //
-   //   bytes_total      — total VTCM on this DSP variant (V69 ≈ 8 MB)
-   //   bytes_avail      — currently unallocated VTCM (other DSP sessions
+   //   bytes_total      ? total VTCM on this DSP variant (V69 ? 8 MB)
+   //   bytes_avail      ? currently unallocated VTCM (other DSP sessions
    //                      and system services compete for this)
-   //   bytes_acquired   — bytes this session reserved at open (0 if the
+   //   bytes_acquired   ? bytes this session reserved at open (0 if the
    //                      acquire call failed; non-zero means we have
    //                      our region and HVX kernels can target it)
    // -------------------------------------------------------------------
@@ -99,7 +99,7 @@ interface sp_hex : remote_handle64 {
    //
    // Each iteration includes a memcpy from a stable input buffer so the
    // timing isolates the transform itself rather than measuring repeated
-   // applications on already-transformed data (VHT2 is self-inverse —
+   // applications on already-transformed data (VHT2 is self-inverse ?
    // running it twice on the same buffer hits a different numerical
    // path).
    // -------------------------------------------------------------------
@@ -107,4 +107,47 @@ interface sp_hex : remote_handle64 {
                    in long iterations,
                    rout long long scalar_pcycles,
                    rout long long hvx_pcycles);
+
+   // -------------------------------------------------------------------
+   // compress_f32 ? single-call full encode pipeline.
+   //
+   //   in_vec  --VHT2-->  coeffs  --band_quantize-->  packed bytes
+   //
+   // Used by the host's sp_hexagon_cache_write_{k,v} wrappers to land
+   // a per-position raw fp32 K/V vector into compressed bytes in ONE
+   // FastRPC dispatch ? half the IPC cost of calling vht2_forward and
+   // band_quantize separately. The packed layout is bit-identical to
+   // the math core's sp_band_quantize so storage emitted here is
+   // interchangeable with the CPU shadow cache.
+   //
+   // The packed_used out-parameter is set to bc.total_bytes so the
+   // caller knows exactly how many bytes were written (the rout
+   // sequence length is whatever capacity the caller supplied; the
+   // header treats the trailing region as undefined).
+   // -------------------------------------------------------------------
+   long compress_f32(in sequence<float> in_vec,
+                     in long head_dim,
+                     rout sequence<octet> out_packed,
+                     rout long packed_used);
+
+   // -------------------------------------------------------------------
+   // decompress_f32 ? single-call full decode pipeline.
+   //
+   //   packed --band_dequantize--> coeffs --VHT2 (self-inverse)--> out_vec
+   //
+   // Used by the host's sp_hexagon_cache_read_{k,v}{,_partial} wrappers
+   // to reconstruct a per-position fp32 K/V vector from compressed bytes
+   // in one FastRPC dispatch. max_bands < 0 (or >= n_bands) is "all
+   // bands" (= sp_band_dequantize); 0 <= max_bands < n_bands triggers
+   // the partial reconstruction path used by the phase 3 attention
+   // short-circuit.
+   //
+   // The packed_in capacity must cover bc.total_bytes for the band
+   // config implicit in head_dim (the scaffold uses {5,5,4,3} ship
+   // defaults today; see sp_hex_imp.c).
+   // -------------------------------------------------------------------
+   long decompress_f32(in sequence<octet> packed_in,
+                       in long head_dim,
+                       in long max_bands,
+                       rout sequence<float> out_vec);
 };

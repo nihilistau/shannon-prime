@@ -347,75 +347,366 @@ long long sp_hexagon_last_call_cycles(const sp_hexagon_ctx_t *ctx) {
     return ctx ? ctx->last_call_cycles : 0;
 }
 
+// ============================================================================
+// sp_hexagon_cache_t — per-position storage with DSP-side compress/decompress
+// ============================================================================
+//
+// Each (layer, head) slot is a max_seq × bc.total_bytes byte block, allocated
+// via rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, ...) so the compress_f32 /
+// decompress_f32 FastRPC calls land in zero-copy SMMU-mapped pages and
+// skip the IPC marshal copy. RPCMEM_TRY_MAP_STATIC pre-maps each slot at
+// allocation time so the first access to a fresh slot doesn't pay
+// map-on-first-use latency.
+//
+// Sizing: a single 32-layer / 8-head model with head_dim=128 and 4096-token
+// max-seq comes to about (32*8) * 4096 * 144 = ~144 MB total, well within
+// the SMMU-mapped budget. Smaller models (Llama-3.2-1B, draft-class)
+// land under 50 MB.
+//
+// Storage offset for a per-position write/read:
+//   offset = pos * total_bytes
+//   slot[layer * n_heads_kv + head] + offset
+
+static int sp_hex_slot_index(const sp_config_t *cfg, int layer, int head) {
+    return layer * cfg->n_heads_kv + head;
+}
+
+// Defensive cache-clean barrier for rpcmem buffers that the host filled
+// mid-pipeline (e.g. fread() into a previously-marshaled rpcmem region).
+// FastRPC's marshal does an implicit cache_clean_invalidate at dispatch
+// time, so today's tests pass without this. But streaming readers that
+// fill rpcmem AFTER the first marshal — disk-tier loaders, KV cache page
+// prefetchers — should call this between the host write and the next
+// FastRPC call to guarantee visibility into the DSP's SMMU-mapped view.
+//
+// Implementation today: a strong memory barrier (__atomic_thread_fence
+// SEQ_CST). On ARMv8 that emits DMB ISH which waits for all in-flight
+// stores to drain to inner-shareable point of unification — sufficient
+// when the buffer is in a cached-mapped ION region (the default for
+// rpcmem_alloc). For uncached regions this is a no-op.
+//
+// Future: when SDK exposes rpcmem_sync_cache (or remote_register_buf with
+// fd-based zero-copy), swap this for the explicit ION clean ioctl.
+static inline void sp_hex_rpcmem_sync_for_dsp(const void *buf, size_t bytes) {
+    (void)buf; (void)bytes;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+int sp_hexagon_cache_init(sp_hexagon_cache_t *cache,
+                           sp_hexagon_ctx_t *ctx,
+                           const sp_config_t *cfg,
+                           int max_seq_len) {
+    if (!cache || !ctx || !cfg || max_seq_len <= 0) return -1;
+    memset(cache, 0, sizeof(*cache));
+    cache->ctx          = ctx;
+    cache->cfg_snapshot = *cfg;
+    cache->max_seq_len  = max_seq_len;
+    cache->n_slots      = cfg->n_layers * cfg->n_heads_kv;
+
+    int k_bits[4] = {5, 5, 4, 3};
+    int v_bits[4] = {3};
+    sp_band_config_init(&cache->k_bands, cfg->head_dim, 4, k_bits);
+    sp_band_config_init(&cache->v_bands, cfg->head_dim, 1, v_bits);
+
+    int alloc_flags = RPCMEM_DEFAULT_FLAGS | RPCMEM_TRY_MAP_STATIC;
+    cache->vec_in_f32  = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, alloc_flags,
+                          SP_HEXAGON_HEAD_DIM_MAX * sizeof(float));
+    cache->vec_out_f32 = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, alloc_flags,
+                          SP_HEXAGON_HEAD_DIM_MAX * sizeof(float));
+    if (!cache->vec_in_f32 || !cache->vec_out_f32) {
+        fprintf(stderr, "[Shannon-Prime] hexagon cache: rpcmem vec scratch alloc failed\n");
+        if (cache->vec_in_f32)  rpcmem_free(cache->vec_in_f32);
+        if (cache->vec_out_f32) rpcmem_free(cache->vec_out_f32);
+        cache->vec_in_f32 = cache->vec_out_f32 = NULL;
+        return -1;
+    }
+
+    cache->k_cache = (uint8_t **)calloc(cache->n_slots, sizeof(uint8_t *));
+    cache->v_cache = (uint8_t **)calloc(cache->n_slots, sizeof(uint8_t *));
+    if (!cache->k_cache || !cache->v_cache) {
+        sp_hexagon_cache_free(cache);
+        return -1;
+    }
+
+    size_t k_slot_bytes = (size_t)max_seq_len * (size_t)cache->k_bands.total_bytes;
+    size_t v_slot_bytes = (size_t)max_seq_len * (size_t)cache->v_bands.total_bytes;
+
+    for (int s = 0; s < cache->n_slots; ++s) {
+        cache->k_cache[s] = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, alloc_flags,
+                              (int)k_slot_bytes);
+        cache->v_cache[s] = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, alloc_flags,
+                              (int)v_slot_bytes);
+        if (!cache->k_cache[s] || !cache->v_cache[s]) {
+            fprintf(stderr, "[Shannon-Prime] hexagon cache: rpcmem slot %d/%d failed "
+                            "(k=%zu v=%zu)\n", s, cache->n_slots, k_slot_bytes, v_slot_bytes);
+            sp_hexagon_cache_free(cache);
+            return -1;
+        }
+        memset(cache->k_cache[s], 0, k_slot_bytes);
+        memset(cache->v_cache[s], 0, v_slot_bytes);
+        ctx->bytes_in_use += k_slot_bytes + v_slot_bytes;
+    }
+    return 0;
+}
+
+void sp_hexagon_cache_free(sp_hexagon_cache_t *cache) {
+    if (!cache) return;
+    if (cache->k_cache) {
+        for (int s = 0; s < cache->n_slots; ++s)
+            if (cache->k_cache[s]) rpcmem_free(cache->k_cache[s]);
+        free(cache->k_cache);
+    }
+    if (cache->v_cache) {
+        for (int s = 0; s < cache->n_slots; ++s)
+            if (cache->v_cache[s]) rpcmem_free(cache->v_cache[s]);
+        free(cache->v_cache);
+    }
+    if (cache->vec_in_f32)  rpcmem_free(cache->vec_in_f32);
+    if (cache->vec_out_f32) rpcmem_free(cache->vec_out_f32);
+    memset(cache, 0, sizeof(*cache));
+}
+
+static void sp_hex_cache_write_one(sp_hexagon_cache_t *cache,
+                                    int layer, int head, int pos,
+                                    const float *vec, int is_k) {
+    if (!cache || !cache->ctx ||
+        cache->ctx->fastrpc_handle == (remote_handle64)-1) return;
+    if (pos < 0 || pos >= cache->max_seq_len) return;
+    int hd = cache->cfg_snapshot.head_dim;
+    if (hd <= 0 || hd > SP_HEXAGON_HEAD_DIM_MAX) return;
+
+    int slot = sp_hex_slot_index(&cache->cfg_snapshot, layer, head);
+    if (slot < 0 || slot >= cache->n_slots) return;
+
+    sp_band_config_t *bc = is_k ? &cache->k_bands : &cache->v_bands;
+    uint8_t *dst_slot = is_k ? cache->k_cache[slot] : cache->v_cache[slot];
+    if (!dst_slot) return;
+    uint8_t *dst = dst_slot + (size_t)pos * (size_t)bc->total_bytes;
+
+    memcpy(cache->vec_in_f32, vec, sizeof(float) * hd);
+    sp_hex_rpcmem_sync_for_dsp(cache->vec_in_f32, sizeof(float) * hd);
+    int packed_used = 0;
+    int rc = sp_hex_compress_f32(cache->ctx->fastrpc_handle,
+                                  cache->vec_in_f32, hd, hd,
+                                  dst, bc->total_bytes,
+                                  &packed_used);
+    if (rc != AEE_SUCCESS || packed_used != bc->total_bytes) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[Shannon-Prime] hexagon: compress_f32 rc=0x%x "
+                    "used=%d expect=%d (slot=%d pos=%d)\n",
+                    rc, packed_used, bc->total_bytes, slot, pos);
+            warned = 1;
+        }
+    }
+}
+
+static void sp_hex_cache_read_one(const sp_hexagon_cache_t *cache,
+                                   int layer, int head, int pos,
+                                   float *out_vec, int is_k, int max_bands) {
+    if (!cache || !cache->ctx ||
+        cache->ctx->fastrpc_handle == (remote_handle64)-1) {
+        if (out_vec && cache) memset(out_vec, 0, sizeof(float) * cache->cfg_snapshot.head_dim);
+        return;
+    }
+    int hd = cache->cfg_snapshot.head_dim;
+    if (hd <= 0 || hd > SP_HEXAGON_HEAD_DIM_MAX) return;
+    if (pos < 0 || pos >= cache->max_seq_len) {
+        memset(out_vec, 0, sizeof(float) * hd);
+        return;
+    }
+    int slot = sp_hex_slot_index(&cache->cfg_snapshot, layer, head);
+    if (slot < 0 || slot >= cache->n_slots) {
+        memset(out_vec, 0, sizeof(float) * hd);
+        return;
+    }
+    const sp_band_config_t *bc = is_k ? &cache->k_bands : &cache->v_bands;
+    uint8_t *src_slot = is_k ? cache->k_cache[slot] : cache->v_cache[slot];
+    if (!src_slot) {
+        memset(out_vec, 0, sizeof(float) * hd);
+        return;
+    }
+    uint8_t *src = src_slot + (size_t)pos * (size_t)bc->total_bytes;
+
+    sp_hexagon_cache_t *cache_mut = (sp_hexagon_cache_t *)cache;
+    int rc = sp_hex_decompress_f32(cache->ctx->fastrpc_handle,
+                                    src, bc->total_bytes,
+                                    hd, max_bands,
+                                    cache_mut->vec_out_f32, hd);
+    if (rc != AEE_SUCCESS) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[Shannon-Prime] hexagon: decompress_f32 rc=0x%x "
+                    "(slot=%d pos=%d)\n", rc, slot, pos);
+            warned = 1;
+        }
+        memset(out_vec, 0, sizeof(float) * hd);
+        return;
+    }
+    memcpy(out_vec, cache_mut->vec_out_f32, sizeof(float) * hd);
+}
+
+void sp_hexagon_cache_write_k(sp_hexagon_cache_t *cache, int layer, int head, int pos, const float *k_vec) {
+    sp_hex_cache_write_one(cache, layer, head, pos, k_vec, 1);
+}
+void sp_hexagon_cache_write_v(sp_hexagon_cache_t *cache, int layer, int head, int pos, const float *v_vec) {
+    sp_hex_cache_write_one(cache, layer, head, pos, v_vec, 0);
+}
+void sp_hexagon_cache_read_k(const sp_hexagon_cache_t *cache, int layer, int head, int pos, float *k_out) {
+    sp_hex_cache_read_one(cache, layer, head, pos, k_out, 1, -1);
+}
+void sp_hexagon_cache_read_v(const sp_hexagon_cache_t *cache, int layer, int head, int pos, float *v_out) {
+    sp_hex_cache_read_one(cache, layer, head, pos, v_out, 0, -1);
+}
+void sp_hexagon_cache_read_k_partial(const sp_hexagon_cache_t *cache, int layer, int head, int pos,
+                                      float *k_out, int max_bands) {
+    sp_hex_cache_read_one(cache, layer, head, pos, k_out, 1, max_bands);
+}
+void sp_hexagon_cache_read_v_partial(const sp_hexagon_cache_t *cache, int layer, int head, int pos,
+                                      float *v_out, int max_bands) {
+    sp_hex_cache_read_one(cache, layer, head, pos, v_out, 0, max_bands);
+}
+
+void sp_hexagon_cache_write_k_batch(sp_hexagon_cache_t *cache, int layer, int head,
+                                     int start_pos, int n_pos, const float *k_vecs) {
+    if (!cache) return;
+    int hd = cache->cfg_snapshot.head_dim;
+    for (int i = 0; i < n_pos; ++i)
+        sp_hexagon_cache_write_k(cache, layer, head, start_pos + i, k_vecs + (size_t)i * hd);
+}
+void sp_hexagon_cache_write_v_batch(sp_hexagon_cache_t *cache, int layer, int head,
+                                     int start_pos, int n_pos, const float *v_vecs) {
+    if (!cache) return;
+    int hd = cache->cfg_snapshot.head_dim;
+    for (int i = 0; i < n_pos; ++i)
+        sp_hexagon_cache_write_v(cache, layer, head, start_pos + i, v_vecs + (size_t)i * hd);
+}
+void sp_hexagon_cache_read_k_batch(const sp_hexagon_cache_t *cache, int layer, int head,
+                                    int start_pos, int n_pos, float *k_out) {
+    if (!cache) return;
+    int hd = cache->cfg_snapshot.head_dim;
+    for (int i = 0; i < n_pos; ++i)
+        sp_hexagon_cache_read_k(cache, layer, head, start_pos + i, k_out + (size_t)i * hd);
+}
+void sp_hexagon_cache_read_v_batch(const sp_hexagon_cache_t *cache, int layer, int head,
+                                    int start_pos, int n_pos, float *v_out) {
+    if (!cache) return;
+    int hd = cache->cfg_snapshot.head_dim;
+    for (int i = 0; i < n_pos; ++i)
+        sp_hexagon_cache_read_v(cache, layer, head, start_pos + i, v_out + (size_t)i * hd);
+}
+
+void sp_hexagon_cache_clear_range(sp_hexagon_cache_t *cache, int start_pos, int end_pos) {
+    if (!cache || start_pos >= end_pos) return;
+    if (start_pos < 0) start_pos = 0;
+    if (end_pos > cache->max_seq_len) end_pos = cache->max_seq_len;
+    int n_clear = end_pos - start_pos;
+    for (int s = 0; s < cache->n_slots; ++s) {
+        if (cache->k_cache[s]) {
+            size_t k_off = (size_t)start_pos * cache->k_bands.total_bytes;
+            size_t k_len = (size_t)n_clear * cache->k_bands.total_bytes;
+            memset(cache->k_cache[s] + k_off, 0, k_len);
+        }
+        if (cache->v_cache[s]) {
+            size_t v_off = (size_t)start_pos * cache->v_bands.total_bytes;
+            size_t v_len = (size_t)n_clear * cache->v_bands.total_bytes;
+            memset(cache->v_cache[s] + v_off, 0, v_len);
+        }
+    }
+}
+
 #else  // !SP_HEXAGON_FASTRPC
 
 // ============================================================================
 // Stub fallback (x86 / desktop / no FastRPC headers available).
-// The bridge sees -1 / NULL and falls back to Adreno/CPU.
+// Bridge sees -1 / NULL and falls back to Adreno/CPU.
 // ============================================================================
 
 int sp_hexagon_caps_probe(sp_hexagon_caps_t *caps) {
     if (!caps) return -1;
     memset(caps, 0, sizeof(*caps));
-    return -1;  // signal "DSP unavailable"
+    return -1;
 }
-
 void sp_hexagon_caps_print(const sp_hexagon_caps_t *caps) {
     if (!caps) return;
-    fprintf(stderr, "Hexagon DSP Capabilities:\n");
-    fprintf(stderr, "  DSP accessible: %s\n", caps->has_dsp ? "yes" : "no");
-    if (!caps->has_dsp) {
-        fprintf(stderr, "  (DSP unavailable - SDK not built or device not "
-                        "Snapdragon)\n");
-    }
+    fprintf(stderr, "Hexagon DSP unavailable (FastRPC not built)\n");
 }
-
 sp_hexagon_ctx_t *sp_hexagon_init(const sp_config_t *cfg) {
     (void)cfg;
     static int warned = 0;
     if (!warned) {
-        fprintf(stderr,
-            "[Shannon-Prime] Hexagon backend not built (SP_HEXAGON_FASTRPC "
-            "undefined). Build the scaffold ARM target for Android to enable. "
-            "Falling back to Adreno or CPU backend.\n");
+        fprintf(stderr, "[Shannon-Prime] Hexagon backend not built "
+                        "(SP_HEXAGON_FASTRPC undefined). Falling back.\n");
         warned = 1;
     }
     return NULL;
 }
-
 void sp_hexagon_free(sp_hexagon_ctx_t *ctx) { (void)ctx; }
+void *sp_hexagon_alloc(sp_hexagon_ctx_t *ctx, size_t n) { (void)ctx; (void)n; return NULL; }
+void  sp_hexagon_free_shared(sp_hexagon_ctx_t *ctx, void *p) { (void)ctx; (void)p; }
+int sp_hexagon_round_trip_k(sp_hexagon_ctx_t *ctx, const uint16_t *i, uint16_t *o) {
+    (void)ctx; (void)i; (void)o; return -1;
+}
+int sp_hexagon_round_trip_v(sp_hexagon_ctx_t *ctx, const uint16_t *i, uint16_t *o) {
+    (void)ctx; (void)i; (void)o; return -1;
+}
+int sp_hexagon_round_trip_k_batch(sp_hexagon_ctx_t *ctx, const uint16_t *i, uint16_t *o, int n) {
+    (void)ctx; (void)i; (void)o; (void)n; return -1;
+}
+int sp_hexagon_band_dequantize_partial(sp_hexagon_ctx_t *ctx, const uint8_t *i,
+                                        uint16_t *o, int max_bands) {
+    (void)ctx; (void)i; (void)o; (void)max_bands; return -1;
+}
+size_t    sp_hexagon_memory_in_use(const sp_hexagon_ctx_t *ctx) { (void)ctx; return 0; }
+long long sp_hexagon_last_call_cycles(const sp_hexagon_ctx_t *ctx) { (void)ctx; return 0; }
 
-void *sp_hexagon_alloc(sp_hexagon_ctx_t *ctx, size_t n_bytes) {
-    (void)ctx; (void)n_bytes; return NULL;
+// Cache stubs (active when sp_hexagon_init returned NULL upstream so cache
+// is never actually constructed; these exist to satisfy bridge linkage).
+int sp_hexagon_cache_init(sp_hexagon_cache_t *c, sp_hexagon_ctx_t *ctx,
+                           const sp_config_t *cfg, int n) {
+    (void)c; (void)ctx; (void)cfg; (void)n; return -1;
 }
-void sp_hexagon_free_shared(sp_hexagon_ctx_t *ctx, void *ptr) {
-    (void)ctx; (void)ptr;
+void sp_hexagon_cache_free(sp_hexagon_cache_t *c) { (void)c; }
+void sp_hexagon_cache_write_k(sp_hexagon_cache_t *c, int l, int h, int p, const float *v) {
+    (void)c; (void)l; (void)h; (void)p; (void)v;
 }
-
-int sp_hexagon_round_trip_k(sp_hexagon_ctx_t *ctx,
-                             const uint16_t *in_fp16, uint16_t *out_fp16) {
-    (void)ctx; (void)in_fp16; (void)out_fp16; return -1;
+void sp_hexagon_cache_write_v(sp_hexagon_cache_t *c, int l, int h, int p, const float *v) {
+    (void)c; (void)l; (void)h; (void)p; (void)v;
 }
-int sp_hexagon_round_trip_v(sp_hexagon_ctx_t *ctx,
-                             const uint16_t *in_fp16, uint16_t *out_fp16) {
-    (void)ctx; (void)in_fp16; (void)out_fp16; return -1;
+void sp_hexagon_cache_read_k(const sp_hexagon_cache_t *c, int l, int h, int p, float *o) {
+    (void)l; (void)h; (void)p;
+    if (o && c) memset(o, 0, sizeof(float) * c->cfg_snapshot.head_dim);
 }
-int sp_hexagon_round_trip_k_batch(sp_hexagon_ctx_t *ctx,
-                                   const uint16_t *in_fp16, uint16_t *out_fp16,
-                                   int n_vectors) {
-    (void)ctx; (void)in_fp16; (void)out_fp16; (void)n_vectors; return -1;
+void sp_hexagon_cache_read_v(const sp_hexagon_cache_t *c, int l, int h, int p, float *o) {
+    (void)l; (void)h; (void)p;
+    if (o && c) memset(o, 0, sizeof(float) * c->cfg_snapshot.head_dim);
 }
-int sp_hexagon_band_dequantize_partial(sp_hexagon_ctx_t *ctx,
-                                        const uint8_t *in_packed,
-                                        uint16_t *out_fp16, int max_bands) {
-    (void)ctx; (void)in_packed; (void)out_fp16; (void)max_bands; return -1;
+void sp_hexagon_cache_read_k_partial(const sp_hexagon_cache_t *c, int l, int h, int p,
+                                      float *o, int mb) {
+    (void)l; (void)h; (void)p; (void)mb;
+    if (o && c) memset(o, 0, sizeof(float) * c->cfg_snapshot.head_dim);
 }
-
-size_t sp_hexagon_memory_in_use(const sp_hexagon_ctx_t *ctx) {
-    (void)ctx; return 0;
+void sp_hexagon_cache_read_v_partial(const sp_hexagon_cache_t *c, int l, int h, int p,
+                                      float *o, int mb) {
+    (void)l; (void)h; (void)p; (void)mb;
+    if (o && c) memset(o, 0, sizeof(float) * c->cfg_snapshot.head_dim);
 }
-long long sp_hexagon_last_call_cycles(const sp_hexagon_ctx_t *ctx) {
-    (void)ctx; return 0;
+void sp_hexagon_cache_write_k_batch(sp_hexagon_cache_t *c, int l, int h, int sp, int np, const float *v) {
+    (void)c; (void)l; (void)h; (void)sp; (void)np; (void)v;
+}
+void sp_hexagon_cache_write_v_batch(sp_hexagon_cache_t *c, int l, int h, int sp, int np, const float *v) {
+    (void)c; (void)l; (void)h; (void)sp; (void)np; (void)v;
+}
+void sp_hexagon_cache_read_k_batch(const sp_hexagon_cache_t *c, int l, int h, int sp, int np, float *o) {
+    (void)l; (void)h; (void)sp;
+    if (o && c) memset(o, 0, sizeof(float) * (size_t)np * c->cfg_snapshot.head_dim);
+}
+void sp_hexagon_cache_read_v_batch(const sp_hexagon_cache_t *c, int l, int h, int sp, int np, float *o) {
+    (void)l; (void)h; (void)sp;
+    if (o && c) memset(o, 0, sizeof(float) * (size_t)np * c->cfg_snapshot.head_dim);
+}
+void sp_hexagon_cache_clear_range(sp_hexagon_cache_t *c, int s, int e) {
+    (void)c; (void)s; (void)e;
 }
 
 #endif  // SP_HEXAGON_FASTRPC

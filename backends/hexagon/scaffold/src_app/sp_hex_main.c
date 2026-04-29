@@ -86,6 +86,12 @@ int main(int argc, char *argv[]) {
         return dErr;
     }
 
+    int vErr = sp_hex_compress_decompress_validate(head_dim);
+    if (vErr) {
+        printf("ERROR: per-element compress/decompress validate failed\n");
+        return vErr;
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

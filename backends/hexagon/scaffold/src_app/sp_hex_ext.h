@@ -40,6 +40,19 @@ int sp_hex_run_bench_sweep(void);
 // would feed into.
 int sp_hex_disk_tier_proof(int head_dim);
 
+// Per-element validation harness for the compress_f32 / decompress_f32
+// IDL pair. Drives a deterministic input through (a) the DSP-side
+// compress + decompress round-trip and (b) the host-side scalar
+// reference (sp_band_quantize → sp_band_dequantize on already-VHT2'd
+// coeffs), then compares per-element worst-abs.
+//
+// This is the validation lesson from the 2026-04-29 V69 IEEE-HVX
+// debugging episode: round-trip RMS alone is not sufficient — two
+// paths can produce the same RMS while differing wildly in their
+// intermediate values. A per-element comparator is required before
+// any new IDL method goes on the bridge hot path.
+int sp_hex_compress_decompress_validate(int head_dim);
+
 #ifdef __cplusplus
 }
 #endif

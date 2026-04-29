@@ -32,34 +32,6 @@ extern "C" {
 //
 // Primary validation device: Samsung Galaxy S22 Ultra (SM8450, V69).
 // SDK requirement: Qualcomm Hexagon SDK 5.x (toolv87 / DSP_ARCH=v69).
-//
-// Architecture:
-//
-//   ARM (host)                                    Hexagon DSP (server)
-//   -----------                                   --------------------
-//   sp_hexagon_init() ----[FastRPC]----> sp_hexagon_dsp_init()
-//   sp_hexagon_round_trip_band(K) ---->  HVX kernel: gather + quantize +
-//                                         dequantize + scatter
-//                                   <----  reconstructed K via shared mem
-//
-// Communication layer is FastRPC (the Qualcomm-supplied IPC mechanism for
-// CPU<->DSP). Buffers are allocated via rpcmem_alloc with the
-// RPCMEM_HEAP_ID_CONTIG flag to land in a shared physical region that
-// both sides can access without copies.
-//
-// Compute mapping:
-//
-//   Compute Unit            VHT2 Role                  Hexagon API
-//   --------------------------------------------------------------------
-//   ARM Cortex CPU          Orchestration, FastRPC     standard libc
-//   Adreno 730 GPU          Prefill batch (Vulkan)     parallel path
-//   Hexagon V69 DSP HVX     VHT2 butterfly + bands     this header
-//   Hexagon V69 DSP scalar  glue logic, control flow   this header
-//
-// The DSP kernels are designed to fit in HVX_VECTORS_AT_ONCE (typically 4-8)
-// 1024-bit registers per band. A single layer's worth of (head x position)
-// vectors streams through the HVX pipeline at one vector per cycle in
-// the inner loop.
 
 // ============================================================================
 // Capability / feature detection
@@ -75,9 +47,6 @@ typedef struct {
     long long shared_mem_bytes;  // Shared CPU<->DSP physical buffer budget
 } sp_hexagon_caps_t;
 
-// Probe the device capabilities. Returns 0 on success and fills caps;
-// returns -1 if the DSP is unreachable (driver missing, not a Snapdragon
-// device, or FastRPC service unavailable).
 int sp_hexagon_caps_probe(sp_hexagon_caps_t *caps);
 void sp_hexagon_caps_print(const sp_hexagon_caps_t *caps);
 
@@ -85,66 +54,28 @@ void sp_hexagon_caps_print(const sp_hexagon_caps_t *caps);
 // Lifecycle
 // ============================================================================
 
-// Opaque handle to the host-side Hexagon SP context. Holds the FastRPC
-// session, the shared-memory pool, and any per-shape kernel cache.
 typedef struct sp_hexagon_ctx_s sp_hexagon_ctx_t;
 
-// Initialise a Hexagon SP context. Loads the DSP-side stub, opens the
-// FastRPC session, allocates the shared-memory pool sized for one
-// layer's worth of K/V vectors plus headroom for HVX scratch.
-//
-// Returns NULL if the DSP is unavailable (caller should fall back to
-// the Adreno or CPU backend). On success, caller must release the
-// context with sp_hexagon_free.
 sp_hexagon_ctx_t *sp_hexagon_init(const sp_config_t *cfg);
 void sp_hexagon_free(sp_hexagon_ctx_t *ctx);
 
 // ============================================================================
-// Round-trip operations
+// Round-trip operations (single-vector smoke / engine-API path)
 // ============================================================================
-//
-// The same operation triple as the Adreno backend (gather + transform +
-// scatter) but executes on the DSP. Buffers are RPC-shared, so the
-// caller gets pointers via sp_hexagon_alloc / sp_hexagon_free_shared.
-// Pass these pointers, not malloc'd ones - non-shared memory will incur
-// an extra copy across FastRPC.
 
-// Allocate / free shared memory. n_bytes must be page-aligned (4 KB);
-// the implementation rounds up.
 void *sp_hexagon_alloc(sp_hexagon_ctx_t *ctx, size_t n_bytes);
 void  sp_hexagon_free_shared(sp_hexagon_ctx_t *ctx, void *ptr);
 
-// Round-trip a single (head, position) vector through the DSP:
-// fp16_in -> fp16 promote -> VHT2 -> Mobius -> band-quantize -> bytes
-// bytes -> band-dequantize -> Mobius unreorder -> VHT2 inverse -> fp16_out
-//
-// in / out must be sp_hexagon_alloc'd. Returns 0 on success, non-zero
-// on FastRPC failure.
 int sp_hexagon_round_trip_k(sp_hexagon_ctx_t *ctx,
-                             const uint16_t *in_fp16,   // head_dim fp16 values
-                             uint16_t *out_fp16);        // head_dim fp16 values
-
+                             const uint16_t *in_fp16,
+                             uint16_t *out_fp16);
 int sp_hexagon_round_trip_v(sp_hexagon_ctx_t *ctx,
                              const uint16_t *in_fp16,
                              uint16_t *out_fp16);
-
-// Batch round-trip: process n_vectors at once for better HVX
-// utilisation. Used during prefill where we have many (head x position)
-// vectors to handle in parallel. Buffers must be shared (allocated via
-// sp_hexagon_alloc).
 int sp_hexagon_round_trip_k_batch(sp_hexagon_ctx_t *ctx,
                                    const uint16_t *in_fp16,
                                    uint16_t *out_fp16,
                                    int n_vectors);
-
-// Progressive partial dequantize on the DSP - same semantics as
-// sp_band_dequantize_partial (math core). max_bands is clamped to
-// [0, n_bands]. Used by the phase 3 attention short-circuit:
-// reconstruct band 0 only first, attention probes for confidence,
-// promote to bands 0+1 if needed, etc.
-//
-// in: packed band bytes (host-side or shared)
-// out: head_dim fp16 reconstruction (shared memory required)
 int sp_hexagon_band_dequantize_partial(sp_hexagon_ctx_t *ctx,
                                         const uint8_t *in_packed,
                                         uint16_t *out_fp16,
@@ -154,13 +85,80 @@ int sp_hexagon_band_dequantize_partial(sp_hexagon_ctx_t *ctx,
 // Diagnostics
 // ============================================================================
 
-// Total bytes of shared memory currently allocated by this context.
 size_t sp_hexagon_memory_in_use(const sp_hexagon_ctx_t *ctx);
-
-// Approximate cycles spent in the most recent DSP call (read from the
-// HEXAGON_REG_TIMER counter on the DSP side). 0 if profiling not
-// enabled (compile-time HEXAGON_PROFILE=0). Microsecond-class resolution.
 long long sp_hexagon_last_call_cycles(const sp_hexagon_ctx_t *ctx);
+
+// ============================================================================
+// sp_hexagon_cache_t - per-position packed-byte storage with DSP offload
+// ============================================================================
+//
+// Mirrors the sp_shadow_cache_t / sp_adreno_cache_t shape: per-(layer,head)
+// slots, each a contiguous max_seq * bc.total_bytes byte array indexed by
+// position. The compress/decompress work for each per-position write or
+// read goes through ONE FastRPC dispatch into compress_f32 /
+// decompress_f32 on the cDSP, with the packed bytes living in
+// rpcmem-backed pages so the marshal copy is bypassed (the DSP gets the
+// same physical pages via the SMMU).
+//
+// Lifecycle: ctx = sp_hexagon_init; sp_hexagon_cache_init(cache, ctx,...);
+//   ... per-position writes/reads ...; sp_hexagon_cache_free(cache);
+//   sp_hexagon_free(ctx). Cache borrows ctx - ctx must outlive cache.
+
+typedef struct {
+    sp_hexagon_ctx_t  *ctx;
+    sp_config_t        cfg_snapshot;
+    int                max_seq_len;
+    int                n_slots;
+    sp_band_config_t   k_bands;
+    sp_band_config_t   v_bands;
+    uint8_t          **k_cache;
+    uint8_t          **v_cache;
+    float             *vec_in_f32;
+    float             *vec_out_f32;
+} sp_hexagon_cache_t;
+
+int  sp_hexagon_cache_init(sp_hexagon_cache_t *cache,
+                            sp_hexagon_ctx_t *ctx,
+                            const sp_config_t *cfg,
+                            int max_seq_len);
+void sp_hexagon_cache_free(sp_hexagon_cache_t *cache);
+
+void sp_hexagon_cache_write_k(sp_hexagon_cache_t *cache,
+                               int layer, int head, int pos,
+                               const float *k_vec);
+void sp_hexagon_cache_write_v(sp_hexagon_cache_t *cache,
+                               int layer, int head, int pos,
+                               const float *v_vec);
+void sp_hexagon_cache_read_k(const sp_hexagon_cache_t *cache,
+                              int layer, int head, int pos,
+                              float *k_out);
+void sp_hexagon_cache_read_v(const sp_hexagon_cache_t *cache,
+                              int layer, int head, int pos,
+                              float *v_out);
+void sp_hexagon_cache_read_k_partial(const sp_hexagon_cache_t *cache,
+                                      int layer, int head, int pos,
+                                      float *k_out, int max_bands);
+void sp_hexagon_cache_read_v_partial(const sp_hexagon_cache_t *cache,
+                                      int layer, int head, int pos,
+                                      float *v_out, int max_bands);
+void sp_hexagon_cache_write_k_batch(sp_hexagon_cache_t *cache,
+                                     int layer, int head,
+                                     int start_pos, int n_pos,
+                                     const float *k_vecs);
+void sp_hexagon_cache_write_v_batch(sp_hexagon_cache_t *cache,
+                                     int layer, int head,
+                                     int start_pos, int n_pos,
+                                     const float *v_vecs);
+void sp_hexagon_cache_read_k_batch(const sp_hexagon_cache_t *cache,
+                                    int layer, int head,
+                                    int start_pos, int n_pos,
+                                    float *k_out);
+void sp_hexagon_cache_read_v_batch(const sp_hexagon_cache_t *cache,
+                                    int layer, int head,
+                                    int start_pos, int n_pos,
+                                    float *v_out);
+void sp_hexagon_cache_clear_range(sp_hexagon_cache_t *cache,
+                                   int start_pos, int end_pos);
 
 #ifdef __cplusplus
 }
