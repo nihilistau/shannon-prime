@@ -148,26 +148,37 @@ int sp_hex_band_quantize_hvx(const float *coeffs, int head_dim,
     sp_band_config_init(&bc, head_dim, 4, default_bits);
     if (out_capacity < bc.total_bytes) return -1;
 
+    // Sign-bit-clear mask. AND-ing fp32 with 0x7FFFFFFF strips the sign
+    // bit, producing the bit pattern of fabs(x). Since fp32 magnitudes
+    // are monotonic in their bit pattern (for finite non-NaN values),
+    // signed int max of these stripped patterns equals fp32 max of abs.
+    HVX_Vector vsign_mask = Q6_V_vsplat_R(0x7FFFFFFF);
+
     int offset = 0;
     for (int b = 0; b < bc.n_bands; b++) {
         int band_off, band_sz;
         sp_band_span(&bc, b, &band_off, &band_sz);
         const float *band = coeffs + band_off;
 
-        // Bands not multiples of 32 fp32 fall back — caller dispatcher
-        // handles. Should never hit here in well-formed configs.
         if ((band_sz & 31) != 0) return -1;
 
         const int bits = bc.band_bits[b];
         const int max_val = (1 << (bits - 1)) - 1;
 
-        // Pass 1: HVX amax. fabs via vabs, accumulate max across vectors.
-        HVX_Vector vmax = Q6_V_vsplat_R(0);  // 0.0f bit pattern
+        // Pass 1: HVX amax via the int-bit-pattern trick. Avoids the
+        // broken IEEE Q6_Vsf_vabs / vmax intrinsics on V69 entirely.
+        HVX_Vector vmax = Q6_V_vsplat_R(0);
         for (int i = 0; i < band_sz; i += 32) {
-            HVX_Vector v   = *((HVX_Vector *)&band[i]);
-            HVX_Vector va  = Q6_Vsf_vabs_Vsf(v);
-            vmax = Q6_Vsf_vmax_VsfVsf(vmax, va);
+            HVX_Vector v        = *((HVX_Vector *)&band[i]);
+            HVX_Vector v_no_sgn = Q6_V_vand_VV(v, vsign_mask);
+            // Signed int max — works because all lanes have sign bit clear,
+            // so signed and unsigned max give identical results, AND the
+            // remaining 31 bits encode magnitude monotonically.
+            vmax = Q6_Vw_vmax_VwVw(vmax, v_no_sgn);
         }
+        // Reduce 32 lanes → scalar. The result is 32 fp32 bit patterns
+        // (stripped of sign), so reinterpret-as-fp32 lane reduction gives
+        // the amax fp32 value directly.
         float amax = sp_hex_hreduce_max_f32(vmax);
 
         // Compute scale exactly the way the math core does — fp16

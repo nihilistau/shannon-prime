@@ -78,11 +78,28 @@ int sp_hex_band_quantize_scalar(const float *coeffs, int head_dim,
     sp_hex_default_band_config(&bc, head_dim);
     if (out_capacity < bc.total_bytes) return -1;
 
-    // KNOWN ISSUE: sp_hex_band_quantize_hvx produces wrong output (round-trip
-    // RMS 0.69 vs scalar 0.029). Likely the same HVX fp32 precision drift
-    // pattern that affects sp_hex_vht2_f32_hvx — the amax values differ
-    // enough between scalar and HVX paths to misalign the per-band scales.
-    // Investigation deferred. Dispatcher uses math core scalar reference.
+#ifdef __HVX__
+    // HVX path conditions: head_dim ≥ 128 with head_dim%128==0 (so each
+    // band_sz is a multiple of 32 fp32 = one HVX vector), no ternary
+    // bands. Lock HVX context per-call (thread-local; FastRPC may
+    // dispatch on a different worker thread than the one that opened
+    // the session). Amax now uses the int-bit-pattern trick — bypasses
+    // the broken IEEE Q6_Vsf_* family, gives bit-equivalent results
+    // to scalar amax.
+    if (bc.ternary_band_mask == 0 &&
+        head_dim >= 128 && (head_dim & 127) == 0) {
+        if (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0) {
+            int rc = sp_hex_band_quantize_hvx(coeffs, head_dim,
+                                              out, out_capacity);
+            qurt_hvx_unlock();
+            if (rc == 0) {
+                if (out_len) *out_len = bc.total_bytes;
+                return 0;
+            }
+        }
+    }
+#endif
+
     sp_band_quantize(coeffs, out, &bc);
     if (out_len) *out_len = bc.total_bytes;
     return 0;
