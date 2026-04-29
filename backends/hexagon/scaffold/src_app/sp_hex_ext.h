@@ -19,6 +19,13 @@ extern "C" {
 // the worst-case fp32 error. Returns 0 on full success.
 int sp_hex_process(int domain, int head_dim, bool isUnsignedPD_Enabled);
 
+// Second smoke-test path: drives the engine-side hexagon API
+// (sp_hexagon_init / sp_hexagon_round_trip_k / sp_hexagon_free) instead
+// of the qaic IDL directly. Validates that the engine's host-side
+// FastRPC shim works end-to-end on the phone before we wire it into
+// llama-cpp-sp's bridge.
+int sp_hex_engine_smoke(int head_dim);
+
 #ifdef __cplusplus
 }
 #endif

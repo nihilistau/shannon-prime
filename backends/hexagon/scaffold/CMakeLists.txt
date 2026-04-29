@@ -40,18 +40,30 @@ if(${OS_TYPE} MATCHES "HLOS")
     # ---------------------------------------------------------------------
     add_library(sp_hex SHARED ${CMAKE_CURRENT_BINARY_DIR}/sp_hex_stub)
 
+    # SP math core path (needed for the engine-side stub's fp16 helpers
+    # and band config). Matches the DSP-side definition below.
+    set(SP_CORE ${CMAKE_CURRENT_SOURCE_DIR}/../../../core)
+
     # ---------------------------------------------------------------------
     # HLOS Executable (sp_hex on the device, built from the *_device CMake target)
     # ---------------------------------------------------------------------
     add_executable(sp_hex_device
         ${CMAKE_CURRENT_SOURCE_DIR}/src_app/sp_hex_main
         ${CMAKE_CURRENT_SOURCE_DIR}/src_app/sp_hex_ext
+        ${CMAKE_CURRENT_SOURCE_DIR}/../shannon_prime_hexagon
+        ${SP_CORE}/shannon_prime
+        ${SP_CORE}/shannon_prime_pe
+        ${SP_CORE}/shannon_prime_sqfree
         ${HEXAGON_SDK_ROOT}/utils/examples/dsp_capabilities_utils
     )
 
     set_target_properties(sp_hex_device PROPERTIES OUTPUT_NAME "sp_hex")
 
-    target_compile_definitions(sp_hex_device PUBLIC VERIFY_PRINT_ERROR)
+    target_compile_definitions(sp_hex_device PUBLIC VERIFY_PRINT_ERROR
+                                                    SP_HEXAGON_FASTRPC)
+    target_include_directories(sp_hex_device PRIVATE ${SP_CORE}
+                                                     ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    target_compile_options(sp_hex_device PRIVATE -Wno-unused-function)
 
     link_options(sp_hex_device)
 

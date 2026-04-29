@@ -64,8 +64,16 @@ int main(int argc, char *argv[]) {
     nErr = sp_hex_process(domain, head_dim, isUnsignedPD_Enabled);
     if (nErr) {
         printf("ERROR 0x%x: sp_hex smoke test failed\n", nErr);
-    } else {
-        printf("[sp_hex] Success\n\n");
+        return nErr;
     }
-    return nErr;
+    printf("[sp_hex] Direct IDL path: Success\n");
+
+    int eErr = sp_hex_engine_smoke(head_dim);
+    if (eErr) {
+        printf("ERROR: engine API smoke test failed\n");
+        return eErr;
+    }
+
+    printf("\n[sp_hex] All paths green\n\n");
+    return 0;
 }
