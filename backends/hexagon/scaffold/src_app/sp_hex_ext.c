@@ -13,7 +13,9 @@
 #include "os_defines.h"
 
 #include "shannon_prime.h"             // sp_f16_to_f32 / sp_f32_to_f16
+#ifdef SP_HEXAGON_FASTRPC
 #include "shannon_prime_hexagon.h"     // sp_hexagon_init / round_trip_k / free
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -102,6 +104,22 @@ int sp_hex_process(int domain, int head_dim, bool isUnsignedPD_Enabled) {
         goto bail;
     }
 
+    {
+        long long vtcm_total = 0, vtcm_avail = 0, vtcm_acq = 0;
+        int rc = sp_hex_vtcm_status(h, &vtcm_total, &vtcm_avail, &vtcm_acq);
+        if (rc == 0) {
+            printf("[sp_hex] VTCM: total=%lld KB  avail=%lld KB  "
+                   "acquired_by_session=%lld KB\n",
+                   vtcm_total / 1024, vtcm_avail / 1024, vtcm_acq / 1024);
+            if (vtcm_acq == 0) {
+                printf("[sp_hex] WARNING: session got 0 VTCM — HVX kernels "
+                       "will fall back to DDR\n");
+            }
+        } else {
+            printf("[sp_hex] vtcm_status failed rc=%d (non-fatal)\n", rc);
+        }
+    }
+
     printf("[sp_hex] calling round_trip_f32 on the DSP...\n");
     nErr = sp_hex_round_trip_f32(h, in_vec, head_dim, head_dim,
                                   out_vec, head_dim);
@@ -154,8 +172,16 @@ bail:
 // Engine-API smoke test — exercises sp_hexagon_init / round_trip_k / free
 // instead of the raw qaic IDL. Same numerical contract; the test verifies
 // the engine's host-side FastRPC shim is bit-equivalent to the direct path.
+//
+// Only compiled when SP_HEXAGON_FASTRPC is defined (the device build).
+// The simulator path (sp_hex_q.so) doesn't have rpcmem and can't open a
+// real FastRPC session, so the engine smoke would have nothing to drive.
+// Returns 0 (no-op success) on the sim path.
 // ----------------------------------------------------------------------------
 
+#ifndef SP_HEXAGON_FASTRPC
+int sp_hex_engine_smoke(int head_dim) { (void)head_dim; return 0; }
+#else
 int sp_hex_engine_smoke(int head_dim) {
     printf("\n[engine] === engine-API smoke test ===\n");
 
@@ -226,3 +252,4 @@ int sp_hex_engine_smoke(int head_dim) {
     sp_hexagon_free(ctx);
     return test_err;
 }
+#endif  // SP_HEXAGON_FASTRPC

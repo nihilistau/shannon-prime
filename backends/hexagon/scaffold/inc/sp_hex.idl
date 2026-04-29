@@ -73,4 +73,20 @@ interface sp_hex : remote_handle64 {
                         in long head_dim,
                         in long max_bands,
                         rout sequence<float> out_coeffs);
+
+   // -------------------------------------------------------------------
+   // VTCM residency report. Used to verify HAP_request_VTCM at session
+   // open landed a region (otherwise HVX kernels run against DDR with
+   // no perf benefit). Returns:
+   //
+   //   bytes_total      — total VTCM on this DSP variant (V69 ≈ 8 MB)
+   //   bytes_avail      — currently unallocated VTCM (other DSP sessions
+   //                      and system services compete for this)
+   //   bytes_acquired   — bytes this session reserved at open (0 if the
+   //                      acquire call failed; non-zero means we have
+   //                      our region and HVX kernels can target it)
+   // -------------------------------------------------------------------
+   long vtcm_status(rout long long bytes_total,
+                    rout long long bytes_avail,
+                    rout long long bytes_acquired);
 };

@@ -12,9 +12,30 @@
 #include <string.h>
 
 #include "HAP_farf.h"
+#include "HAP_vtcm_mgr.h"      // HAP_request_VTCM / HAP_release_VTCM / queries
 #include "sp_hex.h"            // qaic-generated header from sp_hex.idl
 #include "sp_hex_kernels.h"    // forwards to SP math core
 #include "shannon_prime.h"     // sp_band_config_t / sp_band_quantize / etc.
+
+// Per-session DSP context. Held behind the FastRPC handle that sp_hex_open
+// returns; sp_hex_close releases everything. Sized to fit a few small
+// pieces of state — VTCM pointer, region size, anything else the kernels
+// will need at the session level.
+//
+// VTCM is V69's tightly-coupled SRAM (~8 MB total on this DSP variant).
+// Acquiring a small region per session ensures HVX kernels have a fast
+// scratch path; HAP_request_VTCM returning NULL means the kernels will
+// fall back to DDR, with predictably worse perf.
+typedef struct {
+    void   *vtcm_ptr;       // NULL if acquisition failed
+    int     vtcm_bytes;     // 0 if no region; else bytes acquired
+} sp_hex_session_t;
+
+// Default per-session VTCM ask. Banded quantize working set on a typical
+// head_dim is well under 16 KB; 64 KB gives headroom for staging packed
+// bytes + scale headers + a few HVX register spills if needed. Tunable
+// once we have actual HVX kernels showing pressure.
+#define SP_HEX_VTCM_BYTES   (64 * 1024)
 
 // ============================================================================
 // Lifecycle - inherited from remote_handle64.
@@ -22,16 +43,62 @@
 
 int sp_hex_open(const char *uri, remote_handle64 *handle) {
     (void)uri;
-    void *tptr = malloc(1);  // FastRPC requires a non-null handle
-    *handle = (remote_handle64)tptr;
-    assert(*handle);
-    FARF(RUNTIME_HIGH, "[sp_hex] open() -> handle=0x%llx", *handle);
+    sp_hex_session_t *sess = (sp_hex_session_t *)calloc(1, sizeof(*sess));
+    if (!sess) return -1;
+
+    // Try to acquire a VTCM region. single_page_flag=1 asks for one
+    // contiguous physical page — fine for 64 KB which is well under
+    // the V69 page granularity. NULL return means "couldn't get one";
+    // the session is still usable, kernels just run against DDR.
+    sess->vtcm_ptr = HAP_request_VTCM(SP_HEX_VTCM_BYTES, /*single_page=*/1);
+    sess->vtcm_bytes = (sess->vtcm_ptr != NULL) ? SP_HEX_VTCM_BYTES : 0;
+
+    *handle = (remote_handle64)sess;
+    FARF(RUNTIME_HIGH,
+         "[sp_hex] open() -> handle=0x%llx vtcm=%p (%d bytes)",
+         *handle, sess->vtcm_ptr, sess->vtcm_bytes);
     return 0;
 }
 
 int sp_hex_close(remote_handle64 handle) {
-    if (handle) free((void *)handle);
+    sp_hex_session_t *sess = (sp_hex_session_t *)handle;
+    if (sess) {
+        if (sess->vtcm_ptr) {
+            HAP_release_VTCM(sess->vtcm_ptr);
+        }
+        free(sess);
+    }
     FARF(RUNTIME_HIGH, "[sp_hex] close()");
+    return 0;
+}
+
+int sp_hex_vtcm_status(remote_handle64 h,
+                        long long *bytes_total,
+                        long long *bytes_avail,
+                        long long *bytes_acquired) {
+    sp_hex_session_t *sess = (sp_hex_session_t *)h;
+    if (!bytes_total || !bytes_avail || !bytes_acquired) return -1;
+
+    unsigned int page_size = 0, page_count = 0;
+    if (HAP_query_total_VTCM(&page_size, &page_count) == 0) {
+        *bytes_total = (long long)page_size * (long long)page_count;
+    } else {
+        *bytes_total = 0;
+    }
+
+    unsigned int avail_block = 0, max_page = 0, num_pages = 0;
+    if (HAP_query_avail_VTCM(&avail_block, &max_page, &num_pages) == 0) {
+        // avail_block is the largest contiguous request that would
+        // succeed right now; close enough to "avail" for our purposes.
+        *bytes_avail = (long long)avail_block;
+    } else {
+        *bytes_avail = 0;
+    }
+
+    *bytes_acquired = sess ? (long long)sess->vtcm_bytes : 0;
+    FARF(RUNTIME_HIGH,
+         "[sp_hex] vtcm_status: total=%lld avail=%lld acquired=%lld",
+         *bytes_total, *bytes_avail, *bytes_acquired);
     return 0;
 }
 
