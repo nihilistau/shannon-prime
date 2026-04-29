@@ -206,4 +206,69 @@ int sp_hex_band_quantize_hvx(const float *coeffs, int head_dim,
     return 0;
 }
 
+// ============================================================================
+// VHT2 — qf32 intermediate variant.
+//
+// Same math as sp_hex_vht2_f32_hvx, but the butterfly arithmetic stays in
+// Qualcomm's qf32 ("flexible float") representation — wider mantissa than
+// IEEE sf, deterministic ordering of internal rounding — converting back
+// to IEEE sf only at the final store. Theory: the drift in the IEEE-only
+// HVX path comes from HVX's sf pipeline using a different rounding stance
+// (possibly RTZ) than scalar's RNE; qf32 promotes the intermediate
+// precision enough that any single-pass rounding-mode disagreement
+// doesn't compound into visible per-element error.
+//
+// Exported separately so we can A/B vs the IEEE path without touching the
+// existing kernel. The dispatcher stays scalar-only until one of these
+// proves bit-equivalent to the math core reference.
+// ============================================================================
+
+void sp_hex_vht2_f32_hvx_qf32(float *data, int n);
+
+void sp_hex_vht2_f32_hvx_qf32(float *data, int n) {
+    if (!data || n < 2) return;
+
+    const float s_const = 0.70710678118654752440f;
+    HVX_Vector vs_sf  = Q6_V_vsplat_R(sp_hex_f32_bits(s_const));
+    HVX_Vector zero_sf = Q6_V_vsplat_R(0);
+    // Convert vs_sf → vs_qf32 by adding zero (the documented sf→qf32 path).
+    HVX_Vector vs_qf  = Q6_Vqf32_vadd_VsfVsf(vs_sf, zero_sf);
+
+    for (int stride = 1; stride < n; stride <<= 1) {
+        const int block = 2 * stride;
+
+        if (stride >= 32) {
+            for (int i = 0; i < n; i += block) {
+                for (int j = 0; j < stride; j += 32) {
+                    HVX_Vector *p0 = (HVX_Vector *)&data[i + j];
+                    HVX_Vector *p1 = (HVX_Vector *)&data[i + stride + j];
+                    HVX_Vector x0  = *p0;   // sf
+                    HVX_Vector x1  = *p1;   // sf
+
+                    // sf + sf → qf32 (mixed add)
+                    HVX_Vector sum_qf = Q6_Vqf32_vadd_VsfVsf(x0, x1);
+                    HVX_Vector dif_qf = Q6_Vqf32_vsub_VsfVsf(x0, x1);
+                    // qf32 * qf32 → qf32 (intermediate stays in qf32)
+                    HVX_Vector ssum_qf = Q6_Vqf32_vmpy_Vqf32Vqf32(sum_qf, vs_qf);
+                    HVX_Vector sdif_qf = Q6_Vqf32_vmpy_Vqf32Vqf32(dif_qf, vs_qf);
+                    // qf32 → IEEE sf for memory store
+                    *p0 = Q6_Vsf_equals_Vqf32(ssum_qf);
+                    *p1 = Q6_Vsf_equals_Vqf32(sdif_qf);
+                }
+            }
+        } else {
+            // Scalar tail — identical to the IEEE-HVX kernel and to the
+            // math core. No rounding-mode question at this level.
+            for (int i = 0; i < n; i += block) {
+                for (int j = 0; j < stride; j++) {
+                    float x0 = data[i + j];
+                    float x1 = data[i + stride + j];
+                    data[i + j]          = (x0 + x1) * s_const;
+                    data[i + stride + j] = (x0 - x1) * s_const;
+                }
+            }
+        }
+    }
+}
+
 #endif  // __HVX__

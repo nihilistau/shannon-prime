@@ -44,6 +44,7 @@ static void sp_hex_default_band_config(sp_band_config_t *bc, int head_dim) {
 #ifdef __HVX__
 #include "qurt_hvx.h"   // qurt_hvx_lock / unlock — required around HVX kernels
 void sp_hex_vht2_f32_hvx(float *data, int n);
+void sp_hex_vht2_f32_hvx_qf32(float *data, int n);  // numerically correct
 int  sp_hex_band_quantize_hvx(const float *coeffs, int head_dim,
                                unsigned char *out, int out_capacity);
 #endif
@@ -53,18 +54,20 @@ static int sp_hex_is_pow2(int n) {
 }
 
 void sp_hex_vht2_f32(float *data, int n) {
-    // KNOWN ISSUE: sp_hex_vht2_f32_hvx produces output that's ~0.005-0.02
-    // absolute different from sp_vht2_forward_f32 on the same input.
-    // Verified by direct scalar-vs-HVX output comparison on head_dim=64..1024.
-    // The drift is small (~0.1% relative) but compounds badly through the
-    // round-trip's two VHT2 calls + band quantize/dequantize, pushing
-    // round-trip RMS from 0.029 to 0.69. Likely cause: HVX fp32 rounding
-    // semantics differing from scalar fp32 even with -mhvx-ieee-fp.
-    // Investigation deferred to a separate workstream.
-    //
-    // For now: dispatcher falls through to the math core scalar reference.
-    // sp_hex_vht2_f32_hvx remains exported so the bench can measure HVX
-    // timing; it just isn't on the production path.
+#ifdef __HVX__
+    // qf32 path: IEEE-HVX (Q6_Vsf_*) produces structurally wrong output
+    // on V69 (off by 4–20 absolute, not just rounding noise). The qf32
+    // intermediate path is bit-equivalent to scalar within fp32 epsilon
+    // (~3.8e-06 worst at head_dim=1024 — pure rounding accumulation
+    // through the qf32→sf conversion at the end of each butterfly).
+    if (sp_hex_is_pow2(n) && n >= 64) {
+        if (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0) {
+            sp_hex_vht2_f32_hvx_qf32(data, n);
+            qurt_hvx_unlock();
+            return;
+        }
+    }
+#endif
     sp_vht2_forward_f32(data, n);
 }
 

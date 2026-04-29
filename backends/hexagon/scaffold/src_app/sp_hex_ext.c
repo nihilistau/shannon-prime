@@ -295,9 +295,10 @@ int sp_hex_run_bench_sweep(void) {
     const int dims[]     = {64, 128, 256, 512, 1024};
     const int n_dims     = (int)(sizeof(dims) / sizeof(dims[0]));
 
-    printf("\n[bench] === VHT2 cycle bench (iter=%d) ===\n", iterations);
+    printf("\n[bench] === VHT2 cycle bench: scalar vs HVX-qf32 (iter=%d) ===\n",
+           iterations);
     printf("[bench] %-9s %-14s %-14s %-9s\n",
-           "head_dim", "scalar pcyc/call", "HVX pcyc/call", "speedup");
+           "head_dim", "scalar pcyc/call", "HVX-qf32 pcyc/call", "speedup");
 
     int test_err = 0;
     for (int i = 0; i < n_dims; ++i) {

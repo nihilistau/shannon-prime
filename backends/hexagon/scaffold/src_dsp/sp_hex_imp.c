@@ -24,6 +24,7 @@
 // vs sp_hex_vht2_f32 which dispatches and would obscure the comparison.
 #ifdef __HVX__
 void sp_hex_vht2_f32_hvx(float *data, int n);
+void sp_hex_vht2_f32_hvx_qf32(float *data, int n);
 #endif
 
 // Per-session DSP context. Held behind the FastRPC handle that sp_hex_open
@@ -136,15 +137,16 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
     if ((head_dim & (head_dim - 1)) != 0) return -1;  // pow2 only
     if (iterations < 1) return -1;
 
-    // 128-byte aligned for HVX vmem. 8 KB total — fits unsigned PD stack.
+    // Cycle bench — scalar reference vs HVX-qf32 (the numerically correct
+    // HVX path). The IEEE-HVX kernel is structurally broken on V69 so we
+    // time qf32; user can A/B by editing the kernel call below.
     float input[1024] __attribute__((aligned(128)));
     float buf[1024]   __attribute__((aligned(128)));
-
     for (int i = 0; i < head_dim; ++i) {
         input[i] = 0.125f + (float)i / (float)head_dim;
     }
 
-    // Time scalar path
+    // Scalar timing
     memcpy(buf, input, sizeof(float) * head_dim);
     sp_vht2_forward_f32(buf, head_dim);  // warmup
     uint64_t t0 = HAP_perf_get_pcycles();
@@ -154,16 +156,15 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
     }
     *scalar_pcycles = (long long)(HAP_perf_get_pcycles() - t0);
 
-    // Time HVX path (kept for perf measurement even though dispatcher
-    // doesn't currently use it — see note in sp_hex_kernels.c).
+    // HVX-qf32 timing
 #ifdef __HVX__
     if (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0) {
         memcpy(buf, input, sizeof(float) * head_dim);
-        sp_hex_vht2_f32_hvx(buf, head_dim);  // warmup
+        sp_hex_vht2_f32_hvx_qf32(buf, head_dim);  // warmup
         t0 = HAP_perf_get_pcycles();
         for (int it = 0; it < iterations; ++it) {
             memcpy(buf, input, sizeof(float) * head_dim);
-            sp_hex_vht2_f32_hvx(buf, head_dim);
+            sp_hex_vht2_f32_hvx_qf32(buf, head_dim);
         }
         *hvx_pcycles = (long long)(HAP_perf_get_pcycles() - t0);
         qurt_hvx_unlock();
