@@ -53,7 +53,35 @@ struct sp_hexagon_ctx_s {
     size_t          bytes_in_use;       // Tracked allocations
     long long       last_call_cycles;   // 0 until profiling lands
     int             unsigned_pd_active; // 1 if we enabled it on this domain
+
+    // Pre-allocated rpcmem-backed scratch buffers, sized for the
+    // largest head_dim we expect (1024 fp32 = 4 KB each). FastRPC
+    // recognises pointers from rpcmem_alloc as ION-backed shared
+    // physical memory and skips the IPC marshal copy entirely — the
+    // DSP gets the same physical pages via SMMU translation. malloc'd
+    // pointers fall back to a marshal copy across the host/DSP boundary.
+    //
+    // Reusing one allocation across all round_trip calls also avoids
+    // the rpcmem_alloc/_free overhead per call (each is several µs of
+    // kernel ION-buffer setup + SMMU map/unmap).
+    //
+    // RPCMEM_HEAP_ID_SYSTEM = non-contiguous physical memory routed
+    // through the cDSP's SMMU. The contiguous heap (HEAP_ID_CONTIG=22)
+    // is for older subsystems without SMMU and is documented as
+    // deprecated for V73+. V69 cDSP uses SYSTEM.
+    //
+    // Allocations come back 4 KB-aligned (one physical page minimum),
+    // which is also the SMMU translation granularity — no extra page-
+    // table walks for the kernels' inner loops.
+    float          *scratch_in_f32;     // rpcmem, head_dim_max * 4 bytes
+    float          *scratch_out_f32;    // rpcmem, head_dim_max * 4 bytes
+    size_t          scratch_bytes;      // size of each scratch buffer
 };
+
+// Largest head_dim the engine accommodates without re-allocating.
+// 1024 covers every modern model (Qwen / Llama 3 / Phi / Gemma all sit
+// at 64–256). 4 KB per buffer × 2 = 8 KB total per session.
+#define SP_HEXAGON_HEAD_DIM_MAX 1024
 
 // One-shot init of rpcmem. rpcmem_init / _deinit are reference-counted so
 // repeated init pairs are safe; a static guard keeps us from doubling up.
@@ -132,11 +160,40 @@ sp_hexagon_ctx_t *sp_hexagon_init(const sp_config_t *cfg) {
         free(ctx);
         return NULL;
     }
+
+    // Pre-allocate the FastRPC-shared scratch. RPCMEM_TRY_MAP_STATIC
+    // tells the FastRPC runtime to pre-map this buffer into the DSP's
+    // address space at allocation time so the first round_trip call
+    // doesn't pay a one-shot map-on-first-use latency.
+    ctx->scratch_bytes = SP_HEXAGON_HEAD_DIM_MAX * sizeof(float);
+    int alloc_flags = RPCMEM_DEFAULT_FLAGS | RPCMEM_TRY_MAP_STATIC;
+    ctx->scratch_in_f32  = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                  alloc_flags,
+                                                  (int)ctx->scratch_bytes);
+    ctx->scratch_out_f32 = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                  alloc_flags,
+                                                  (int)ctx->scratch_bytes);
+    if (!ctx->scratch_in_f32 || !ctx->scratch_out_f32) {
+        fprintf(stderr, "[Shannon-Prime] hexagon: rpcmem_alloc scratch "
+                        "failed; falling back to non-zero-copy\n");
+        // Non-fatal — round_trip will malloc-allocate per call as a
+        // fallback. Leave scratch pointers NULL to signal that path.
+        if (ctx->scratch_in_f32)  rpcmem_free(ctx->scratch_in_f32);
+        if (ctx->scratch_out_f32) rpcmem_free(ctx->scratch_out_f32);
+        ctx->scratch_in_f32  = NULL;
+        ctx->scratch_out_f32 = NULL;
+        ctx->scratch_bytes   = 0;
+    } else {
+        ctx->bytes_in_use = ctx->scratch_bytes * 2;
+    }
+
     return ctx;
 }
 
 void sp_hexagon_free(sp_hexagon_ctx_t *ctx) {
     if (!ctx) return;
+    if (ctx->scratch_in_f32)  rpcmem_free(ctx->scratch_in_f32);
+    if (ctx->scratch_out_f32) rpcmem_free(ctx->scratch_out_f32);
     if (ctx->fastrpc_handle != (remote_handle64)-1) {
         sp_hex_close(ctx->fastrpc_handle);
     }
@@ -171,19 +228,39 @@ static void sp_hex_narrow_f32_to_f16(const float *in, uint16_t *out, int n) {
 }
 
 // Single-vector round-trip. fp16 in/out, fp32 across the FastRPC boundary.
-// Future optimization: widen the IDL to take fp16 directly so we skip the
-// host-side widening (saves 2 × head_dim × 4 bytes per call of memory
-// traffic plus the conversion loops).
+//
+// Uses the rpcmem-backed scratch from the engine ctx — FastRPC sees these
+// as ION-backed shared physical memory and skips the IPC marshal copy,
+// the DSP gets the same physical pages via SMMU translation. If the
+// scratch wasn't allocated at init (rpcmem_alloc failure), falls back
+// to stack scratch with the marshal copy.
 static int sp_hex_round_trip_one(sp_hexagon_ctx_t *ctx,
                                   const uint16_t *in_fp16,
                                   uint16_t *out_fp16) {
     if (!ctx || ctx->fastrpc_handle == (remote_handle64)-1) return -1;
     int hd = ctx->cfg_snapshot.head_dim;
-    if (hd <= 0 || hd > 1024) return -1;
+    if (hd <= 0 || hd > SP_HEXAGON_HEAD_DIM_MAX) return -1;
 
-    // Stack scratch — 4 KB on a 64-byte stack vs heap thrash.
-    float in_f32[1024];
-    float out_f32[1024];
+    float *in_f32, *out_f32;
+    float  stack_in[SP_HEXAGON_HEAD_DIM_MAX]
+        __attribute__((aligned(128)));
+    float  stack_out[SP_HEXAGON_HEAD_DIM_MAX]
+        __attribute__((aligned(128)));
+
+    if (ctx->scratch_in_f32 && ctx->scratch_out_f32) {
+        // Zero-copy path: rpcmem-backed scratch reused across calls,
+        // FastRPC bypasses the marshal copy, DSP processes from shared
+        // physical pages directly.
+        in_f32  = ctx->scratch_in_f32;
+        out_f32 = ctx->scratch_out_f32;
+    } else {
+        // Fallback path: stack scratch, FastRPC will marshal-copy the
+        // input across the IPC boundary and copy the output back. Slower
+        // but correct.
+        in_f32  = stack_in;
+        out_f32 = stack_out;
+    }
+
     sp_hex_widen_f16_to_f32(in_fp16, in_f32, hd);
     int rc = sp_hex_round_trip_f32(ctx->fastrpc_handle, in_f32, hd, hd,
                                     out_f32, hd);
