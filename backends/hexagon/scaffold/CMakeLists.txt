@@ -101,6 +101,7 @@ else()
         ${CMAKE_CURRENT_BINARY_DIR}/sp_hex_skel
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_imp
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels_hvx
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree
@@ -132,6 +133,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src_app/sp_hex_ext
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_imp
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels_hvx
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree

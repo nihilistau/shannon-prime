@@ -37,7 +37,28 @@ static void sp_hex_default_band_config(sp_band_config_t *bc, int head_dim) {
     sp_band_config_init(bc, head_dim, 4, default_bits);
 }
 
+// Forward declaration — defined in sp_hex_kernels_hvx.c when HVX is
+// available. Power-of-2 sizes only; the dispatcher falls back to the
+// scalar reference for the multi-prime VHT2 sizes that the math core
+// supports for non-pow2 head_dims.
+#ifdef __HEXAGON_HVX__
+void sp_hex_vht2_f32_hvx(float *data, int n);
+#endif
+
+static int sp_hex_is_pow2(int n) {
+    return n > 0 && ((n & (n - 1)) == 0);
+}
+
 void sp_hex_vht2_f32(float *data, int n) {
+#ifdef __HEXAGON_HVX__
+    // HVX path: power-of-2, n large enough that at least one pass fills
+    // a full vector (n/2 >= 32 ⇒ n >= 64). Below that, scalar wins
+    // because the loop overhead dominates.
+    if (sp_hex_is_pow2(n) && n >= 64) {
+        sp_hex_vht2_f32_hvx(data, n);
+        return;
+    }
+#endif
     sp_vht2_forward_f32(data, n);
 }
 
