@@ -79,14 +79,32 @@ else()
     # ---------------------------------------------------------------------
     # Hexagon Dynamic Skel Library (libsp_hex_skel.so on the DSP side)
     # ---------------------------------------------------------------------
+    # SP math core sources (relative to shannon-prime repo root, two levels up
+    # from this CMakeLists.txt). Linked into the DSP skel so IDL methods can
+    # call sp_band_quantize / sp_band_dequantize / sp_vht2_forward_f32 directly
+    # — no scalar reference duplication on the DSP side.
+    set(SP_CORE ${CMAKE_CURRENT_SOURCE_DIR}/../../../core)
+
     set(srcs
         ${CMAKE_CURRENT_BINARY_DIR}/sp_hex_skel
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_imp
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels
+        ${SP_CORE}/shannon_prime
+        ${SP_CORE}/shannon_prime_pe
+        ${SP_CORE}/shannon_prime_sqfree
         ${HEXAGON_SDK_ROOT}/utils/examples/dsp_capabilities_utils
     )
 
     add_library(sp_hex_skel SHARED ${srcs})
+
+    # SP core needs its own header dir on the include path.
+    target_include_directories(sp_hex_skel PRIVATE ${SP_CORE})
+
+    # The SP core has static-inline helpers that are unused when only
+    # shannon_prime.c + _pe.c + _sqfree.c are linked (the cauchy and
+    # modelpack TUs that consume them are host-only). Suppress the
+    # resulting -Wunused-function-as-error so the DSP build stays green.
+    target_compile_options(sp_hex_skel PRIVATE -Wno-unused-function)
 
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
 
@@ -102,9 +120,16 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src_app/sp_hex_ext
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_imp
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels
+        ${SP_CORE}/shannon_prime
+        ${SP_CORE}/shannon_prime_pe
+        ${SP_CORE}/shannon_prime_sqfree
     )
+    target_include_directories(sp_hex_q PRIVATE ${SP_CORE})
+    target_compile_options(sp_hex_q PRIVATE -Wno-unused-function)
 
     add_library(sp_hex_skel_static STATIC ${srcs})
+    target_include_directories(sp_hex_skel_static PRIVATE ${SP_CORE})
+    target_compile_options(sp_hex_skel_static PRIVATE -Wno-unused-function)
 
     include_directories(${common_incs})
 

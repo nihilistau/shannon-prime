@@ -13,7 +13,8 @@
 
 #include "HAP_farf.h"
 #include "sp_hex.h"            // qaic-generated header from sp_hex.idl
-#include "sp_hex_kernels.h"    // scalar reference math
+#include "sp_hex_kernels.h"    // forwards to SP math core
+#include "shannon_prime.h"     // sp_band_config_t / sp_band_quantize / etc.
 
 // ============================================================================
 // Lifecycle - inherited from remote_handle64.
@@ -38,9 +39,12 @@ int sp_hex_close(remote_handle64 handle) {
 // IDL methods.
 // ============================================================================
 
-// VHT2(VHT2(x)) ≈ x to fp32 epsilon. The scaffold's smoke test verifies this
-// round-trip. Once HVX kernels land, we'll widen the test to include the
-// quantize+dequantize sandwich.
+// Full SP round-trip on the cDSP:
+//   in_vec  --VHT2-->  coeffs  --quantize-->  packed bytes
+//   packed  --dequantize-->  coeffs  --VHT2-->  out_vec
+// VHT2 is self-inverse so the second VHT2 is the inverse. Reconstruction
+// error matches what the math core produces on CPU for the same input —
+// not fp32 epsilon (that's the no-quantize path).
 int sp_hex_round_trip_f32(remote_handle64 h,
                            const float *in_vec, int in_len,
                            int head_dim,
@@ -57,12 +61,40 @@ int sp_hex_round_trip_f32(remote_handle64 h,
         return -1;
     }
 
-    memcpy(out_vec, in_vec, sizeof(float) * head_dim);
-    sp_hex_vht2_f32(out_vec, head_dim);   // forward
-    sp_hex_vht2_f32(out_vec, head_dim);   // inverse (self-inverse property)
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
 
-    FARF(RUNTIME_HIGH, "[sp_hex] round_trip done: hd=%d in[0]=%f out[0]=%f",
-         head_dim, in_vec[0], out_vec[0]);
+    if (bc.total_bytes > 4096) {
+        FARF(ERROR, "[sp_hex] round_trip: packed size %d > scratch 4096",
+             bc.total_bytes);
+        return -1;
+    }
+    unsigned char packed[4096];
+    float coeffs[1024];   // head_dim <= 1024 — fits typical model sizes
+    if (head_dim > 1024) {
+        FARF(ERROR, "[sp_hex] round_trip: head_dim=%d > scratch 1024",
+             head_dim);
+        return -1;
+    }
+
+    // 1. Copy in, VHT2 forward (in-place on coeffs)
+    memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+    sp_vht2_forward_f32(coeffs, head_dim);
+
+    // 2. Quantize to packed bytes
+    sp_band_quantize(coeffs, packed, &bc);
+
+    // 3. Dequantize back to coeffs
+    sp_band_dequantize(packed, coeffs, &bc);
+
+    // 4. VHT2 inverse (self-inverse, same call) -> out_vec
+    sp_vht2_forward_f32(coeffs, head_dim);
+    memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+
+    FARF(RUNTIME_HIGH,
+         "[sp_hex] round_trip: hd=%d packed=%d in[0]=%f out[0]=%f",
+         head_dim, bc.total_bytes, in_vec[0], out_vec[0]);
     return 0;
 }
 
