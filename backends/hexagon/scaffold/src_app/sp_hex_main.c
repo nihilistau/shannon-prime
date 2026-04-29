@@ -80,6 +80,12 @@ int main(int argc, char *argv[]) {
         return bErr;
     }
 
+    int dErr = sp_hex_disk_tier_proof(head_dim);
+    if (dErr) {
+        printf("ERROR: disk-tier proof failed\n");
+        return dErr;
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

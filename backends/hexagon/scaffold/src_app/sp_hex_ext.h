@@ -33,6 +33,13 @@ int sp_hex_engine_smoke(int head_dim);
 // timing.
 int sp_hex_run_bench_sweep(void);
 
+// Disk-tier proof: scalar host-side quantize fills an rpcmem-backed
+// packed-bands buffer, sp_hexagon_band_dequantize_partial processes via
+// FastRPC zero-copy, output compared to scalar dequantize reference.
+// Demonstrates the rpcmem → DSP path that disk I/O (fread into rpcmem)
+// would feed into.
+int sp_hex_disk_tier_proof(int head_dim);
+
 #ifdef __cplusplus
 }
 #endif

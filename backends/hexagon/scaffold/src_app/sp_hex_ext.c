@@ -321,3 +321,146 @@ int sp_hex_run_bench_sweep(void) {
     rpcmem_deinit();
     return test_err;
 }
+
+// ----------------------------------------------------------------------------
+// Disk-tier I/O proof — exercises the rpcmem-backed packed-bands path
+// that the disk reader will feed into.
+//
+// Pipeline:
+//   1. Generate deterministic fp32 input + run host-side scalar VHT2 to
+//      get realistic spectral coefficients
+//   2. Run host-side scalar sp_band_quantize → packed bytes (this is what
+//      the disk format stores, byte-for-byte)
+//   3. Allocate rpcmem buffer for those packed bytes (RPCMEM_HEAP_ID_SYSTEM,
+//      pre-mapped to DSP via RPCMEM_TRY_MAP_STATIC)
+//   4. memcpy packed bytes into the rpcmem buffer (this step represents
+//      the fread-into-rpcmem that the disk reader does — the bytes
+//      themselves come from disk in the production path)
+//   5. Allocate rpcmem buffer for fp16 output
+//   6. Call sp_hexagon_band_dequantize_partial(ctx, rpcmem_in, rpcmem_out,
+//                                              max_bands=full)
+//   7. Compare against host-side scalar dequantize → should match within
+//      fp16 narrowing tolerance
+//
+// FastRPC sees both rpcmem buffers as ION-backed shared physical memory
+// and forwards them to the DSP without marshal-copying. That's the
+// "predictable, low-latency ping" architecture — DSP processes directly
+// out of pages the kernel allocated for our process.
+// ----------------------------------------------------------------------------
+
+#ifndef SP_HEXAGON_FASTRPC
+int sp_hex_disk_tier_proof(int head_dim) { (void)head_dim; return 0; }
+#else
+int sp_hex_disk_tier_proof(int head_dim) {
+    printf("\n[disk] === Disk-tier I/O proof: rpcmem → DSP partial dequant ===\n");
+
+    sp_config_t cfg;
+    sp_config_init(&cfg, head_dim, 1, 1);
+    sp_hexagon_ctx_t *ctx = sp_hexagon_init(&cfg);
+    if (!ctx) {
+        printf("[disk] sp_hexagon_init failed — DSP unreachable\n");
+        return 1;
+    }
+
+    // Default 4-band 5/5/4/3 ship config (matches the math core defaults
+    // for K and what the DSP-side dispatcher hardcodes today).
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+
+    // ── Host-side: produce reference packed bytes via scalar quantize.
+    // This is bit-identical to what the disk file would contain — the
+    // disk format stores the same byte-for-byte output of sp_band_quantize.
+    float *coeffs_host = (float *)malloc(sizeof(float) * head_dim);
+    uint8_t *packed_host = (uint8_t *)malloc(bc.total_bytes);
+    float *recon_host = (float *)malloc(sizeof(float) * head_dim);
+    if (!coeffs_host || !packed_host || !recon_host) {
+        printf("[disk] host alloc failed\n");
+        sp_hexagon_free(ctx);
+        return 1;
+    }
+
+    for (int i = 0; i < head_dim; ++i) {
+        coeffs_host[i] = 0.125f + (float)i / (float)head_dim;
+    }
+    sp_vht2_forward_f32(coeffs_host, head_dim);    // → VHT2 coefficients
+    sp_band_quantize(coeffs_host, packed_host, &bc);   // → packed bytes
+    sp_band_dequantize(packed_host, recon_host, &bc);  // → reconstructed VHT2 coeffs
+    // sp_hexagon_band_dequantize_partial applies IVHT2 internally to land
+    // in time-domain. Mirror that on the host so we compare like-with-like.
+    sp_vht2_forward_f32(recon_host, head_dim);     // VHT2 self-inverse
+
+    // ── Allocate rpcmem buffers — this is the "shared physical memory"
+    // the cDSP will access directly via SMMU. RPCMEM_TRY_MAP_STATIC
+    // pre-maps so the first FastRPC call doesn't pay setup latency.
+    int alloc_flags = RPCMEM_DEFAULT_FLAGS | RPCMEM_TRY_MAP_STATIC;
+    uint8_t *packed_rpc = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                   alloc_flags,
+                                                   bc.total_bytes);
+    uint16_t *out_fp16  = (uint16_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                   alloc_flags,
+                                                   sizeof(uint16_t) * head_dim);
+    if (!packed_rpc || !out_fp16) {
+        printf("[disk] rpcmem_alloc failed\n");
+        if (packed_rpc) rpcmem_free(packed_rpc);
+        if (out_fp16)   rpcmem_free(out_fp16);
+        free(coeffs_host); free(packed_host); free(recon_host);
+        sp_hexagon_free(ctx);
+        return 1;
+    }
+    printf("[disk] rpcmem_alloc: packed=%p (%d bytes)  out_fp16=%p (%zu bytes)\n",
+           (void *)packed_rpc, bc.total_bytes,
+           (void *)out_fp16, sizeof(uint16_t) * head_dim);
+
+    // ── This memcpy is the only "extra" copy. In the production disk
+    // reader, this becomes:  fread(packed_rpc, 1, bc.total_bytes, fp);
+    // — same destination buffer, same operation, just the bytes come
+    // from UFS instead of from packed_host. The DSP doesn't see this
+    // copy; it just sees the rpcmem pointer.
+    memcpy(packed_rpc, packed_host, bc.total_bytes);
+
+    // ── DSP-side partial dequantize. max_bands=-1 means "all bands" —
+    // identical to a full sp_band_dequantize.
+    int rc = sp_hexagon_band_dequantize_partial(ctx, packed_rpc,
+                                                 out_fp16, /*max_bands=*/-1);
+    if (rc != 0) {
+        printf("[disk] sp_hexagon_band_dequantize_partial failed rc=%d\n", rc);
+        rpcmem_free(packed_rpc); rpcmem_free(out_fp16);
+        free(coeffs_host); free(packed_host); free(recon_host);
+        sp_hexagon_free(ctx);
+        return rc;
+    }
+
+    // ── Compare DSP output (fp16, narrowed) against scalar reference
+    // (fp32, before narrowing). Tolerance: fp16 ULP near recon range.
+    double sse = 0.0;
+    float worst = 0.0f;
+    for (int i = 0; i < head_dim; ++i) {
+        float dsp_val = sp_f16_to_f32(out_fp16[i]);
+        float d = recon_host[i] - dsp_val;
+        if (d < 0) d = -d;
+        if (d > worst) worst = d;
+        sse += (double)d * (double)d;
+    }
+    float rms = (float)sqrt(sse / head_dim);
+    printf("[disk] head_dim=%d  worst_diff=%.3e  rms_diff=%.3e (vs scalar reference)\n",
+           head_dim, worst, rms);
+
+    int test_err = 0;
+    // fp16 narrowing on values of order 1.0 introduces ~5e-4 worst.
+    // We're checking that DSP path matches scalar bit-for-bit modulo
+    // that narrowing — a regression here would be catastrophic.
+    if (rms > 5e-3f) {
+        printf("[disk] ERROR: RMS %.3e exceeds 5e-3 narrowing threshold\n", rms);
+        test_err = 1;
+    } else {
+        printf("[disk] Success — rpcmem → DSP partial dequant matches scalar\n");
+    }
+
+    rpcmem_free(packed_rpc);
+    rpcmem_free(out_fp16);
+    free(coeffs_host); free(packed_host); free(recon_host);
+    sp_hexagon_free(ctx);
+    return test_err;
+}
+#endif  // SP_HEXAGON_FASTRPC
