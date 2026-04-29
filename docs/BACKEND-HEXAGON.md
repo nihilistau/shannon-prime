@@ -111,15 +111,27 @@ chmod +x qualcomm_hexagon_sdk_5.5.6.0.bin
 # Default install path: ~/Qualcomm/Hexagon_SDK/5.5.6.0/
 ```
 
-**B. Reuse the Windows install via /mnt/c** — saves the download but requires the Windows install to be functional (most things ARE there; only the broken WinNT bits we hit in the gotchas section don't matter for Linux):
+**B. Reuse the Windows install via /mnt/c** — *attractive in theory, doesn't work in practice* (verified empirically on this machine 2026-04-29). Keeping this section so you don't waste time re-discovering why:
 
 ```bash
-# Inside WSL, reference the Windows-side install directly
+# Inside WSL — what you'd LIKE to do:
 export HEXAGON_SDK_ROOT="/mnt/c/Qualcomm/Hexagon_SDK/5.5.6.0"
-ls $HEXAGON_SDK_ROOT/setup_sdk_env.source    # confirm Linux setup exists
+ls $HEXAGON_SDK_ROOT/setup_sdk_env.source    # MISSING on Windows installs
 ```
 
-The reuse path works because the Linux variants of qaic / hexagon-clang / cmake all live inside the SDK install regardless of host OS — Qualcomm ships everything cross-platform; only the entry-point scripts diverge. If the Windows install is missing the `setup_sdk_env.source` (Linux equivalent), you'll need approach A.
+What's actually in a Windows-installed SDK:
+
+| Component                                | Bundled? | Notes                                  |
+|------------------------------------------|----------|-----------------------------------------|
+| `setup_sdk_env.cmd` / `_power.ps1`       | yes      | Windows-only entry points              |
+| `setup_sdk_env.source` (Linux entry)     | **no**   | Not shipped with Windows SDK           |
+| `tools/HEXAGON_Tools/8.7.06/Tools/bin`   | yes      | Contains `.exe` ONLY (e.g. `hexagon-clang.exe`) — no Linux ELF binaries |
+| `ipc/fastrpc/qaic/WinNT/qaic.exe`        | yes      | Windows qaic                           |
+| `ipc/fastrpc/qaic/Ubuntu20/qaic`         | yes      | Linux qaic — the *one* cross-OS binary  |
+
+So although `qaic/Ubuntu20/qaic` is callable from WSL, the compiler (`hexagon-clang`) is shipped as Windows .exe only — there are no Linux ELF copies to run. The calculator Makefile also guards on `SDK_SETUP_ENV=Done`, which the missing `setup_sdk_env.source` is the only thing that sets, so even running `make` directly is blocked.
+
+**Conclusion: Option B is documentation only. Use Option A (QPM3 download of the Linux SDK installer) for any real WSL work.** Plan budget: ~1 GB download, plus the `setup_sdk_env.source` ships with the Linux installer and doesn't have the broken-`make` problem the Windows path has.
 
 #### Step 3 — Source the Linux env script
 
