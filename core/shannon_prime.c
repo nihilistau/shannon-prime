@@ -951,16 +951,23 @@ void sp_shadow_write_v(sp_shadow_cache_t *sc,
 // Hot path: uses persistent sc->read_scratch + sc->mobius_scratch. No malloc.
 // The `const` on sc is a contract for thread-call-safety, not true immutability
 // — we write into sc->read_scratch / sc->mobius_scratch. Callers must serialize.
-void sp_shadow_read_k(const sp_shadow_cache_t *sc,
-                      int layer, int head, int pos,
-                      float *k_out) {
+// Internal helper used by both the full and partial read paths.
+// max_bands < 0 OR >= bc->n_bands selects the full path (sp_band_dequantize);
+// otherwise sp_band_dequantize_partial is called with that bound.
+static void sp_shadow_read_k_impl(const sp_shadow_cache_t *sc,
+                                  int layer, int head, int pos,
+                                  float *k_out, int max_bands) {
     int hd = sc->config.head_dim;
     float *scratch = sc->read_scratch;
 
     int slot = layer * sc->config.n_heads_kv + head;
     const uint8_t *src = sc->k_cache[slot] + (size_t)pos * sc->k_bands.total_bytes;
 
-    sp_band_dequantize(src, scratch, &sc->k_bands);
+    if (max_bands < 0 || max_bands >= sc->k_bands.n_bands) {
+        sp_band_dequantize(src, scratch, &sc->k_bands);
+    } else {
+        sp_band_dequantize_partial(src, scratch, &sc->k_bands, max_bands);
+    }
 
     // Inverse reorder: variance-ranked (if calibrated) > Möbius > none
     if (sc->use_var_reorder) {
@@ -972,27 +979,56 @@ void sp_shadow_read_k(const sp_shadow_cache_t *sc,
     }
 
     // Inverse transform: VHT2 is self-inverse (1/√p per stage absorbs the
-    // 1/N the old unnormalised p=2 butterfly required).
+    // 1/N the old unnormalised p=2 butterfly required). Zero coefficients
+    // in unread bands collapse butterfly contributions to zero on those
+    // axes, giving a partial-fidelity reconstruction in head_dim space.
     sp_vht2_forward_f32(scratch, hd);
 
     memcpy(k_out, scratch, hd * sizeof(float));
 }
 
-void sp_shadow_read_v(const sp_shadow_cache_t *sc,
-                      int layer, int head, int pos,
-                      float *v_out) {
+static void sp_shadow_read_v_impl(const sp_shadow_cache_t *sc,
+                                  int layer, int head, int pos,
+                                  float *v_out, int max_bands) {
     int hd = sc->config.head_dim;
     float *scratch = sc->read_scratch;
 
     int slot = layer * sc->config.n_heads_kv + head;
     const uint8_t *src = sc->v_cache[slot] + (size_t)pos * sc->v_bands.total_bytes;
 
-    sp_band_dequantize(src, scratch, &sc->v_bands);
+    if (max_bands < 0 || max_bands >= sc->v_bands.n_bands) {
+        sp_band_dequantize(src, scratch, &sc->v_bands);
+    } else {
+        sp_band_dequantize_partial(src, scratch, &sc->v_bands, max_bands);
+    }
 
-    // Inverse transform: VHT2 is self-inverse.
     sp_vht2_forward_f32(scratch, hd);
 
     memcpy(v_out, scratch, hd * sizeof(float));
+}
+
+void sp_shadow_read_k(const sp_shadow_cache_t *sc,
+                      int layer, int head, int pos,
+                      float *k_out) {
+    sp_shadow_read_k_impl(sc, layer, head, pos, k_out, -1 /* full */);
+}
+
+void sp_shadow_read_v(const sp_shadow_cache_t *sc,
+                      int layer, int head, int pos,
+                      float *v_out) {
+    sp_shadow_read_v_impl(sc, layer, head, pos, v_out, -1 /* full */);
+}
+
+void sp_shadow_read_k_partial(const sp_shadow_cache_t *sc,
+                              int layer, int head, int pos,
+                              float *k_out, int max_bands) {
+    sp_shadow_read_k_impl(sc, layer, head, pos, k_out, max_bands);
+}
+
+void sp_shadow_read_v_partial(const sp_shadow_cache_t *sc,
+                              int layer, int head, int pos,
+                              float *v_out, int max_bands) {
+    sp_shadow_read_v_impl(sc, layer, head, pos, v_out, max_bands);
 }
 
 // Batch variants. Tight loop reusing the persistent scratch. Zero mallocs

@@ -851,6 +851,23 @@ void sp_shadow_read_v(const sp_shadow_cache_t *sc,
                       int layer, int head, int pos,
                       float *v_out);
 
+// Partial reads — reconstruct using only the first `max_bands` spectral
+// bands. Higher bands are treated as zero coefficients, which propagates
+// cleanly through the inverse Möbius reorder + inverse VHT2 to give a
+// partial-fidelity reconstruction. Used by the phase 3 attention
+// short-circuit: low-fidelity band-0-only reads first, promote to more
+// bands when entropy demands.
+//
+// max_bands clamps into [0, n_bands]. INT_MAX or any value >= n_bands
+// is identical to sp_shadow_read_{k,v} (full reconstruction).
+// max_bands == 0 returns an all-zero vector.
+void sp_shadow_read_k_partial(const sp_shadow_cache_t *sc,
+                              int layer, int head, int pos,
+                              float *k_out, int max_bands);
+void sp_shadow_read_v_partial(const sp_shadow_cache_t *sc,
+                              int layer, int head, int pos,
+                              float *v_out, int max_bands);
+
 // Batch variants — process n_pos contiguous vectors with a single setup.
 // k_vecs / v_vecs must be contiguous [n_pos × head_dim] arrays.
 // These are the real batches: they run in a tight loop over the persistent
