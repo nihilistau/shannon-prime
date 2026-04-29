@@ -26,6 +26,13 @@ int sp_hex_process(int domain, int head_dim, bool isUnsignedPD_Enabled);
 // llama-cpp-sp's bridge.
 int sp_hex_engine_smoke(int head_dim);
 
+// Cycle bench: runs the VHT2 forward butterfly through both the scalar
+// reference path and the HVX-vectorised path on the cDSP, prints
+// per-call pcycles + speedup ratio across a sweep of head_dim values.
+// Uses sp_hex_vht2_bench (FastRPC) under the hood with HAP_perf_get_pcycles
+// timing.
+int sp_hex_run_bench_sweep(void);
+
 #ifdef __cplusplus
 }
 #endif

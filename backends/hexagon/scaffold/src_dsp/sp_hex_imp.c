@@ -13,9 +13,18 @@
 
 #include "HAP_farf.h"
 #include "HAP_vtcm_mgr.h"      // HAP_request_VTCM / HAP_release_VTCM / queries
+#include "HAP_perf.h"          // HAP_perf_get_pcycles for the bench IDL
+#include "qurt_hvx.h"          // qurt_hvx_lock / unlock — required before HVX
 #include "sp_hex.h"            // qaic-generated header from sp_hex.idl
 #include "sp_hex_kernels.h"    // forwards to SP math core
 #include "shannon_prime.h"     // sp_band_config_t / sp_band_quantize / etc.
+
+// Forward decl — defined in sp_hex_kernels_hvx.c when HVX is available.
+// Used directly by the bench IDL to time the HVX path in isolation,
+// vs sp_hex_vht2_f32 which dispatches and would obscure the comparison.
+#ifdef __HVX__
+void sp_hex_vht2_f32_hvx(float *data, int n);
+#endif
 
 // Per-session DSP context. Held behind the FastRPC handle that sp_hex_open
 // returns; sp_hex_close releases everything. Sized to fit a few small
@@ -29,6 +38,12 @@
 typedef struct {
     void   *vtcm_ptr;       // NULL if acquisition failed
     int     vtcm_bytes;     // 0 if no region; else bytes acquired
+    int     hvx_locked;     // 1 if qurt_hvx_lock succeeded — required
+                            //   before any HVX instruction executes on
+                            //   this thread; without it, vector ops
+                            //   fault and FastRPC returns a transport
+                            //   error code (the 78 / -2147482611 / 39
+                            //   chaos we saw before locking).
 } sp_hex_session_t;
 
 // Default per-session VTCM ask. Banded quantize working set on a typical
@@ -46,6 +61,14 @@ int sp_hex_open(const char *uri, remote_handle64 *handle) {
     sp_hex_session_t *sess = (sp_hex_session_t *)calloc(1, sizeof(*sess));
     if (!sess) return -1;
 
+    // Lock the HVX context for this thread. Required before any HVX
+    // instruction executes — without this lock, the first vector op
+    // throws a fault and FastRPC returns a transport error to the host.
+    // V69 is 128-byte (1024-bit) HVX so we ask for QURT_HVX_MODE_128B.
+    // 0 on success; negative if HVX is unavailable for any reason.
+    int hvx_rc = qurt_hvx_lock(QURT_HVX_MODE_128B);
+    sess->hvx_locked = (hvx_rc == 0);
+
     // Try to acquire a VTCM region. single_page_flag=1 asks for one
     // contiguous physical page — fine for 64 KB which is well under
     // the V69 page granularity. NULL return means "couldn't get one";
@@ -55,8 +78,8 @@ int sp_hex_open(const char *uri, remote_handle64 *handle) {
 
     *handle = (remote_handle64)sess;
     FARF(RUNTIME_HIGH,
-         "[sp_hex] open() -> handle=0x%llx vtcm=%p (%d bytes)",
-         *handle, sess->vtcm_ptr, sess->vtcm_bytes);
+         "[sp_hex] open() -> handle=0x%llx hvx_locked=%d vtcm=%p (%d bytes)",
+         *handle, sess->hvx_locked, sess->vtcm_ptr, sess->vtcm_bytes);
     return 0;
 }
 
@@ -65,6 +88,9 @@ int sp_hex_close(remote_handle64 handle) {
     if (sess) {
         if (sess->vtcm_ptr) {
             HAP_release_VTCM(sess->vtcm_ptr);
+        }
+        if (sess->hvx_locked) {
+            qurt_hvx_unlock();
         }
         free(sess);
     }
@@ -99,6 +125,58 @@ int sp_hex_vtcm_status(remote_handle64 h,
     FARF(RUNTIME_HIGH,
          "[sp_hex] vtcm_status: total=%lld avail=%lld acquired=%lld",
          *bytes_total, *bytes_avail, *bytes_acquired);
+    return 0;
+}
+
+int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
+                       long long *scalar_pcycles, long long *hvx_pcycles) {
+    (void)h;
+    if (!scalar_pcycles || !hvx_pcycles) return -1;
+    if (head_dim < 8 || head_dim > 1024) return -1;
+    if ((head_dim & (head_dim - 1)) != 0) return -1;  // pow2 only
+    if (iterations < 1) return -1;
+
+    // 128-byte aligned for HVX vmem. Without this, sp_hex_vht2_f32_hvx
+    // faults on the first vector load — *((HVX_Vector*)ptr) emits a
+    // strict vmem instruction that requires alignment, not vmemu.
+    float input[1024] __attribute__((aligned(128)));
+    float buf[1024]   __attribute__((aligned(128)));
+
+    for (int i = 0; i < head_dim; ++i) {
+        input[i] = 0.125f + (float)i / (float)head_dim;
+    }
+
+    // Time scalar path (no HVX involvement).
+    memcpy(buf, input, sizeof(float) * head_dim);
+    sp_vht2_forward_f32(buf, head_dim);  // warmup
+    uint64_t t0 = HAP_perf_get_pcycles();
+    for (int it = 0; it < iterations; ++it) {
+        memcpy(buf, input, sizeof(float) * head_dim);
+        sp_vht2_forward_f32(buf, head_dim);
+    }
+    *scalar_pcycles = (long long)(HAP_perf_get_pcycles() - t0);
+
+#ifdef __HVX__
+    if (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0) {
+        memcpy(buf, input, sizeof(float) * head_dim);
+        sp_hex_vht2_f32_hvx(buf, head_dim);  // warmup
+        t0 = HAP_perf_get_pcycles();
+        for (int it = 0; it < iterations; ++it) {
+            memcpy(buf, input, sizeof(float) * head_dim);
+            sp_hex_vht2_f32_hvx(buf, head_dim);
+        }
+        *hvx_pcycles = (long long)(HAP_perf_get_pcycles() - t0);
+        qurt_hvx_unlock();
+    } else {
+        *hvx_pcycles = *scalar_pcycles;
+    }
+#else
+    *hvx_pcycles = *scalar_pcycles;
+#endif
+
+    FARF(RUNTIME_HIGH,
+         "[sp_hex] vht2_bench: hd=%d iter=%d scalar=%lld hvx=%lld",
+         head_dim, iterations, *scalar_pcycles, *hvx_pcycles);
     return 0;
 }
 

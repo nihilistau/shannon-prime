@@ -13,7 +13,7 @@
 //   sp_hex_band_dequantize    -> int8 → fp32 widen/scale, vector at a time.
 //
 // The HVX kernels go in a separate .c (sp_hex_kernels_hvx.c) gated on
-// #ifdef __HEXAGON_HVX__ so the scalar fallback always works for unit tests.
+// #ifdef __HVX__ so the scalar fallback always works for unit tests.
 
 #include "sp_hex_kernels.h"
 
@@ -23,7 +23,7 @@
 // the math.
 //
 // HVX kernels will be added later as a sibling sp_hex_kernels_hvx.c
-// gated on #ifdef __HEXAGON_HVX__, with the imp file calling the HVX path
+// gated on #ifdef __HVX__, with the imp file calling the HVX path
 // when the macro is defined and falling back to the scalar core otherwise.
 
 #include "shannon_prime.h"
@@ -41,7 +41,7 @@ static void sp_hex_default_band_config(sp_band_config_t *bc, int head_dim) {
 // available. Power-of-2 sizes only; the dispatcher falls back to the
 // scalar reference for the multi-prime VHT2 sizes that the math core
 // supports for non-pow2 head_dims.
-#ifdef __HEXAGON_HVX__
+#ifdef __HVX__
 void sp_hex_vht2_f32_hvx(float *data, int n);
 #endif
 
@@ -50,7 +50,7 @@ static int sp_hex_is_pow2(int n) {
 }
 
 void sp_hex_vht2_f32(float *data, int n) {
-#ifdef __HEXAGON_HVX__
+#ifdef __HVX__
     // HVX path: power-of-2, n large enough that at least one pass fills
     // a full vector (n/2 >= 32 ⇒ n >= 64). Below that, scalar wins
     // because the loop overhead dominates.

@@ -89,4 +89,22 @@ interface sp_hex : remote_handle64 {
    long vtcm_status(rout long long bytes_total,
                     rout long long bytes_avail,
                     rout long long bytes_acquired);
+
+   // -------------------------------------------------------------------
+   // Cycle bench. Runs the VHT2 forward butterfly through both the
+   // scalar reference path and the HVX-vectorised path, reports total
+   // pcycles consumed by each (across `iterations` calls) using
+   // HAP_perf_get_pcycles. Caller divides by `iterations` to get
+   // per-call cost; ratio of scalar/hvx is the speedup factor.
+   //
+   // Each iteration includes a memcpy from a stable input buffer so the
+   // timing isolates the transform itself rather than measuring repeated
+   // applications on already-transformed data (VHT2 is self-inverse —
+   // running it twice on the same buffer hits a different numerical
+   // path).
+   // -------------------------------------------------------------------
+   long vht2_bench(in long head_dim,
+                   in long iterations,
+                   rout long long scalar_pcycles,
+                   rout long long hvx_pcycles);
 };

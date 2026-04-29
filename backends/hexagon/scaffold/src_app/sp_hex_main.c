@@ -74,6 +74,12 @@ int main(int argc, char *argv[]) {
         return eErr;
     }
 
+    int bErr = sp_hex_run_bench_sweep();
+    if (bErr) {
+        printf("ERROR: bench sweep failed\n");
+        return bErr;
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

@@ -117,7 +117,11 @@ else()
     # shannon_prime.c + _pe.c + _sqfree.c are linked (the cauchy and
     # modelpack TUs that consume them are host-only). Suppress the
     # resulting -Wunused-function-as-error so the DSP build stays green.
-    target_compile_options(sp_hex_skel PRIVATE -Wno-unused-function)
+    #
+    # -mhvx is required for the HVX intrinsics in sp_hex_kernels_hvx.c.
+    # The default v69 build doesn't enable HVX automatically; with -mhvx
+    # the toolchain defines __HVX__ and the HVX-gated code paths activate.
+    target_compile_options(sp_hex_skel PRIVATE -Wno-unused-function -mhvx -mhvx-ieee-fp)
 
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
 
@@ -139,11 +143,11 @@ else()
         ${SP_CORE}/shannon_prime_sqfree
     )
     target_include_directories(sp_hex_q PRIVATE ${SP_CORE})
-    target_compile_options(sp_hex_q PRIVATE -Wno-unused-function)
+    target_compile_options(sp_hex_q PRIVATE -Wno-unused-function -mhvx -mhvx-ieee-fp)
 
     add_library(sp_hex_skel_static STATIC ${srcs})
     target_include_directories(sp_hex_skel_static PRIVATE ${SP_CORE})
-    target_compile_options(sp_hex_skel_static PRIVATE -Wno-unused-function)
+    target_compile_options(sp_hex_skel_static PRIVATE -Wno-unused-function -mhvx -mhvx-ieee-fp)
 
     include_directories(${common_incs})
 

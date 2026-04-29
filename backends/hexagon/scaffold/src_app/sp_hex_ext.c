@@ -253,3 +253,70 @@ int sp_hex_engine_smoke(int head_dim) {
     return test_err;
 }
 #endif  // SP_HEXAGON_FASTRPC
+
+// ----------------------------------------------------------------------------
+// Cycle bench sweep — opens a FastRPC session, calls vht2_bench across a
+// representative ladder of head_dim values, prints per-call pcycles for both
+// the scalar reference and HVX paths plus the speedup ratio.
+//
+// "Per-call cycles" here is total bench cycles divided by the iteration
+// count, including the memcpy reset between iterations. The memcpy delta
+// is the same across both paths so the *ratio* isolates the kernel-only
+// speedup; the absolute numbers are slightly inflated by the reset cost.
+// ----------------------------------------------------------------------------
+
+int sp_hex_run_bench_sweep(void) {
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    // Enable unsigned PD before opening — bench session is the same kind
+    // of session the smoke test uses.
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[bench] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[bench] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    const int iterations = 1000;
+    const int dims[]     = {64, 128, 256, 512, 1024};
+    const int n_dims     = (int)(sizeof(dims) / sizeof(dims[0]));
+
+    printf("\n[bench] === VHT2 cycle bench (iter=%d) ===\n", iterations);
+    printf("[bench] %-9s %-14s %-14s %-9s\n",
+           "head_dim", "scalar pcyc/call", "HVX pcyc/call", "speedup");
+
+    int test_err = 0;
+    for (int i = 0; i < n_dims; ++i) {
+        long long scalar_total = 0, hvx_total = 0;
+        rc = sp_hex_vht2_bench(h, dims[i], iterations,
+                                &scalar_total, &hvx_total);
+        if (rc != AEE_SUCCESS) {
+            printf("[bench] hd=%d  vht2_bench failed rc=%d\n", dims[i], rc);
+            test_err = 1;
+            continue;
+        }
+        double scalar_per = (double)scalar_total / (double)iterations;
+        double hvx_per    = (double)hvx_total / (double)iterations;
+        double ratio      = (hvx_per > 0.0) ? (scalar_per / hvx_per) : 0.0;
+        printf("[bench] %-9d %-14.0f %-14.0f %.2fx\n",
+               dims[i], scalar_per, hvx_per, ratio);
+    }
+
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return test_err;
+}

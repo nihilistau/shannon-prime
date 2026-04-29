@@ -7,7 +7,7 @@
 //
 // Build gating
 // ------------
-//   __HEXAGON_HVX__   defined when the toolchain targets a DSP variant
+//   __HVX__   defined when the toolchain targets a DSP variant
 //                     with HVX. Always true for V60+, including our V69.
 //
 // All entry points fall back to the scalar reference for sizes that
@@ -15,7 +15,7 @@
 // which the multi-prime VHT2 path would handle. This keeps the IDL
 // surface uniform — callers don't branch on capability.
 
-#ifdef __HEXAGON_HVX__
+#ifdef __HVX__
 
 #include <hexagon_types.h>
 #include <hvx_hexagon_protos.h>
@@ -93,4 +93,4 @@ void sp_hex_vht2_f32_hvx(float *data, int n) {
     }
 }
 
-#endif  // __HEXAGON_HVX__
+#endif  // __HVX__
