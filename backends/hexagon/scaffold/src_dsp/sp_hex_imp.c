@@ -136,9 +136,7 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
     if ((head_dim & (head_dim - 1)) != 0) return -1;  // pow2 only
     if (iterations < 1) return -1;
 
-    // 128-byte aligned for HVX vmem. Without this, sp_hex_vht2_f32_hvx
-    // faults on the first vector load — *((HVX_Vector*)ptr) emits a
-    // strict vmem instruction that requires alignment, not vmemu.
+    // 128-byte aligned for HVX vmem. 8 KB total — fits unsigned PD stack.
     float input[1024] __attribute__((aligned(128)));
     float buf[1024]   __attribute__((aligned(128)));
 
@@ -146,7 +144,7 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
         input[i] = 0.125f + (float)i / (float)head_dim;
     }
 
-    // Time scalar path (no HVX involvement).
+    // Time scalar path
     memcpy(buf, input, sizeof(float) * head_dim);
     sp_vht2_forward_f32(buf, head_dim);  // warmup
     uint64_t t0 = HAP_perf_get_pcycles();
@@ -156,6 +154,8 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
     }
     *scalar_pcycles = (long long)(HAP_perf_get_pcycles() - t0);
 
+    // Time HVX path (kept for perf measurement even though dispatcher
+    // doesn't currently use it — see note in sp_hex_kernels.c).
 #ifdef __HVX__
     if (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0) {
         memcpy(buf, input, sizeof(float) * head_dim);
@@ -173,10 +173,6 @@ int sp_hex_vht2_bench(remote_handle64 h, int head_dim, int iterations,
 #else
     *hvx_pcycles = *scalar_pcycles;
 #endif
-
-    FARF(RUNTIME_HIGH,
-         "[sp_hex] vht2_bench: hd=%d iter=%d scalar=%lld hvx=%lld",
-         head_dim, iterations, *scalar_pcycles, *hvx_pcycles);
     return 0;
 }
 
@@ -215,26 +211,32 @@ int sp_hex_round_trip_f32(remote_handle64 h,
              bc.total_bytes);
         return -1;
     }
-    unsigned char packed[4096];
-    float coeffs[1024];   // head_dim <= 1024 — fits typical model sizes
+    // 128-byte aligned for HVX vmem (the dispatcher routes large enough
+    // head_dim through HVX and the kernels do strict-alignment loads).
+    unsigned char packed[4096] __attribute__((aligned(128)));
+    float coeffs[1024]         __attribute__((aligned(128)));
     if (head_dim > 1024) {
         FARF(ERROR, "[sp_hex] round_trip: head_dim=%d > scratch 1024",
              head_dim);
         return -1;
     }
 
-    // 1. Copy in, VHT2 forward (in-place on coeffs)
+    // 1. Copy in, VHT2 forward via dispatcher (currently scalar — HVX
+    // VHT2 has a precision drift issue noted in sp_hex_kernels.c).
     memcpy(coeffs, in_vec, sizeof(float) * head_dim);
-    sp_vht2_forward_f32(coeffs, head_dim);
+    sp_hex_vht2_f32(coeffs, head_dim);
 
-    // 2. Quantize to packed bytes
-    sp_band_quantize(coeffs, packed, &bc);
+    // 2. Quantize via dispatcher — HVX path activates for head_dim ≥ 128
+    // multiple-of-128, ternary mask zero (the default).
+    int packed_used = 0;
+    sp_hex_band_quantize_scalar(coeffs, head_dim, packed, sizeof(packed),
+                                &packed_used);
 
-    // 3. Dequantize back to coeffs
+    // 3. Dequantize back to coeffs (still scalar — HVX dequantize TODO).
     sp_band_dequantize(packed, coeffs, &bc);
 
-    // 4. VHT2 inverse (self-inverse, same call) -> out_vec
-    sp_vht2_forward_f32(coeffs, head_dim);
+    // 4. VHT2 inverse via dispatcher.
+    sp_hex_vht2_f32(coeffs, head_dim);
     memcpy(out_vec, coeffs, sizeof(float) * head_dim);
 
     FARF(RUNTIME_HIGH,

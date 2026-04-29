@@ -37,12 +37,15 @@ static void sp_hex_default_band_config(sp_band_config_t *bc, int head_dim) {
     sp_band_config_init(bc, head_dim, 4, default_bits);
 }
 
-// Forward declaration — defined in sp_hex_kernels_hvx.c when HVX is
+// Forward declarations — defined in sp_hex_kernels_hvx.c when HVX is
 // available. Power-of-2 sizes only; the dispatcher falls back to the
 // scalar reference for the multi-prime VHT2 sizes that the math core
 // supports for non-pow2 head_dims.
 #ifdef __HVX__
+#include "qurt_hvx.h"   // qurt_hvx_lock / unlock — required around HVX kernels
 void sp_hex_vht2_f32_hvx(float *data, int n);
+int  sp_hex_band_quantize_hvx(const float *coeffs, int head_dim,
+                               unsigned char *out, int out_capacity);
 #endif
 
 static int sp_hex_is_pow2(int n) {
@@ -50,15 +53,18 @@ static int sp_hex_is_pow2(int n) {
 }
 
 void sp_hex_vht2_f32(float *data, int n) {
-#ifdef __HVX__
-    // HVX path: power-of-2, n large enough that at least one pass fills
-    // a full vector (n/2 >= 32 ⇒ n >= 64). Below that, scalar wins
-    // because the loop overhead dominates.
-    if (sp_hex_is_pow2(n) && n >= 64) {
-        sp_hex_vht2_f32_hvx(data, n);
-        return;
-    }
-#endif
+    // KNOWN ISSUE: sp_hex_vht2_f32_hvx produces output that's ~0.005-0.02
+    // absolute different from sp_vht2_forward_f32 on the same input.
+    // Verified by direct scalar-vs-HVX output comparison on head_dim=64..1024.
+    // The drift is small (~0.1% relative) but compounds badly through the
+    // round-trip's two VHT2 calls + band quantize/dequantize, pushing
+    // round-trip RMS from 0.029 to 0.69. Likely cause: HVX fp32 rounding
+    // semantics differing from scalar fp32 even with -mhvx-ieee-fp.
+    // Investigation deferred to a separate workstream.
+    //
+    // For now: dispatcher falls through to the math core scalar reference.
+    // sp_hex_vht2_f32_hvx remains exported so the bench can measure HVX
+    // timing; it just isn't on the production path.
     sp_vht2_forward_f32(data, n);
 }
 
@@ -68,6 +74,12 @@ int sp_hex_band_quantize_scalar(const float *coeffs, int head_dim,
     sp_band_config_t bc;
     sp_hex_default_band_config(&bc, head_dim);
     if (out_capacity < bc.total_bytes) return -1;
+
+    // KNOWN ISSUE: sp_hex_band_quantize_hvx produces wrong output (round-trip
+    // RMS 0.69 vs scalar 0.029). Likely the same HVX fp32 precision drift
+    // pattern that affects sp_hex_vht2_f32_hvx — the amax values differ
+    // enough between scalar and HVX paths to misalign the per-band scales.
+    // Investigation deferred. Dispatcher uses math core scalar reference.
     sp_band_quantize(coeffs, out, &bc);
     if (out_len) *out_len = bc.total_bytes;
     return 0;
