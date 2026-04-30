@@ -132,6 +132,20 @@ typedef struct {
     float             *vec_out_f32;
     uint8_t           *k_packed_rpc;
     uint8_t           *v_packed_rpc;
+    // Batched FastRPC scratches — sized at chunk_size * per-call so a
+    // single dispatch covers chunk_size positions. Used by
+    // sp_hexagon_cache_{write,read}_k_batch on the prefill path. chunk_size
+    // is the bridge's per-call fan-out (default 32, env-overridable via
+    // SP_HEX_BATCH_CHUNK). vec_in_batch_rpc carries chunk_size * head_dim
+    // fp32 vectors for compress_f32_batch input; k_packed_batch_rpc carries
+    // chunk_size * k_bands.total_bytes packed bytes for output. Read path
+    // reverses (in_packed → out_vecs). Same registration-length contract
+    // applies: alloc size MUST equal the FastRPC call length parameter.
+    int                batch_chunk_size;
+    float             *vec_in_batch_rpc;
+    float             *vec_out_batch_rpc;
+    uint8_t           *k_packed_batch_rpc;
+    uint8_t           *v_packed_batch_rpc;
 } sp_hexagon_cache_t;
 
 int  sp_hexagon_cache_init(sp_hexagon_cache_t *cache,
