@@ -21,6 +21,7 @@
 #include "buffer.h"
 #include "ion_allocation.h"
 #include "rpcmem.h"
+#include "remote.h"            // remote_session_control + DSPRPC_CONTROL_UNSIGNED_MODULE
 #include "sp_dma_raw.h"        // FastRPC stub (generated from .idl)
 #include "test_report.h"
 
@@ -100,9 +101,27 @@ int main(int argc, char *argv[]) {
 
     alloc_init();
 
+    // Enable UNSIGNED PD on the cDSP. The phone is bootloader-locked and
+    // we don't have a Qualcomm-issued testsig for it; without unsigned PD
+    // the cDSP loader rejects our (unsigned) skel.so + oemconfig.so with
+    // "signature verify start failed". Mirrors the working S22U test's
+    // pattern in S22U_ext.c.
+    {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = 3;  // CDSP_DOMAIN_ID
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void*)&data, sizeof(data));
+        if (rc != 0) {
+            std::fprintf(stderr, "remote_session_control(UNSIGNED_PD) failed: 0x%x\n", rc);
+            return 1;
+        }
+    }
+
     // Power on HVX + turbo
-    if (sp_dma_raw_power_on_hvx() != 0) {
-        std::fprintf(stderr, "power_on_hvx failed\n");
+    int rc_pwr = sp_dma_raw_power_on_hvx();
+    if (rc_pwr != 0) {
+        std::fprintf(stderr, "power_on_hvx failed: 0x%x\n", rc_pwr);
         return 1;
     }
     sp_dma_raw_set_hvx_perf_mode_turbo();
@@ -143,8 +162,12 @@ int main(int argc, char *argv[]) {
                     n_bytes, packed_band_stride);
     }
 
-    // Send to DSP.
-    uint64_t avg_time = 0;
+    // Send to DSP. NB: qaic-generated `uint64` resolves to `unsigned long
+    // long` per the SDK's AEEStdDef.h, while `uint64_t` from <stdint.h> is
+    // `unsigned long` on aarch64 NDK (LP64 model) — same width, distinct
+    // C++ type. Use unsigned long long here so the FastRPC stub signature
+    // matches without a cast.
+    unsigned long long avg_time = 0;
     int rc = sp_dma_raw_run(
         packed_in.get_buffer(), packed_band_stride * N_BANDS,
         packed_band_stride,

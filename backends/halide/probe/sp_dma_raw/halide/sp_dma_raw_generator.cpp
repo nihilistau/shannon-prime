@@ -48,10 +48,19 @@ public:
         Expr byte_pos   = start_bit / 8;
         Expr bit_offset = start_bit % 8;
 
+        // Halide's bounds inference can't statically prove `byte_pos` and
+        // `byte_pos + 1` stay within `packed.dim(0)` because both depend
+        // on the runtime value of `band_bits`. Wrap the input with a
+        // constant-exterior boundary condition so out-of-range reads
+        // return 0; the host packs strictly inside the dim 0 extent so
+        // this only affects the trailing window-read on the last byte
+        // (where the extra byte falls past the band's packed-stride).
+        Func packed_safe = BoundaryConditions::constant_exterior(packed, 0);
+
         // 16-bit window over two adjacent packed bytes — covers up to
         // 16-bit code widths starting at any bit offset (we use 2..5).
-        Expr lo = cast<uint16_t>(packed(byte_pos,     y));
-        Expr hi = cast<uint16_t>(packed(byte_pos + 1, y));
+        Expr lo = cast<uint16_t>(packed_safe(byte_pos,     y));
+        Expr hi = cast<uint16_t>(packed_safe(byte_pos + 1, y));
         Expr window = (hi << 8) | lo;
 
         Expr mask = cast<uint16_t>((1 << band_bits) - 1);

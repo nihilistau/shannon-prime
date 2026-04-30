@@ -156,14 +156,45 @@ $UbwcLibDir = "$env:HEXAGON_SDK_ROOT\addons\compute\libs\ubwcdma\fw\v$Q6Version"
 $UbwcLib    = Join-Path $UbwcLibDir "ubwcdma_dynlib.so"
 $DmaInc     = Join-Path $UbwcLibDir "inc"
 
+# Fallbacks when the Compute add-on isn't installed:
+#   (1) A `compat/` subdir in the example provides shim headers (e.g. our
+#       Halide-mini-vendored dma_def.h / dma_types.h / dmaWrapper.h).
+#   (2) `ubwcdma_dynlib.so` staged anywhere under C:\Qualcomm or pulled
+#       from the device via adb. Symbols are SDK-defined and stable across
+#       vendor builds; runtime resolution on the phone goes via
+#       /vendor/dsp/cdsp/ubwcdma_dynlib.so regardless of which build we link.
+$LocalCompatDir = Join-Path $ExampleDir "compat"
+$HasLocalCompat = Test-Path (Join-Path $LocalCompatDir "dmaWrapper.h")
 if ($NeedsDma -and -not (Test-Path $UbwcLib)) {
-    Fail @"
-This example uses Hexagon DMA (hexagon_dma feature / dmaWrapper.h include),
-but the Compute add-on isn't installed:
-  Expected: $UbwcLib
-Install via Qualcomm Software Center -> Hexagon SDK 5.5 -> Compute add-on,
-then re-run.
+    $candidates = @(
+        "C:\Qualcomm\dsp\cdsp\ubwcdma_dynlib.so",
+        "C:\Qualcomm\ubwcdma_dynlib.so"
+    )
+    $UbwcLib = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($UbwcLib -and $HasLocalCompat) {
+        Write-Host "[info] Compute add-on not installed; using staged lib + local compat shim:" -ForegroundColor Yellow
+        Write-Host "         lib:    $UbwcLib"
+        Write-Host "         compat: $LocalCompatDir"
+        $DmaInc = $LocalCompatDir
+    } elseif ($UbwcLib) {
+        Fail @"
+Found staged ubwcdma_dynlib.so at $UbwcLib, but no compat/ shim headers
+in the example. Drop dma_def.h / dma_types.h / dmaWrapper.h shims into:
+  $LocalCompatDir
+(See backends/halide/probe/sp_dma_raw/compat/ for a working set vendored
+from the Halide project's mini_hexagon_dma.h.)
 "@
+    } else {
+        Fail @"
+This example uses Hexagon DMA (hexagon_dma feature / dmaWrapper.h include),
+but the Compute add-on isn't installed and no staged fallback was found.
+Either:
+  (a) Install via Qualcomm Software Center -> Hexagon SDK 5.5 -> Compute add-on
+  (b) Stage ubwcdma_dynlib.so at C:\Qualcomm\dsp\cdsp\ubwcdma_dynlib.so
+      (e.g. by adb-pulling /vendor/dsp/cdsp/ubwcdma_dynlib.so) AND drop
+      compat shim headers into $LocalCompatDir
+"@
+    }
 }
 
 # ---- 4. Set up bin tree + working dir -----------------------------------------
@@ -211,6 +242,17 @@ Invoke-Tool "cl.exe" @(
 # ---- 7. Run generator -> Hexagon .o + .h --------------------------------------
 
 Step "3/8" "Run generator: emit Hexagon .o, .h, .s, bitcode"
+# Generator was just linked against Halide.lib (MSVC import lib); to RUN
+# it we need Halide.dll on PATH. The DLL ships at $HALIDE_ROOT\bin.
+$env:PATH = "$env:HALIDE_ROOT\bin;$env:PATH"
+# Also prepend the Hexagon toolchain bin so hexagon-clang(++).exe resolves
+# in steps 4-6. setup_sdk_env.cmd doesn't put these on PATH by default.
+$HexToolsVer = if ($env:HEXAGON_TOOLS_VER) { $env:HEXAGON_TOOLS_VER } else { "8.7.06" }
+$HexBin = "$env:HEXAGON_SDK_ROOT\tools\HEXAGON_Tools\$HexToolsVer\Tools\bin"
+if (-not (Test-Path "$HexBin\hexagon-clang.exe")) {
+    Fail "hexagon-clang.exe not found under $HexBin (set HEXAGON_TOOLS_VER if your install differs)"
+}
+$env:PATH = "$HexBin;$env:PATH"
 $genTarget = if ($NeedsDma) {
     "hexagon-32-qurt-hexagon_dma-hvx_128"
 } else {
