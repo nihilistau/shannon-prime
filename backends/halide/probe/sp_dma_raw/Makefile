@@ -11,7 +11,25 @@
 # this Makefile invoked via mingw32-make from C:\Qualcomm\Hexagon_SDK\...
 # environment).
 
-CURR_DIR = $(shell pwd)
+# Path canonicalization. On Windows, mingw32-make's `$(shell pwd)` returns
+# `C:\...` (backslashes via gow's pwd.EXE) which then mixes with the literal
+# forward-slash path components in Makefile.common's expansions. GNU Make
+# pattern-rule matching is string-based — mixed slashes break it (the
+# symptom is "No rule to make target ...lib<TEST>_skel.so" even though the
+# rule exists in Makefile.rules). Force forward slashes everywhere.
+#
+# NOTE: even with this fix, Make-driven builds on Windows still hit two
+# more blockers: (1) Makefile.common's `GENERATOR_DEPS` references
+# `libHalide.a` which doesn't exist on the Windows Halide install (it's
+# `Halide.lib`); (2) the Compute add-on (`addons/compute/libs/ubwcdma`)
+# is required for both compile (`#include "dmaWrapper.h"`) and link
+# (`ubwcdma_dynlib.so`). The Windows-native build path that works is
+# `test-sp_dma_raw.cmd` in this directory.
+ifeq ($(OS),Windows_NT)
+  CURR_DIR := $(subst \,/,$(shell cmd /c cd))
+else
+  CURR_DIR := $(shell pwd)
+endif
 DEVICE_STANDALONE_TEST_TOP_DIR = ${CURR_DIR}/../..
 TESTNAME = $(shell basename ${CURR_DIR})
 

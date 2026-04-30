@@ -769,4 +769,3 @@ int sp_hex_kq_matmul_fused(remote_handle64 h,
 #endif
     return 0;
 }
-}
