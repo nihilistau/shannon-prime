@@ -108,6 +108,37 @@ int main(int argc, char *argv[]) {
         // non-fatal — print and continue
     }
 
+    // Phase 2.0 weight-streaming probe. Opt-in via env var because it
+    // creates a multi-MB backing file. Set SP_HEX_WSTREAM=1 to run.
+    const char *wstream_enable = getenv("SP_HEX_WSTREAM");
+    if (wstream_enable && wstream_enable[0] == '1') {
+        const char *wstream_path = getenv("SP_HEX_WSTREAM_FILE");
+        if (!wstream_path || !*wstream_path) {
+            wstream_path = "/data/local/tmp/sp/wstream_dummy.bin";
+        }
+        long long wstream_bytes = 256LL * 1024LL * 1024LL;  // 256 MB default
+        const char *wstream_bytes_s = getenv("SP_HEX_WSTREAM_BYTES");
+        if (wstream_bytes_s && *wstream_bytes_s) {
+            wstream_bytes = atoll(wstream_bytes_s);
+        }
+        int wstream_tile = 16 * 1024;
+        const char *wstream_tile_s = getenv("SP_HEX_WSTREAM_TILE");
+        if (wstream_tile_s && *wstream_tile_s) wstream_tile = atoi(wstream_tile_s);
+        int wstream_slots = 4;
+        const char *wstream_slots_s = getenv("SP_HEX_WSTREAM_SLOTS");
+        if (wstream_slots_s && *wstream_slots_s) wstream_slots = atoi(wstream_slots_s);
+
+        int wErr = sp_hex_weight_stream_bench(wstream_path, wstream_bytes,
+                                               wstream_tile, wstream_slots,
+                                               head_dim);
+        if (wErr) {
+            printf("ERROR: weight_stream_bench failed (err=%d)\n", wErr);
+            // non-fatal
+        }
+    } else {
+        printf("\n[sp_hex] (Phase 2.0 weight-stream bench skipped — set SP_HEX_WSTREAM=1)\n");
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

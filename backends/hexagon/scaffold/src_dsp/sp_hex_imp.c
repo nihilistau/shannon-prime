@@ -506,6 +506,174 @@ int sp_hex_decompress_f32_batch(remote_handle64 h,
     return 0;
 }
 
+// ============================================================================
+// Phase 2.0 weight streaming probe — see IDL contract in inc/sp_hex.idl.
+// ============================================================================
+//
+// Single FastRPC call that runs the consumer side of the producer/consumer
+// ring buffer. The ARM thread feeds tiles in via pread() and signals via
+// flags[]; this loop polls flags[] for READY, decompresses a tile, dot-
+// products against the resident activation, and marks the slot CONSUMED.
+//
+// Memory ordering: rpcmem is shared between ARM and DSP via SMMU. We rely
+// on the ARM side using release-store on flags[slot] = READY (after the
+// pread() data is fully written) and acquire-load on this side checking
+// flags[slot] == READY before reading tile data. On Hexagon V69 the
+// hardware enforces ordering through a memory barrier issued via
+// __asm__ __volatile__("barrier" ::: "memory"). We use the GCC builtin
+// __sync_synchronize() which lowers to that barrier on V69.
+//
+// Slot states (in flags[slot]):
+//   0 = SP_TILE_EMPTY    (initial, or just consumed by DSP)
+//   1 = SP_TILE_READY    (ARM has filled the tile, DSP may consume)
+//   2 = SP_TILE_CONSUMED (DSP has read the tile; ARM may refill)
+//
+// The DSP transitions READY -> CONSUMED. The ARM transitions
+// EMPTY/CONSUMED -> READY. This avoids any mutex; the slot ownership is
+// implied by the flag value.
+
+#define SP_TILE_EMPTY    0u
+#define SP_TILE_READY    1u
+#define SP_TILE_CONSUMED 2u
+
+int sp_hex_weight_stream_session(remote_handle64 h,
+                                  int n_tiles, int tile_bytes, int n_slots,
+                                  int head_dim,
+                                  const float *activation, int activation_len,
+                                  const unsigned char *tile_pool, int pool_len,
+                                  unsigned long *flags, int flags_len,
+                                  long long *stats, int stats_len) {
+    (void)h;
+
+    // ── Validate contract ────────────────────────────────────────────
+    if (n_tiles <= 0 || tile_bytes <= 0 || n_slots <= 0) {
+        FARF(ERROR, "[sp_hex] wsess: bad params n=%d tb=%d sl=%d",
+             n_tiles, tile_bytes, n_slots);
+        return -1;
+    }
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        FARF(ERROR, "[sp_hex] wsess: head_dim=%d must be pow2 in [8,1024]", head_dim);
+        return -1;
+    }
+    if (activation_len != head_dim) {
+        FARF(ERROR, "[sp_hex] wsess: activation_len=%d != head_dim=%d",
+             activation_len, head_dim);
+        return -1;
+    }
+    if (pool_len != n_slots * tile_bytes) {
+        FARF(ERROR, "[sp_hex] wsess: pool_len=%d != n_slots=%d * tile_bytes=%d",
+             pool_len, n_slots, tile_bytes);
+        return -1;
+    }
+    if (flags_len != n_slots) {
+        FARF(ERROR, "[sp_hex] wsess: flags_len=%d != n_slots=%d",
+             flags_len, n_slots);
+        return -1;
+    }
+    if (stats_len < 4) {
+        FARF(ERROR, "[sp_hex] wsess: stats_len=%d < 4", stats_len);
+        return -1;
+    }
+
+    // ── Decide how the tile is interpreted ──────────────────────────
+    // For this probe each tile is a contiguous run of SP-compressed K
+    // band records (4-band 5/5/4/3 config). Caller picks tile_bytes as
+    // a multiple of bc.total_bytes; we work out vectors-per-tile.
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    int per_vec_bytes = bc.total_bytes;
+    if (tile_bytes % per_vec_bytes != 0) {
+        FARF(ERROR, "[sp_hex] wsess: tile_bytes=%d not a multiple of per_vec_bytes=%d",
+             tile_bytes, per_vec_bytes);
+        return -1;
+    }
+    int vecs_per_tile = tile_bytes / per_vec_bytes;
+
+    // Activation stays resident — copy into stack scratch (small,
+    // ≤ 4 KB at head_dim=1024).
+    float activation_local[1024] __attribute__((aligned(128)));
+    memcpy(activation_local, activation, sizeof(float) * head_dim);
+
+    // ── Main consumer loop ───────────────────────────────────────────
+    long long total_pcycles    = 0;
+    long long wait_pcycles     = 0;
+    long long compute_pcycles  = 0;
+    long long bytes_consumed   = 0;
+    double    accumulator      = 0.0;  // sink for dot products so the
+                                       // compiler can't optimise them away
+
+    float coeffs[1024] __attribute__((aligned(128)));
+
+    uint64_t loop_start = HAP_perf_get_pcycles();
+
+    for (int t = 0; t < n_tiles; ++t) {
+        const int slot = t % n_slots;
+        volatile unsigned long *slot_flag = (volatile unsigned long *)&flags[slot];
+
+        // 1) Wait for the producer to mark this slot READY.
+        uint64_t wait_t0 = HAP_perf_get_pcycles();
+        while (*slot_flag != SP_TILE_READY) {
+            // Tight spin. Yielding via qurt_thread_yield would cost more
+            // pcycles than the typical wait window (we expect <50 µs at
+            // 1.5 GB/s for 16 KB tiles). Producer transition is a single
+            // atomic store on the ARM side.
+        }
+        __sync_synchronize();  // acquire fence — make tile data visible
+        wait_pcycles += (long long)(HAP_perf_get_pcycles() - wait_t0);
+
+        // 2) Compute on this tile.
+        const unsigned char *tile = tile_pool + (size_t)slot * (size_t)tile_bytes;
+
+        uint64_t comp_t0 = HAP_perf_get_pcycles();
+        for (int v = 0; v < vecs_per_tile; ++v) {
+            const unsigned char *vp = tile + (size_t)v * (size_t)per_vec_bytes;
+            int rc = sp_hex_band_dequantize_scalar(vp, per_vec_bytes, head_dim,
+                                                    /*max_bands=*/-1, coeffs);
+            if (rc != 0) {
+                FARF(ERROR, "[sp_hex] wsess: dequant rc=%d t=%d v=%d", rc, t, v);
+                return rc;
+            }
+            sp_hex_vht2_f32(coeffs, head_dim);
+
+            // Dot product against resident activation.
+            float dot = 0.0f;
+            for (int i = 0; i < head_dim; ++i) {
+                dot += activation_local[i] * coeffs[i];
+            }
+            accumulator += dot;
+        }
+        compute_pcycles += (long long)(HAP_perf_get_pcycles() - comp_t0);
+
+        // 3) Mark the slot CONSUMED so the producer can refill.
+        __sync_synchronize();  // release fence — make sure all reads done
+        *slot_flag = SP_TILE_CONSUMED;
+
+        bytes_consumed += tile_bytes;
+    }
+
+    total_pcycles = (long long)(HAP_perf_get_pcycles() - loop_start);
+
+    // Anti-DCE: stash a tiny reduction so the compiler can't optimise
+    // the matmul away. The ARM caller reads stats[3] back as a sanity.
+    long long acc_bits;
+    {
+        double ad = accumulator;
+        memcpy(&acc_bits, &ad, sizeof(acc_bits));
+    }
+
+    stats[0] = bytes_consumed;
+    stats[1] = total_pcycles;
+    stats[2] = wait_pcycles;
+    stats[3] = compute_pcycles;
+    if (stats_len >= 5) stats[4] = acc_bits;
+
+    FARF(HIGH, "[sp_hex] wsess: %d tiles, %lld bytes, total=%lld wait=%lld comp=%lld pcycles",
+         n_tiles, bytes_consumed, total_pcycles, wait_pcycles, compute_pcycles);
+    return 0;
+}
+
 
 // ============================================================================
 // V-specific compress/decompress (1 band, 3 bits — different from K's 4-band

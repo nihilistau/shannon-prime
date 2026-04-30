@@ -61,6 +61,33 @@ int sp_hex_compress_decompress_validate(int head_dim);
 //   n_q:  number of Q queries to dot against each K row
 int sp_hex_kq_matmul_bench(int n_kv, int hd, int n_q);
 
+// Phase 2.0 weight streaming probe — standalone validator for the
+// "Zero-RAM-Footprint" thesis. Spawns an ARM I/O thread that pread()s
+// from a backing weight file into a circular rpcmem ring buffer, calls
+// sp_hex_weight_stream_session on the cDSP which polls the ring, fused-
+// decompresses each tile and FMA's against a resident activation, and
+// reports throughput + wait/compute jitter via qtimer pcycles.
+//
+// Args:
+//   weight_file_path : path to a backing weight file (will be created
+//                      with random SP-compressed bytes if missing,
+//                      sized to file_bytes_target).
+//   file_bytes_target: total bytes to stream end-to-end (e.g., 1 GiB).
+//   tile_bytes       : per-tile bytes (default 16384 = 16 KB).
+//   n_slots          : ring depth (default 4 = triple-buffer + drain).
+//   head_dim         : VHT2 vector length (default 128).
+//
+// Success criterion: sustained throughput approaches UFS line speed
+// (~1.2 GB/s on UFS 3.1) AND wait_pcycles > 0 consistently — that
+// confirms compute is free and UFS is the bottleneck (the Phase 2.0
+// thesis). If wait_pcycles == 0 (DSP never idle), compute is the
+// bottleneck and we need a faster kernel before streaming makes sense.
+int sp_hex_weight_stream_bench(const char *weight_file_path,
+                                long long file_bytes_target,
+                                int tile_bytes,
+                                int n_slots,
+                                int head_dim);
+
 #ifdef __cplusplus
 }
 #endif
