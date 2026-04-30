@@ -140,16 +140,46 @@ KV reads. Spec-decode in this regime isn't just compute reuse; it's
 the **demand oracle for the streaming pipeline.** Track in
 project_specdecode_session.md memory.
 
+## Phase 2.4 architecture is forced by data (commit 2a759a1)
+
+Sustained-call-rate measurement on the existing 1-attn-block .bin via
+test_sp_qnn (200 iters, fp32, Qwen3-4B-shape):
+
+```
+sustained calls/sec:       577
+tok/sec @ 28 layers/call:  20.6    (per-layer dispatch, fp32)
+tok/sec @ 1 layer/call:    577     (theoretical, full-graph compile)
+fp32 -> w4a16:             20.6 -> 38.7 tok/sec  (28-layer dispatch)
+```
+
+**Per-layer dispatch is dead-on-arrival.** At ~1.7 ms per FastRPC call
+times 28 layers per token = 50 ms/token = 20 tok/sec — which is below
+the existing CPU-only 43.72 t/s baseline (commit 05c405d, Qwen2.5-Coder-3B
++ spec-decode). Even with w4a16 amplification we only reach ~38 tok/sec.
+
+**Full-graph compile is mechanically required.** One FastRPC call per
+token, ~1.5 ms QNN exec dominates, jitter (30% of avg) gets amortized
+across the full token's compute instead of compounding across 28 calls.
+
+This **forces** Phase 2.4a to compile the full transformer (28 layers +
+MLPs + embeddings + LM head) as a single QNN context binary — not
+per-layer .bins driven by shannon-prime-llama dispatch.
+
 ## Next concrete steps
 
-1. **Submit Qwen3-4B-shape w4a16** — re-run when network is faster
-   (current upload stalls at ~51%); the small-shape pipeline is
-   validated end-to-end so the qwen-shape is just a longer upload.
-   Task #43.
-2. **Phase 2.3 stage 2** — fill in sp_qnn.c TODOs so we can call the
-   w4a16 binary via our own runner.
-3. **Phase 2.3.2** — map SP-bands to HTP int4 tensor format. The
-   op-breakdown methodology above is the validation harness. Task #44.
-4. **Phase 2.4** — full Qwen3-4B graph (28 layers + MLP + embeddings
-   + LM head) compiled as a single QNN context, SP-compressed KV
-   reads, speculative-decode-driven prefetch. The deployment target.
+1. **Phase 2.4a** — get a Qwen3-4B-Coder ONNX (full transformer, not
+   single block). Either via HuggingFace `optimum-cli export onnx` or
+   via Qualcomm's qai-hub-models (we found earlier that qai-hub-models
+   ships pre-exported Qwen at the right shape). Submit to AI Hub
+   compile; expect a much larger .bin (~2-4 GB w4a16). Run via our
+   own sp_qnn shim.
+2. **Phase 2.3 stage 3** — wire libsp_qnn.so as the matmul executor in
+   shannon-prime-llama IF we're keeping the per-layer dispatch path
+   for development (it's slower but easier to debug). Lower priority
+   given the rate finding.
+3. **Phase 2.3.2** — map SP-bands to HTP int4 tensor format. Task #44.
+   Becomes especially relevant if we control the quantization (vs
+   AIMET's choices) once full-graph compile lands.
+4. **Phase 2.3.1b** — Qwen w4a16 retry on faster network. Task #43.
+   Still useful as a per-block calibration data point for the prediction
+   framework above.
