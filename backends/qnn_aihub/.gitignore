@@ -1,0 +1,3 @@
+# Re-downloadable from AI Hub via v69_workflow.py --check
+artifacts/*.bin
+artifacts/*.so
