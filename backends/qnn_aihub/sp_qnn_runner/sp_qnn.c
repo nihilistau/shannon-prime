@@ -58,7 +58,11 @@ struct sp_qnn_handle {
     void  *bin_data;
     size_t bin_size;
 
-    /* Binary-info-derived metadata (lifetime-tied to bin_data). */
+    /* QnnSystemContext handle — must live for the lifetime of any
+     * binary_info pointers we cached. Freed at destroy(). */
+    QnnSystemContext_Handle_t sysCtx;
+
+    /* Binary-info-derived metadata (lifetime-tied to sysCtx). */
     const QnnSystemContext_BinaryInfo_t *binary_info;
 
     /* Cached I/O tensor info for sp_qnn_get_io_info(). Allocated. */
@@ -66,6 +70,11 @@ struct sp_qnn_handle {
     size_t              n_inputs;
     sp_qnn_tensor_info *outputs;
     size_t              n_outputs;
+
+    /* Tensor templates copied from binary_info at load — used at every
+     * execute() call. We mutate clientBuf.{data,dataSize} per call. */
+    Qnn_Tensor_t *in_tensors;    /* n_inputs entries */
+    Qnn_Tensor_t *out_tensors;   /* n_outputs entries */
 };
 
 /* ------------------------------------------------------------------ */
@@ -207,6 +216,91 @@ static int read_file(const char *path, void **out_data, size_t *out_size) {
 /* Load + execute — TODO sections marked, see PHASE_2_3_DESIGN.md     */
 /* ------------------------------------------------------------------ */
 
+/* Resolve the per-graph Qnn_Tensor_t arrays from the versioned
+ * binary_info struct. Returns 0 on success, -1 on unsupported version. */
+static int resolve_graph_info(const QnnSystemContext_BinaryInfo_t *bi,
+                              const char **out_graph_name,
+                              const Qnn_Tensor_t **out_inputs,
+                              uint32_t *out_n_in,
+                              const Qnn_Tensor_t **out_outputs,
+                              uint32_t *out_n_out) {
+    /* binary_info is versioned. We pick graph 0 in either layout. */
+    const QnnSystemContext_GraphInfo_t *graph0 = NULL;
+    if (bi->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_1) {
+        if (bi->contextBinaryInfoV1.numGraphs == 0) return -1;
+        graph0 = &bi->contextBinaryInfoV1.graphs[0];
+    } else if (bi->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_2) {
+        if (bi->contextBinaryInfoV2.numGraphs == 0) return -1;
+        graph0 = &bi->contextBinaryInfoV2.graphs[0];
+    } else if (bi->version == QNN_SYSTEM_CONTEXT_BINARY_INFO_VERSION_3) {
+        if (bi->contextBinaryInfoV3.numGraphs == 0) return -1;
+        graph0 = &bi->contextBinaryInfoV3.graphs[0];
+    } else {
+        fprintf(stderr, "[sp_qnn] unknown binary_info version: %d\n", (int)bi->version);
+        return -1;
+    }
+    /* Per-graph info also versioned. */
+    if (graph0->version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_1) {
+        *out_graph_name = graph0->graphInfoV1.graphName;
+        *out_inputs     = graph0->graphInfoV1.graphInputs;
+        *out_n_in       = graph0->graphInfoV1.numGraphInputs;
+        *out_outputs    = graph0->graphInfoV1.graphOutputs;
+        *out_n_out      = graph0->graphInfoV1.numGraphOutputs;
+    } else if (graph0->version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_2) {
+        *out_graph_name = graph0->graphInfoV2.graphName;
+        *out_inputs     = graph0->graphInfoV2.graphInputs;
+        *out_n_in       = graph0->graphInfoV2.numGraphInputs;
+        *out_outputs    = graph0->graphInfoV2.graphOutputs;
+        *out_n_out      = graph0->graphInfoV2.numGraphOutputs;
+    } else if (graph0->version == QNN_SYSTEM_CONTEXT_GRAPH_INFO_VERSION_3) {
+        *out_graph_name = graph0->graphInfoV3.graphName;
+        *out_inputs     = graph0->graphInfoV3.graphInputs;
+        *out_n_in       = graph0->graphInfoV3.numGraphInputs;
+        *out_outputs    = graph0->graphInfoV3.graphOutputs;
+        *out_n_out      = graph0->graphInfoV3.numGraphOutputs;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+/* Convert a Qnn_DataType_t to bytes per element (rough; QNN has more types). */
+static uint32_t dtype_bytes(Qnn_DataType_t dt) {
+    switch (dt) {
+    case QNN_DATATYPE_FLOAT_32: case QNN_DATATYPE_INT_32: case QNN_DATATYPE_UINT_32:
+    case QNN_DATATYPE_SFIXED_POINT_32: case QNN_DATATYPE_UFIXED_POINT_32:
+        return 4;
+    case QNN_DATATYPE_FLOAT_16: case QNN_DATATYPE_INT_16: case QNN_DATATYPE_UINT_16:
+    case QNN_DATATYPE_SFIXED_POINT_16: case QNN_DATATYPE_UFIXED_POINT_16:
+        return 2;
+    case QNN_DATATYPE_INT_8: case QNN_DATATYPE_UINT_8:
+    case QNN_DATATYPE_SFIXED_POINT_8: case QNN_DATATYPE_UFIXED_POINT_8:
+    case QNN_DATATYPE_BOOL_8:
+        return 1;
+    case QNN_DATATYPE_FLOAT_64: case QNN_DATATYPE_INT_64: case QNN_DATATYPE_UINT_64:
+        return 8;
+    default:
+        return 0;
+    }
+}
+
+/* Cache one tensor template into our flat sp_qnn_tensor_info struct. */
+static void cache_tensor_info(const Qnn_Tensor_t *t, sp_qnn_tensor_info *out) {
+    if (t->version == QNN_TENSOR_VERSION_1) {
+        out->name              = t->v1.name;
+        out->rank              = t->v1.rank;
+        out->dims              = t->v1.dimensions;
+        out->dtype             = (uint32_t)t->v1.dataType;
+        out->bytes_per_element = dtype_bytes(t->v1.dataType);
+    } else {
+        out->name              = t->v2.name;
+        out->rank              = t->v2.rank;
+        out->dims              = t->v2.dimensions;
+        out->dtype             = (uint32_t)t->v2.dataType;
+        out->bytes_per_element = dtype_bytes(t->v2.dataType);
+    }
+}
+
 sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
                                  const char *graph_name,
                                  sp_qnn_handle **out_h) {
@@ -225,46 +319,114 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
     fprintf(stderr, "[sp_qnn] loaded %zu bytes from %s\n",
             h->bin_size, context_bin_path);
 
-    /* (2) Use QnnSystemContext to extract binary info (graphs, tensors). */
-    QnnSystemContext_Handle_t sysCtx = NULL;
-    if (g_lib.qsys.systemContextCreate(&sysCtx) != QNN_SUCCESS) {
+    /* (2) QnnSystemContext to extract binary info (graphs, tensors). */
+    if (g_lib.qsys.systemContextCreate(&h->sysCtx) != QNN_SUCCESS) {
         free(h->bin_data); free(h);
         return SP_QNN_ERR_BINARY_INFO;
     }
     Qnn_ContextBinarySize_t info_size = 0;
     if (g_lib.qsys.systemContextGetBinaryInfo(
-            sysCtx, h->bin_data, h->bin_size,
+            h->sysCtx, h->bin_data, h->bin_size,
             &h->binary_info, &info_size) != QNN_SUCCESS) {
-        g_lib.qsys.systemContextFree(sysCtx);
+        g_lib.qsys.systemContextFree(h->sysCtx);
         free(h->bin_data); free(h);
         return SP_QNN_ERR_BINARY_INFO;
     }
-    /* sysCtx leak is intentional — binary_info pointers reference it.
-     * QnnSystemContext_free invalidates them. We free both at destroy. */
-    /* TODO: store sysCtx in handle for later free. */
 
-    /* TODO (Phase 2.3 fill-in):
-     * (3) Create log handle  : g_lib.qnn.logCreate(...)
-     * (4) Create backend     : g_lib.qnn.backendCreate(log, NULL, &h->backend)
-     * (5) Create device      : g_lib.qnn.deviceCreate(log, NULL, &h->device)
-     *      (HTP-specific QnnDevice_Config can be added for perf-mode tuning)
-     * (6) Create context     : g_lib.qnn.contextCreateFromBinary(
-     *                              h->backend, h->device, NULL,
-     *                              h->bin_data, h->bin_size,
-     *                              &h->context, NULL)
-     * (7) Retrieve graph     : g_lib.qnn.graphRetrieve(
-     *                              h->context, graph_name_to_use,
-     *                              &h->graph)
-     *      (graph_name_to_use comes from binary_info if NULL)
-     * (8) Cache IO tensor info:
-     *      iterate binary_info->contextBinaryInfoV2->graphs[*]->graph
-     *          .graphTensorInfo[*] etc, populate h->inputs/h->outputs.
-     */
-    (void)graph_name;  /* TODO use */
-    fprintf(stderr, "[sp_qnn] WARNING: load_binary scaffold complete, "
-                    "context-create + graph-retrieve TODO. See "
-                    "PHASE_2_3_DESIGN.md for the API call sequence.\n");
+    /* (3) Resolve the graph + tensor templates from binary_info. */
+    const char *bin_graph_name = NULL;
+    const Qnn_Tensor_t *bin_inputs = NULL, *bin_outputs = NULL;
+    uint32_t n_in = 0, n_out = 0;
+    if (resolve_graph_info(h->binary_info, &bin_graph_name,
+                           &bin_inputs, &n_in,
+                           &bin_outputs, &n_out) != 0) {
+        fprintf(stderr, "[sp_qnn] unsupported binary_info version\n");
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        free(h->bin_data); free(h);
+        return SP_QNN_ERR_BINARY_INFO;
+    }
+    fprintf(stderr, "[sp_qnn] graph '%s': %u inputs / %u outputs\n",
+            bin_graph_name ? bin_graph_name : "(unnamed)", n_in, n_out);
 
+    /* (4) Create log handle (NULL callback = stderr-default). */
+    if (g_lib.qnn.logCreate(NULL, QNN_LOG_LEVEL_WARN, &h->log) != QNN_SUCCESS) {
+        h->log = NULL;  /* non-fatal — some backends accept NULL log */
+    }
+
+    /* (5) Create backend. */
+    if (g_lib.qnn.backendCreate(h->log, NULL, &h->backend) != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] backendCreate failed\n");
+        if (h->log) g_lib.qnn.logFree(h->log);
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        free(h->bin_data); free(h);
+        return SP_QNN_ERR_BACKEND_CREATE;
+    }
+
+    /* (6) Create device. NULL config -> default HTP V69 picks itself up
+     *     from the loaded libQnnHtp.so. Perf-mode tuning is a follow-up. */
+    if (g_lib.qnn.deviceCreate(h->log, NULL, &h->device) != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] deviceCreate failed\n");
+        g_lib.qnn.backendFree(h->backend);
+        if (h->log) g_lib.qnn.logFree(h->log);
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        free(h->bin_data); free(h);
+        return SP_QNN_ERR_DEVICE_CREATE;
+    }
+
+    /* (7) Create context FROM the binary. QNN copies what it needs
+     *     internally; we keep bin_data alive anyway for safety. */
+    if (g_lib.qnn.contextCreateFromBinary(h->backend, h->device,
+                                          NULL /*config*/,
+                                          h->bin_data, h->bin_size,
+                                          &h->context,
+                                          NULL /*profile*/) != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] contextCreateFromBinary failed\n");
+        g_lib.qnn.deviceFree(h->device);
+        g_lib.qnn.backendFree(h->backend);
+        if (h->log) g_lib.qnn.logFree(h->log);
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        free(h->bin_data); free(h);
+        return SP_QNN_ERR_CONTEXT_CREATE;
+    }
+
+    /* (8) Retrieve the named graph (or first). */
+    const char *gname_use = graph_name ? graph_name : bin_graph_name;
+    if (g_lib.qnn.graphRetrieve(h->context, gname_use, &h->graph) != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] graphRetrieve('%s') failed\n", gname_use);
+        g_lib.qnn.contextFree(h->context, NULL);
+        g_lib.qnn.deviceFree(h->device);
+        g_lib.qnn.backendFree(h->backend);
+        if (h->log) g_lib.qnn.logFree(h->log);
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        free(h->bin_data); free(h);
+        return SP_QNN_ERR_GRAPH_RETRIEVE;
+    }
+
+    /* (9) Cache I/O tensor templates and metadata. We allocate three
+     *     parallel arrays per side: the public sp_qnn_tensor_info, and
+     *     the internal Qnn_Tensor_t templates (copied from binary_info
+     *     so the originals can be freed when sysCtx is freed). */
+    h->n_inputs   = n_in;
+    h->n_outputs  = n_out;
+    h->inputs     = (sp_qnn_tensor_info *)calloc(n_in,  sizeof(*h->inputs));
+    h->outputs    = (sp_qnn_tensor_info *)calloc(n_out, sizeof(*h->outputs));
+    h->in_tensors = (Qnn_Tensor_t *)calloc(n_in,  sizeof(*h->in_tensors));
+    h->out_tensors= (Qnn_Tensor_t *)calloc(n_out, sizeof(*h->out_tensors));
+    if ((n_in > 0 && (!h->inputs || !h->in_tensors)) ||
+        (n_out > 0 && (!h->outputs || !h->out_tensors))) {
+        sp_qnn_destroy(&h);
+        return SP_QNN_ERR_INVALID;
+    }
+    for (uint32_t i = 0; i < n_in;  ++i) {
+        h->in_tensors[i]  = bin_inputs[i];   /* shallow copy template */
+        cache_tensor_info(&bin_inputs[i],  &h->inputs[i]);
+    }
+    for (uint32_t i = 0; i < n_out; ++i) {
+        h->out_tensors[i] = bin_outputs[i];
+        cache_tensor_info(&bin_outputs[i], &h->outputs[i]);
+    }
+
+    fprintf(stderr, "[sp_qnn] context + graph ready\n");
     *out_h = h;
     return SP_QNN_OK;
 }
@@ -272,13 +434,16 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
 void sp_qnn_destroy(sp_qnn_handle **h_io) {
     if (!h_io || !*h_io) return;
     sp_qnn_handle *h = *h_io;
-    /* TODO: release in reverse order:
-     *   graphFree (if QNN provides one — usually no)
-     *   contextFree(h->context)
-     *   deviceFree(h->device)
-     *   backendFree(h->backend)
-     *   logFree(h->log)
-     */
+    /* Release in reverse-creation order. Each call is no-op-safe on
+     * NULL/zero handles since we calloc'd the struct. */
+    if (h->context) g_lib.qnn.contextFree(h->context, NULL);
+    if (h->device)  g_lib.qnn.deviceFree(h->device);
+    if (h->backend) g_lib.qnn.backendFree(h->backend);
+    if (h->log)     g_lib.qnn.logFree(h->log);
+    if (h->sysCtx)  g_lib.qsys.systemContextFree(h->sysCtx);
+
+    free(h->in_tensors);
+    free(h->out_tensors);
     free(h->inputs);
     free(h->outputs);
     free(h->bin_data);
@@ -300,6 +465,20 @@ sp_qnn_status sp_qnn_get_io_info(sp_qnn_handle *h,
     return SP_QNN_OK;
 }
 
+/* Set the (data, dataSize) on a tensor that's a copy of a binary_info
+ * template. Handles version 1 vs 2 layouts. */
+static void tensor_set_buf(Qnn_Tensor_t *t, void *data, size_t bytes) {
+    if (t->version == QNN_TENSOR_VERSION_1) {
+        t->v1.memType            = QNN_TENSORMEMTYPE_RAW;
+        t->v1.clientBuf.data     = data;
+        t->v1.clientBuf.dataSize = (uint32_t)bytes;
+    } else {
+        t->v2.memType            = QNN_TENSORMEMTYPE_RAW;
+        t->v2.clientBuf.data     = data;
+        t->v2.clientBuf.dataSize = (uint32_t)bytes;
+    }
+}
+
 sp_qnn_status sp_qnn_execute(sp_qnn_handle *h,
                              const void *const *inputs,
                              const size_t *input_sizes,
@@ -307,22 +486,40 @@ sp_qnn_status sp_qnn_execute(sp_qnn_handle *h,
                              const size_t *output_sizes,
                              uint64_t *out_exec_us) {
     if (!h) return SP_QNN_ERR_INVALID;
-    (void)inputs; (void)input_sizes; (void)outputs; (void)output_sizes;
+    if (!inputs && h->n_inputs)  return SP_QNN_ERR_INVALID;
+    if (!outputs && h->n_outputs) return SP_QNN_ERR_INVALID;
 
-    /* TODO (Phase 2.3 fill-in):
-     * (1) Build Qnn_Tensor_t structs for each input/output:
-     *      .v1.dataType   from cached io info
-     *      .v1.dimensions from cached io info
-     *      .v1.memType    = QNN_TENSORMEMTYPE_RAW
-     *      .v1.clientBuf  = { .data = inputs[i], .dataSize = input_sizes[i] }
-     * (2) Time the call: gettimeofday before, gettimeofday after.
-     * (3) g_lib.qnn.graphExecute(h->graph, in_tensors, n_in,
-     *                             out_tensors, n_out, NULL, NULL)
-     * (4) Output buffers are filled by QNN; nothing else to do.
-     */
-    if (out_exec_us) *out_exec_us = 0;
-    fprintf(stderr, "[sp_qnn] execute() TODO (Phase 2.3 fill-in).\n");
-    return SP_QNN_ERR_EXECUTE;
+    /* Bind the supplied buffers into our cached templates. The rest of
+     * the tensor metadata (name, id, dataType, dims, type APP_WRITE/READ)
+     * came from binary_info via the shallow copy at load time, so we
+     * only need to update the data pointer + size per call. */
+    for (size_t i = 0; i < h->n_inputs; ++i) {
+        tensor_set_buf(&h->in_tensors[i],  (void *)inputs[i],  input_sizes[i]);
+    }
+    for (size_t i = 0; i < h->n_outputs; ++i) {
+        tensor_set_buf(&h->out_tensors[i], outputs[i],         output_sizes[i]);
+    }
+
+    /* Wall-clock the QNN call. */
+    struct timeval t0, t1;
+    gettimeofday(&t0, NULL);
+    Qnn_ErrorHandle_t rc = g_lib.qnn.graphExecute(
+        h->graph,
+        h->in_tensors,  (uint32_t)h->n_inputs,
+        h->out_tensors, (uint32_t)h->n_outputs,
+        NULL /*profile*/, NULL /*signal*/);
+    gettimeofday(&t1, NULL);
+
+    if (out_exec_us) {
+        *out_exec_us = (uint64_t)((t1.tv_sec  - t0.tv_sec)  * 1000000) +
+                       (uint64_t)((t1.tv_usec - t0.tv_usec));
+    }
+
+    if (rc != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] graphExecute failed: 0x%lx\n", (unsigned long)rc);
+        return SP_QNN_ERR_EXECUTE;
+    }
+    return SP_QNN_OK;
 }
 
 sp_qnn_status sp_qnn_bench(sp_qnn_handle *h,
