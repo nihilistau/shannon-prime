@@ -111,10 +111,27 @@ typedef struct {
     int                n_slots;
     sp_band_config_t   k_bands;
     sp_band_config_t   v_bands;
+    // Cache slots are now plain malloc'd memory — DSP never touches them
+    // directly, so they don't need to be rpcmem-registered. This sidesteps
+    // FastRPC's registration-length contract (a 172 KB-registered slot
+    // called with len=42 is rejected as AEE_EUNSUPPORTED) AND avoids
+    // FD/handle exhaustion on large-layer-count models (Llama-70B would
+    // otherwise need 1280 separate rpcmem allocs for K+V slots, blowing
+    // through the typical 1024 FD limit).
     uint8_t          **k_cache;
     uint8_t          **v_cache;
+    // FastRPC IN/OUT scratch — sized at EXACTLY the call length so the
+    // registration-length contract is satisfied. vec_in_f32 / vec_out_f32
+    // hold one head_dim-float vector for compress_f32 input / decompress_f32
+    // output. k_packed_rpc / v_packed_rpc hold one packed-byte vector
+    // (sized at k_bands.total_bytes / v_bands.total_bytes) for compress_f32
+    // output / decompress_f32 input. After each FastRPC call, the bridge
+    // memcpys between these scratches and the per-position offset of the
+    // host-only cache slot.
     float             *vec_in_f32;
     float             *vec_out_f32;
+    uint8_t           *k_packed_rpc;
+    uint8_t           *v_packed_rpc;
 } sp_hexagon_cache_t;
 
 int  sp_hexagon_cache_init(sp_hexagon_cache_t *cache,
