@@ -78,6 +78,33 @@ Expected outcome: ~81 µs/inference matching the AI Hub lab number,
 confirming the V69 HTP execution path works on *our* device with *our*
 toolchain — no AI Hub round-trip required.
 
+## Parallel track: freethedsp shim baked in
+
+Concurrently with Phase 2, `backends/freethedsp/` adapts geohot's
+`freethedsp` (https://github.com/geohot/freethedsp) for our S22U so
+that ANY signed-PD-gated cDSP API "just works" without per-call-site
+plumbing. Phasing:
+
+  - **D.1** discover.so dumps `fastrpc_shell_3` from `init->mem` during
+    a real FastRPC session. Lets us derive the device-specific
+    PATCH_ADDR offline.
+  - **D.2** `tools/find_is_test_enabled.py` runs hexagon-llvm-objdump
+    on the dump, locates `is_test_enabled`, emits the constants to
+    bake into `freethedsp_s22u.c`.
+  - **D.3** Build libfreethedsp.so, smoke-test against the existing
+    Mode D Stage 1 probe (commit 9e6ce90). Expected outcome:
+    `halide_hexagon_dma_allocate_engine` returns success instead of
+    qurt_exit.
+  - **D.4** Wire LD_PRELOAD into `build-example.ps1 -Run` and
+    `backends/hexagon/scaffold/build.cmd`. Default-loaded, opt-in-active
+    via `SP_FREETHEDSP=1` env var.
+
+This Phase-2-and-D-in-parallel posture means: even if we discover that
+QNN-on-device hits an unexpected permission wall, freethedsp is already
+in place to bypass it. Conversely, if QNN runs cleanly without the
+shim (the most likely outcome), we still have freethedsp ready for
+Mode D Stage 1+ rerun and any future signed-PD experiment.
+
 ## What this unblocks
 
 1. **Phase 2.1**: pin the V69 HTP latency baseline locally so subsequent

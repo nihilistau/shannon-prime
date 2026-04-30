@@ -397,7 +397,25 @@ if ($Run) {
     & adb push "bin\main-$TestName.out"        $devicePath
     & adb push "bin\host\lib$($TestName)_stub.so"   $devicePath
     & adb push "bin\remote\lib$($TestName)_skel.so" $devicePath
-    & adb shell "cd $devicePath; chmod 755 main-$TestName.out; LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. ./main-$TestName.out"
+
+    # freethedsp shim — bake into every device run. The shim itself is
+    # a no-op pass-through unless SP_FREETHEDSP=1 is set in the caller's
+    # env (which propagates through adb shell). Pushing libfreethedsp.so
+    # always means we never have to remember to add it for backends that
+    # need test-mode permissions (Halide DMA, CV-ISP MFNR, future
+    # signed-PD-gated APIs). See backends/freethedsp/INTEGRATION.md.
+    $FreeTheDspLib = "$PSScriptRoot\..\freethedsp\libfreethedsp.so"
+    $LdPreload = ""
+    if (Test-Path $FreeTheDspLib) {
+        & adb push $FreeTheDspLib $devicePath | Out-Null
+        $LdPreload = "LD_PRELOAD=./libfreethedsp.so "
+        Write-Host "[info] freethedsp shim pushed (active when SP_FREETHEDSP=1)" -ForegroundColor Yellow
+    } else {
+        Write-Host "[info] freethedsp not built yet — skipping. Build with backends/freethedsp/build.cmd if any signed-PD-gated API is needed." -ForegroundColor DarkGray
+    }
+    $SpFlag = if ($env:SP_FREETHEDSP) { "SP_FREETHEDSP=$env:SP_FREETHEDSP " } else { "" }
+
+    & adb shell "cd $devicePath; chmod 755 main-$TestName.out; LD_LIBRARY_PATH=. ADSP_LIBRARY_PATH=. $LdPreload$SpFlag./main-$TestName.out"
 }
 
 }
