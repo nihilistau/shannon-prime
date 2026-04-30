@@ -373,3 +373,273 @@ int sp_hex_decompress_f32(remote_handle64 h,
     return 0;
 }
 
+// compress_f32_batch ? loop the compress_f32 kernel internally over
+// n_vectors so the host pays one FastRPC dispatch per chunk instead
+// of one per position. Used by the post-decode hook on prefill, where
+// the bridge sees a contiguous run of K/V positions in a single batch.
+//
+// Layout matches the IDL contract:
+//   in_vecs    = n_vectors * head_dim contiguous fp32
+//   out_packed = n_vectors * bc.total_bytes contiguous octets
+//   packed_used = n_vectors * bc.total_bytes on success
+//
+// Validation rules: in_len == n_vectors * head_dim, out_capacity >=
+// n_vectors * bc.total_bytes. n_vectors must be > 0; an empty batch is
+// rejected so the host's chunking logic can't silently drop work.
+int sp_hex_compress_f32_batch(remote_handle64 h,
+                               const float *in_vecs, int in_len,
+                               int head_dim, int n_vectors,
+                               unsigned char *out_packed, int out_capacity,
+                               int *packed_used) {
+    (void)h;
+    if (!packed_used) return -1;
+    *packed_used = 0;
+    if (n_vectors <= 0) {
+        FARF(ERROR, "[sp_hex] compress_batch: n_vectors=%d <= 0", n_vectors);
+        return -1;
+    }
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        FARF(ERROR, "[sp_hex] compress_batch: head_dim=%d must be pow2 in [8,1024]",
+             head_dim);
+        return -1;
+    }
+    if (in_len != n_vectors * head_dim) {
+        FARF(ERROR, "[sp_hex] compress_batch: in_len=%d != n_vectors=%d * hd=%d",
+             in_len, n_vectors, head_dim);
+        return -1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    int per_vec_bytes = bc.total_bytes;
+    int total_needed = n_vectors * per_vec_bytes;
+    if (total_needed > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_batch: needed=%d > capacity=%d",
+             total_needed, out_capacity);
+        return -1;
+    }
+
+    // Stack scratch reused across iterations. 1024-float aligned coeffs
+    // covers head_dim ? 1024 (any production model). The packed stage is
+    // written directly into the per-vector offset of out_packed so we
+    // don't need a separate per-iter packed scratch.
+    float coeffs[1024] __attribute__((aligned(128)));
+
+    for (int i = 0; i < n_vectors; ++i) {
+        const float *in_vec = in_vecs + (size_t)i * (size_t)head_dim;
+        unsigned char *out_slot = out_packed + (size_t)i * (size_t)per_vec_bytes;
+
+        memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+        sp_hex_vht2_f32(coeffs, head_dim);
+
+        int written = 0;
+        int rc = sp_hex_band_quantize_scalar(coeffs, head_dim, out_slot,
+                                              per_vec_bytes, &written);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] compress_batch: vec[%d] band_quantize rc=%d",
+                 i, rc);
+            return rc;
+        }
+        if (written != per_vec_bytes) {
+            FARF(ERROR, "[sp_hex] compress_batch: vec[%d] short write %d != %d",
+                 i, written, per_vec_bytes);
+            return -1;
+        }
+    }
+    *packed_used = total_needed;
+    return 0;
+}
+
+// decompress_f32_batch ? loop the decompress_f32 kernel internally
+// over n_vectors. max_bands applies to every vector in the batch (the
+// host caller is responsible for grouping equal-fidelity reads into
+// one call; mixed-fidelity batches would need a per-vector max_bands
+// array, which today's host paths don't need).
+int sp_hex_decompress_f32_batch(remote_handle64 h,
+                                 const unsigned char *packed_in, int packed_len,
+                                 int head_dim, int n_vectors, int max_bands,
+                                 float *out_vecs, int out_len) {
+    (void)h;
+    if (n_vectors <= 0) {
+        FARF(ERROR, "[sp_hex] decompress_batch: n_vectors=%d <= 0", n_vectors);
+        return -1;
+    }
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        FARF(ERROR, "[sp_hex] decompress_batch: head_dim=%d must be pow2 in [8,1024]",
+             head_dim);
+        return -1;
+    }
+    if (out_len != n_vectors * head_dim) {
+        FARF(ERROR, "[sp_hex] decompress_batch: out_len=%d != n_vectors=%d * hd=%d",
+             out_len, n_vectors, head_dim);
+        return -1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    int per_vec_bytes = bc.total_bytes;
+    if (packed_len != n_vectors * per_vec_bytes) {
+        FARF(ERROR, "[sp_hex] decompress_batch: packed_len=%d != n=%d * pv=%d",
+             packed_len, n_vectors, per_vec_bytes);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+
+    for (int i = 0; i < n_vectors; ++i) {
+        const unsigned char *in_slot = packed_in + (size_t)i * (size_t)per_vec_bytes;
+        float *out_vec = out_vecs + (size_t)i * (size_t)head_dim;
+
+        int rc = sp_hex_band_dequantize_scalar(in_slot, per_vec_bytes, head_dim,
+                                                max_bands, coeffs);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] decompress_batch: vec[%d] dequant rc=%d", i, rc);
+            return rc;
+        }
+        sp_hex_vht2_f32(coeffs, head_dim);
+        memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+    }
+    return 0;
+}
+
+
+// ============================================================================
+// V-specific compress/decompress (1 band, 3 bits — different from K's 4-band
+// 5/5/4/3 config). The kernels are identical to the K path but use V's bc.
+// ============================================================================
+
+int sp_hex_compress_f32_v(remote_handle64 h,
+                           const float *in_vec, int in_len,
+                           int head_dim,
+                           unsigned char *out_packed, int out_capacity,
+                           int *packed_used) {
+    (void)h;
+    if (!packed_used) return -1;
+    *packed_used = 0;
+    if (in_len != head_dim) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    if (bc.total_bytes > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_v: packed=%d > capacity=%d",
+             bc.total_bytes, out_capacity);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+    memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+    sp_hex_vht2_f32(coeffs, head_dim);
+
+    // Use math core sp_band_quantize directly (takes bc), bypassing
+    // sp_hex_band_quantize_scalar which has K's config hard-coded via
+    // sp_hex_default_band_config. V's 1-band 3-bit config doesn't satisfy
+    // HVX preconditions (head_dim >= 128 && % 128 == 0) anyway, so
+    // scalar-only is fine here.
+    sp_band_quantize(coeffs, out_packed, &bc);
+    *packed_used = bc.total_bytes;
+    return 0;
+}
+
+int sp_hex_decompress_f32_v(remote_handle64 h,
+                             const unsigned char *packed_in, int packed_len,
+                             int head_dim, int max_bands,
+                             float *out_vec, int out_len) {
+    (void)h;
+    if (out_len != head_dim) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    if (packed_len < bc.total_bytes) {
+        FARF(ERROR, "[sp_hex] decompress_v: packed_len=%d < expected=%d",
+             packed_len, bc.total_bytes);
+        return -1;
+    }
+    float coeffs[1024] __attribute__((aligned(128)));
+    if (max_bands < 0 || max_bands >= bc.n_bands) {
+        sp_band_dequantize(packed_in, coeffs, &bc);
+    } else {
+        sp_band_dequantize_partial(packed_in, coeffs, &bc, max_bands);
+    }
+    sp_hex_vht2_f32(coeffs, head_dim);
+    memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+    return 0;
+}
+
+int sp_hex_compress_f32_v_batch(remote_handle64 h,
+                                 const float *in_vecs, int in_len,
+                                 int head_dim, int n_vectors,
+                                 unsigned char *out_packed, int out_capacity,
+                                 int *packed_used) {
+    (void)h;
+    if (!packed_used) return -1;
+    *packed_used = 0;
+    if (n_vectors <= 0) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+    if (in_len != n_vectors * head_dim) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    int per_vec_bytes = bc.total_bytes;
+    int total_needed = n_vectors * per_vec_bytes;
+    if (total_needed > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_v_batch: needed=%d > cap=%d",
+             total_needed, out_capacity);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+    for (int i = 0; i < n_vectors; ++i) {
+        const float *in_vec = in_vecs + (size_t)i * (size_t)head_dim;
+        unsigned char *out_slot = out_packed + (size_t)i * (size_t)per_vec_bytes;
+        memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+        sp_hex_vht2_f32(coeffs, head_dim);
+
+        sp_band_quantize(coeffs, out_slot, &bc);
+    }
+    *packed_used = total_needed;
+    return 0;
+}
+
+int sp_hex_decompress_f32_v_batch(remote_handle64 h,
+                                   const unsigned char *packed_in, int packed_len,
+                                   int head_dim, int n_vectors, int max_bands,
+                                   float *out_vecs, int out_len) {
+    (void)h;
+    if (n_vectors <= 0) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+    if (out_len != n_vectors * head_dim) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    int per_vec_bytes = bc.total_bytes;
+    if (packed_len != n_vectors * per_vec_bytes) {
+        FARF(ERROR, "[sp_hex] decompress_v_batch: packed_len=%d != n=%d * pv=%d",
+             packed_len, n_vectors, per_vec_bytes);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+    for (int i = 0; i < n_vectors; ++i) {
+        const unsigned char *in_slot = packed_in + (size_t)i * (size_t)per_vec_bytes;
+        float *out_vec = out_vecs + (size_t)i * (size_t)head_dim;
+
+        if (max_bands < 0 || max_bands >= bc.n_bands) {
+            sp_band_dequantize(in_slot, coeffs, &bc);
+        } else {
+            sp_band_dequantize_partial(in_slot, coeffs, &bc, max_bands);
+        }
+        sp_hex_vht2_f32(coeffs, head_dim);
+        memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+    }
+    return 0;
+}

@@ -150,4 +150,77 @@ interface sp_hex : remote_handle64 {
                        in long head_dim,
                        in long max_bands,
                        rout sequence<float> out_vec);
+
+   // -------------------------------------------------------------------
+   // compress_f32_batch ? batched encode pipeline. Loops the
+   // compress_f32 kernel internally over n_vectors so the host
+   // amortises the FastRPC dispatch cost over a chunk of K-cache
+   // writes. Used by the post-decode hook on prefill (n_pos > 1).
+   //
+   // Layout:
+   //   in_vecs    = n_vectors * head_dim contiguous fp32
+   //   out_packed = n_vectors * bc.total_bytes contiguous octets
+   //   packed_used = n_vectors * bc.total_bytes on success
+   //
+   // n_vectors is the number of per-position K/V vectors in the
+   // chunk. Bridge picks chunk size based on FastRPC payload budget
+   // and VTCM headroom; today the default is 32 (env-overridable).
+   // -------------------------------------------------------------------
+   long compress_f32_batch(in sequence<float> in_vecs,
+                           in long head_dim,
+                           in long n_vectors,
+                           rout sequence<octet> out_packed,
+                           rout long packed_used);
+
+   // -------------------------------------------------------------------
+   // decompress_f32_batch ? batched decode pipeline. Mirror of
+   // compress_f32_batch for the read path. Loops decompress_f32
+   // internally over n_vectors. Used by partial-reconstruction paths
+   // (e.g. phase-3 attention short-circuit) that need a contiguous
+   // run of positions in one dispatch.
+   //
+   // Layout:
+   //   packed_in = n_vectors * bc.total_bytes contiguous octets
+   //   out_vecs  = n_vectors * head_dim contiguous fp32
+   //
+   // max_bands applies to every vector in the batch (per-vector
+   // partial fidelity is a future extension if needed).
+   // -------------------------------------------------------------------
+   long decompress_f32_batch(in sequence<octet> packed_in,
+                             in long head_dim,
+                             in long n_vectors,
+                             in long max_bands,
+                             rout sequence<float> out_vecs);
+
+   // -------------------------------------------------------------------
+   // V-specific compress/decompress: V uses a different band config than
+   // K (1 band, 3 bits vs K's 4 bands at 5/5/4/3). compress_f32 hard-
+   // codes K's config and rejects V's smaller capacity. These methods
+   // bake in V's config so the host can compress V vectors on the DSP
+   // without the bridge having to bypass to host-only fp32 storage.
+   //
+   // For head_dim=64: V packed bytes = 26 (vs K's 42); 3.0x compression
+   // recovered on V cache memory.
+   // -------------------------------------------------------------------
+   long compress_f32_v(in sequence<float> in_vec,
+                       in long head_dim,
+                       rout sequence<octet> out_packed,
+                       rout long packed_used);
+
+   long decompress_f32_v(in sequence<octet> packed_in,
+                         in long head_dim,
+                         in long max_bands,
+                         rout sequence<float> out_vec);
+
+   long compress_f32_v_batch(in sequence<float> in_vecs,
+                             in long head_dim,
+                             in long n_vectors,
+                             rout sequence<octet> out_packed,
+                             rout long packed_used);
+
+   long decompress_f32_v_batch(in sequence<octet> packed_in,
+                               in long head_dim,
+                               in long n_vectors,
+                               in long max_bands,
+                               rout sequence<float> out_vecs);
 };
