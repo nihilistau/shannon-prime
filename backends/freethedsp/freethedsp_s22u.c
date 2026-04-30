@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <stdarg.h>
 
 // =============================================================================
 // >>> PATCH OFFSETS — populate from `tools/find_is_test_enabled.py` output <<<
@@ -75,7 +76,8 @@ struct fastrpc_ioctl_init {
 };
 #define FASTRPC_IOCTL_INIT _IOWR('R', 6, struct fastrpc_ioctl_init)
 
-static int (*real_ioctl)(int, unsigned long, void *) = NULL;
+// Bionic's ioctl prototype is variadic: `int ioctl(int, int, ...)`.
+static int (*real_ioctl)(int, int, void *) = NULL;
 static int patch_done = 0;
 
 static void load_real_ioctl(void) {
@@ -87,7 +89,7 @@ static void load_real_ioctl(void) {
         fprintf(stderr, "[freethedsp] dlopen(libc) failed: %s\n", dlerror());
         abort();
     }
-    real_ioctl = (int (*)(int, unsigned long, void *))dlsym(h, "ioctl");
+    real_ioctl = (int (*)(int, int, void *))dlsym(h, "ioctl");
     if (!real_ioctl) {
         fprintf(stderr, "[freethedsp] dlsym(ioctl) failed: %s\n", dlerror());
         abort();
@@ -161,11 +163,16 @@ static void apply_patch(struct fastrpc_ioctl_init *init) {
             (unsigned)PATCH_ADDR);
 }
 
-int ioctl(int fd, unsigned long request, void *arg) {
+int ioctl(int fd, int request, ...) {
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+
     load_real_ioctl();
     int rc = real_ioctl(fd, request, arg);
 
-    if (request == FASTRPC_IOCTL_INIT && arg != NULL && sp_freethedsp_enabled() && !patch_done) {
+    if (request == (int)FASTRPC_IOCTL_INIT && arg != NULL && sp_freethedsp_enabled() && !patch_done) {
         apply_patch((struct fastrpc_ioctl_init *)arg);
     }
     return rc;

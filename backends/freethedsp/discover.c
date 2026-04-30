@@ -32,33 +32,52 @@
 #include <dlfcn.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdarg.h>
 
-// FastRPC IOCTL definitions — same as in geohot's freethedsp.c.
-// We don't include the kernel headers because the relevant struct is
-// stable across the FastRPC ABI back to ~2016 and re-declaring is
-// safer than depending on the toolchain's headers being present.
-#define IOC_OUT   0x40000000
-#define IOC_IN    0x80000000
-#define IOC_INOUT (IOC_IN | IOC_OUT)
-#define IOCPARM_MASK 0x1fff
-#define _IOC(inout, group, num, len) \
-    (inout | ((len & IOCPARM_MASK) << 16) | ((group) << 8) | (num))
-#define _IOWR(g, n, t) _IOC(IOC_INOUT, (g), (n), sizeof(t))
+// FastRPC IOCTL definitions.
+//
+// IMPORTANT: the kernel's FASTRPC driver registers IOCTLs with the
+// Linux-style _IOWR macros from <asm-generic/ioctl.h>, NOT the BSD-style
+// macros geohot's reference shim uses. We pull from the system header
+// to ensure our constant matches what userland actually emits.
+#include <sys/ioctl.h>
 
-struct fastrpc_ioctl_init {
-    uint32_t flags;
-    uintptr_t file;
-    int32_t  filelen;
-    int32_t  filefd;
-    uintptr_t mem;     /* the userspace mapping the kernel populated with
-                          the per-process fastrpc_shell_N ELF */
-    int32_t  memlen;
-    int32_t  memfd;
+// The upstream Linux kernel + Android NDK header (<misc/fastrpc.h>)
+// declares INIT_CREATE as _IOWR('R', 5, struct fastrpc_init_create) where
+// the userspace process passes a `file` pointer to the shell ELF for the
+// kernel to load into the new PD. Samsung/Qualcomm's fork on the S22U
+// renumbered this to request 4 (we observed 0xc0185204 firing repeatedly
+// during a real FastRPC session, with size field 0x18 = 24 = sizeof of
+// fastrpc_init_create — the upstream INIT_CREATE struct). That's why
+// geohot's reference doesn't match: he targeted older fastrpc with a
+// different struct layout (40 bytes, including a separate `mem` field).
+//
+// On this device the modern struct is what we hook on:
+struct fastrpc_init_create {
+    uint32_t filelen;     // size of the shell ELF in bytes
+    int32_t  filefd;      // fd of an ION/dma_heap buffer holding the ELF
+    uint32_t attrs;       // FASTRPC_MODE_* bits (UNSIGNED_MODULE etc)
+    uint32_t siglen;      // size of attached signature blob (0 for unsigned PD)
+    uint64_t file;        // userspace pointer to the shell ELF — our patch target
 };
-#define FASTRPC_IOCTL_INIT _IOWR('R', 6, struct fastrpc_ioctl_init)
+// Samsung's renumbering: request 4 with size 24 carries fastrpc_init_create.
+#define FASTRPC_IOCTL_INIT_CREATE_SAMSUNG  _IOWR('R', 4, struct fastrpc_init_create)
+// Upstream-spec equivalent (in case we run on a non-Samsung Snapdragon):
+#define FASTRPC_IOCTL_INIT_CREATE_UPSTREAM _IOWR('R', 5, struct fastrpc_init_create)
 
-// dlsym'd handle to libc's real ioctl
-static int (*real_ioctl)(int, unsigned long, void *) = NULL;
+__attribute__((constructor))
+static void discover_init(void) {
+    fprintf(stderr, "[discover] LD_PRELOAD active (pid=%d). Hooking init-create on:\n"
+                    "[discover]   samsung  = 0x%lx (request 4, size 24)\n"
+                    "[discover]   upstream = 0x%lx (request 5, size 24)\n",
+            getpid(),
+            (unsigned long)FASTRPC_IOCTL_INIT_CREATE_SAMSUNG,
+            (unsigned long)FASTRPC_IOCTL_INIT_CREATE_UPSTREAM);
+}
+
+// Bionic's ioctl prototype is variadic: `int ioctl(int, int, ...)`.
+// We hook with the same signature and forward via dlsym'd real_ioctl.
+static int (*real_ioctl)(int, int, void *) = NULL;
 
 static void load_real_ioctl(void) {
     if (real_ioctl) return;
@@ -69,20 +88,33 @@ static void load_real_ioctl(void) {
         fprintf(stderr, "[discover] dlopen(libc) failed: %s\n", dlerror());
         abort();
     }
-    real_ioctl = (int (*)(int, unsigned long, void *))dlsym(h, "ioctl");
+    real_ioctl = (int (*)(int, int, void *))dlsym(h, "ioctl");
     if (!real_ioctl) {
         fprintf(stderr, "[discover] dlsym(ioctl) failed: %s\n", dlerror());
         abort();
     }
 }
 
-static void dump_shell(const struct fastrpc_ioctl_init *init) {
+static void dump_shell(const struct fastrpc_init_create *init) {
     const char *path = getenv("SP_DUMP_PATH");
     if (!path || !*path) path = "./fastrpc_shell.bin";
 
-    if (init->mem == 0 || init->memlen <= 0) {
-        fprintf(stderr, "[discover] init->mem=0x%lx len=%d — nothing to dump\n",
-                (unsigned long)init->mem, init->memlen);
+    if (init->file == 0 || init->filelen == 0) {
+        fprintf(stderr, "[discover] init->file=0x%lx filelen=%u — nothing to dump\n",
+                (unsigned long)init->file, init->filelen);
+        return;
+    }
+
+    // Sanity-check: the shell should be an ELF. If it isn't, our struct
+    // interpretation is wrong and we'd dump garbage — bail with a clear
+    // message.
+    const unsigned char *m = (const unsigned char *)(uintptr_t)init->file;
+    if (m[0] != 0x7f || m[1] != 'E' || m[2] != 'L' || m[3] != 'F') {
+        fprintf(stderr, "[discover] file=0x%lx doesn't look like ELF "
+                        "(bytes %02x %02x %02x %02x); skipping dump.\n"
+                        "[discover] Likely struct layout mismatch — adjust "
+                        "fastrpc_init_create in discover.c.\n",
+                (unsigned long)init->file, m[0], m[1], m[2], m[3]);
         return;
     }
 
@@ -91,35 +123,41 @@ static void dump_shell(const struct fastrpc_ioctl_init *init) {
         fprintf(stderr, "[discover] fopen(%s) failed: %s\n", path, strerror(errno));
         return;
     }
-    size_t wrote = fwrite((void *)init->mem, 1, (size_t)init->memlen, f);
+    size_t wrote = fwrite(m, 1, (size_t)init->filelen, f);
     fclose(f);
-    fprintf(stderr, "[discover] dumped %zu bytes (mem=0x%lx, len=%d) to %s\n",
-            wrote, (unsigned long)init->mem, init->memlen, path);
-    fprintf(stderr, "[discover] flags=0x%x file=0x%lx filelen=%d filefd=%d memfd=%d\n",
-            init->flags, (unsigned long)init->file, init->filelen,
-            init->filefd, init->memfd);
+    fprintf(stderr, "[discover] dumped %zu bytes (file=0x%lx filelen=%u attrs=0x%x siglen=%u filefd=%d) to %s\n",
+            wrote, (unsigned long)init->file, init->filelen, init->attrs,
+            init->siglen, init->filefd, path);
 
-    // First 16 bytes — should start with ELF magic 0x7f 'E' 'L' 'F'.
-    const unsigned char *m = (const unsigned char *)init->mem;
     fprintf(stderr, "[discover] first 16 bytes:");
-    for (int i = 0; i < 16 && i < init->memlen; i++) {
+    for (unsigned i = 0; i < 16 && i < init->filelen; i++) {
         fprintf(stderr, " %02x", m[i]);
     }
     fprintf(stderr, "\n");
 }
 
-int ioctl(int fd, unsigned long request, void *arg) {
+// Match bionic's variadic prototype (system/bionic/libc/include/sys/ioctl.h).
+int ioctl(int fd, int request, ...) {
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+
     load_real_ioctl();
     int rc = real_ioctl(fd, request, arg);
 
-    if (request == FASTRPC_IOCTL_INIT && arg != NULL) {
-        // Even if rc != 0 we dump — the kernel may have populated the mem
-        // before the call ultimately failed, and we want the bytes either
-        // way.
-        dump_shell((const struct fastrpc_ioctl_init *)arg);
+    // Trace mode: log every ioctl request so we can see what FastRPC
+    // actually emits and confirm our hook is intercepting.
+    if (getenv("SP_DUMP_TRACE")) {
+        fprintf(stderr, "[discover] ioctl(fd=%d, req=0x%x) -> %d\n",
+                fd, (unsigned)request, rc);
+    }
 
-        // Set this env var to abort after first successful dump if you
-        // want to capture exactly one shell load.
+    int is_init_create =
+        (request == (int)FASTRPC_IOCTL_INIT_CREATE_SAMSUNG) ||
+        (request == (int)FASTRPC_IOCTL_INIT_CREATE_UPSTREAM);
+    if (is_init_create && arg != NULL) {
+        dump_shell((const struct fastrpc_init_create *)arg);
         if (getenv("SP_DUMP_ONCE")) {
             fprintf(stderr, "[discover] SP_DUMP_ONCE set — exiting\n");
             _exit(0);

@@ -1,5 +1,58 @@
 # Shannon-Prime: freethedsp shim — universal cDSP unblock harness
 
+## STATUS 2026-05-01 — Finding from Phase D.1 dry run
+
+**The freethedsp technique as upstream-designed does not apply on stock
+production S22 Ultra (Android 14, OneUI 6.1, Snapdragon 8 Gen 1).**
+
+Evidence captured during D.1 (`backends/freethedsp/discover.so`
+LD_PRELOAD against the validated `S22U` test and our `sp_dma_raw`
+probe):
+
+  - LD_PRELOAD intercepts every ioctl correctly. The constructor logs
+    `[discover] LD_PRELOAD active (pid=N)`, and we trace 30+ ioctls
+    per FastRPC session.
+  - **Zero `FASTRPC_IOCTL_INIT` (request 6) or `FASTRPC_IOCTL_INIT_CREATE`
+    (request 5) calls** — not in our trace, not in any of the FastRPC
+    sessions we exercised. The shell ELF never enters our userspace.
+  - Samsung's kernel renumbered ioctl request 4 to be `_IOWR` (size
+    24, matching the upstream `fastrpc_init_create` struct shape) but
+    that 24-byte struct fires 18+ times per session and the `file`
+    pointer it carries does NOT point at an ELF (we observed `ff ff
+    ff ff` at the target address). So request 4 isn't init either —
+    it's a renumbered different operation.
+  - Logcat from prior Stage 1 work confirmed the kernel did open
+    `/vendor/dsp/cdsp/fastrpc_shell_3` during our process's run, BUT
+    the load happens through a path that doesn't surface the ELF in
+    our address space. Most likely: cdsprpcd (system user) preloaded
+    the shell at boot into a kernel-protected region, and our process
+    attaches to it via the `INIT_ATTACH` ioctl (request 4 in upstream
+    nomenclature) without seeing the bytes.
+
+**Why upstream freethedsp worked**: older Snapdragon devices used the
+"each app loads its own shell" flow, so every app got a userspace
+mapping of the shell ELF and could patch it. Samsung/Qualcomm hardened
+this for 8 Gen 1 by moving the shell load entirely into the daemon's
+kernel-mediated path. Patching the daemon would require root.
+
+**What this means for Shannon-Prime**:
+
+  - The infrastructure built here (LD_PRELOAD shim, build script,
+    integration hooks, drift detection) is sound and reusable. If we
+    ever run on a dev kit or older device where INIT does fire, all
+    the plumbing is ready.
+  - But the specific shell-patch trick won't unlock Mode D Stage 1's
+    DMA permissions on THIS device.
+  - **This does not block Phase 2 (QNN-on-device).** Qualcomm's QNN
+    runtime works in unsigned PD by design — that's how AI Hub
+    deploys models. Standard graph execution doesn't need test mode.
+  - **It does block re-running Mode D Stage 1 / Stage 3** here. Those
+    are now permanently gated behind a real testsig or a dev kit.
+
+**Decision**: keep the infrastructure (it's cheap to maintain and
+useful elsewhere), pivot lead path back to Phase 2 (commit `f6799bd`),
+park Mode D as a "needs hardware" experiment.
+
 ## Strategic role
 
 Production-locked Android phones run unsigned PD on the cDSP by default,
