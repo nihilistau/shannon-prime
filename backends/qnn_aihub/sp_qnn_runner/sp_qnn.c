@@ -18,6 +18,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,8 +30,12 @@
  * supplies $(QAIRT_ROOT)/include/QNN so these resolve. */
 #include "QnnCommon.h"
 #include "QnnInterface.h"
+#include "QnnDevice.h"
+#include "QnnContext.h"
 #include "System/QnnSystemInterface.h"
 #include "System/QnnSystemContext.h"
+#include "HTP/QnnHtpDevice.h"
+#include "HTP/QnnHtpPerfInfrastructure.h"
 
 /* ------------------------------------------------------------------ */
 /* Internal state                                                     */
@@ -75,6 +80,11 @@ struct sp_qnn_handle {
      * execute() call. We mutate clientBuf.{data,dataSize} per call. */
     Qnn_Tensor_t *in_tensors;    /* n_inputs entries */
     Qnn_Tensor_t *out_tensors;   /* n_outputs entries */
+
+    /* HTP perf-mode state. power_cfg_id=0 means perf-mode wasn't enabled
+     * (e.g., older SDK or feature not supported). At destroy we call
+     * destroyPowerConfigId only if it's non-zero. */
+    uint32_t power_cfg_id;
 };
 
 /* ------------------------------------------------------------------ */
@@ -301,6 +311,77 @@ static void cache_tensor_info(const Qnn_Tensor_t *t, sp_qnn_tensor_info *out) {
     }
 }
 
+/* Enable HTP burst mode (DCVS off, perf governor pinned high) for the
+ * given device. Match qnn-net-run's defaults. Sets h->power_cfg_id on
+ * success so destroy can clean up. Best-effort: any failure is logged
+ * but doesn't fail the whole load (we can still execute, just slower). */
+static void htp_enable_burst_mode(sp_qnn_handle *h) {
+    QnnDevice_Infrastructure_t infra_raw = NULL;
+    if (g_lib.qnn.deviceGetInfrastructure(&infra_raw) != QNN_SUCCESS || !infra_raw) {
+        fprintf(stderr, "[sp_qnn] perf-mode: deviceGetInfrastructure failed (skipping burst)\n");
+        return;
+    }
+    QnnHtpDevice_Infrastructure_t *infra = (QnnHtpDevice_Infrastructure_t *)infra_raw;
+    if (infra->infraType != QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF) {
+        fprintf(stderr, "[sp_qnn] perf-mode: not an HTP perf-infra (type=%d)\n",
+                (int)infra->infraType);
+        return;
+    }
+    QnnHtpDevice_PerfInfrastructure_t *perf = &infra->perfInfra;
+
+    /* deviceId=0 / coreId=0 are the defaults; all our binaries target
+     * the single on-chip HTP. */
+    uint32_t cfg_id = 0;
+    if (perf->createPowerConfigId(0, 0, &cfg_id) != QNN_SUCCESS || cfg_id == 0) {
+        fprintf(stderr, "[sp_qnn] perf-mode: createPowerConfigId failed\n");
+        return;
+    }
+
+    /* DCVS V3 burst mode: disable DCVS, lock to PERFORMANCE_MODE,
+     * minimal sleep latency, voltage corners pegged to TURBO. The
+     * voltage corner enum is defined in QnnHtpPerfInfrastructure.h;
+     * value 7 (DCVS_VOLTAGE_VCORNER_TURBO) is the canonical pin-high. */
+    QnnHtpPerfInfrastructure_PowerConfig_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+    cfg.dcvsV3Config.contextId          = cfg_id;
+    cfg.dcvsV3Config.setDcvsEnable      = 1;
+    cfg.dcvsV3Config.dcvsEnable         = 0;  /* disable DCVS — lock high */
+    cfg.dcvsV3Config.powerMode          = QNN_HTP_PERF_INFRASTRUCTURE_POWERMODE_PERFORMANCE_MODE;
+    cfg.dcvsV3Config.setSleepLatency    = 1;
+    cfg.dcvsV3Config.sleepLatency       = 40;  /* 40us — same as qnn-net-run */
+    cfg.dcvsV3Config.setBusParams       = 1;
+    cfg.dcvsV3Config.busVoltageCornerMin    = DCVS_VOLTAGE_VCORNER_TURBO;
+    cfg.dcvsV3Config.busVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO;
+    cfg.dcvsV3Config.busVoltageCornerMax    = DCVS_VOLTAGE_VCORNER_TURBO;
+    cfg.dcvsV3Config.setCoreParams      = 1;
+    cfg.dcvsV3Config.coreVoltageCornerMin    = DCVS_VOLTAGE_VCORNER_TURBO;
+    cfg.dcvsV3Config.coreVoltageCornerTarget = DCVS_VOLTAGE_VCORNER_TURBO;
+    cfg.dcvsV3Config.coreVoltageCornerMax    = DCVS_VOLTAGE_VCORNER_TURBO;
+
+    const QnnHtpPerfInfrastructure_PowerConfig_t *cfgs[] = { &cfg, NULL };
+    if (perf->setPowerConfig(cfg_id, cfgs) != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] perf-mode: setPowerConfig failed\n");
+        perf->destroyPowerConfigId(cfg_id);
+        return;
+    }
+    h->power_cfg_id = cfg_id;
+    fprintf(stderr, "[sp_qnn] HTP burst mode enabled (cfg_id=%u)\n", cfg_id);
+}
+
+static void htp_disable_burst_mode(sp_qnn_handle *h) {
+    if (h->power_cfg_id == 0) return;
+    QnnDevice_Infrastructure_t infra_raw = NULL;
+    if (g_lib.qnn.deviceGetInfrastructure(&infra_raw) == QNN_SUCCESS && infra_raw) {
+        QnnHtpDevice_Infrastructure_t *infra =
+            (QnnHtpDevice_Infrastructure_t *)infra_raw;
+        if (infra->infraType == QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF) {
+            infra->perfInfra.destroyPowerConfigId(h->power_cfg_id);
+        }
+    }
+    h->power_cfg_id = 0;
+}
+
 sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
                                  const char *graph_name,
                                  sp_qnn_handle **out_h) {
@@ -373,10 +454,21 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
         return SP_QNN_ERR_DEVICE_CREATE;
     }
 
-    /* (7) Create context FROM the binary. QNN copies what it needs
-     *     internally; we keep bin_data alive anyway for safety. */
+    /* Enable HTP burst mode before context create so the graph
+     * finalize step also runs at high clocks. Best-effort. */
+    htp_enable_burst_mode(h);
+
+    /* (7) Create context FROM the binary with HIGH priority hint.
+     *     contextCreateFromBinary takes a NULL-terminated array of
+     *     QnnContext_Config_t* — same convention as setPowerConfig. */
+    QnnContext_Config_t prio_cfg;
+    memset(&prio_cfg, 0, sizeof(prio_cfg));
+    prio_cfg.option   = QNN_CONTEXT_CONFIG_OPTION_PRIORITY;
+    prio_cfg.priority = QNN_PRIORITY_HIGH;
+    const QnnContext_Config_t *ctx_cfgs[] = { &prio_cfg, NULL };
+
     if (g_lib.qnn.contextCreateFromBinary(h->backend, h->device,
-                                          NULL /*config*/,
+                                          ctx_cfgs,
                                           h->bin_data, h->bin_size,
                                           &h->context,
                                           NULL /*profile*/) != QNN_SUCCESS) {
@@ -436,6 +528,7 @@ void sp_qnn_destroy(sp_qnn_handle **h_io) {
     sp_qnn_handle *h = *h_io;
     /* Release in reverse-creation order. Each call is no-op-safe on
      * NULL/zero handles since we calloc'd the struct. */
+    htp_disable_burst_mode(h);
     if (h->context) g_lib.qnn.contextFree(h->context, NULL);
     if (h->device)  g_lib.qnn.deviceFree(h->device);
     if (h->backend) g_lib.qnn.backendFree(h->backend);
