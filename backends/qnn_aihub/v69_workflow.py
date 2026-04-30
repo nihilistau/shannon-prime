@@ -79,7 +79,11 @@ def submit_and_run(name="sp_v69_baseline", N=256, device_name="Samsung Galaxy S2
         return None
 
     print("\n--- download .bin ---")
-    out_path = f"/tmp/v69_{name}.bin"
+    # Honour SP_AIHUB_OUT_DIR for Windows-host runs; default to /tmp
+    # for legacy sandbox compatibility.
+    out_dir = os.environ.get("SP_AIHUB_OUT_DIR", "/tmp")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"v69_{name}.bin")
     cjob.get_target_model().download(filename=out_path)
     print(f"compiled artifact: {out_path} ({os.path.getsize(out_path) / 1024:.1f} KB)")
 
@@ -141,8 +145,24 @@ if __name__ == "__main__":
         job = hub.get_job(args.check)
         s = job.get_status()
         print(f"job {args.check}: {s.code} (success={s.success}, finished={s.finished})")
-        if s.success and hasattr(job, "download_profile"):
-            r = job.download_profile()
-            print(r.get("execution_summary", {}))
+        if s.success:
+            # If it's a compile job, re-download the .bin to SP_AIHUB_OUT_DIR.
+            try:
+                tm = job.get_target_model()
+                if tm is not None:
+                    out_dir = os.environ.get("SP_AIHUB_OUT_DIR", "/tmp")
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_path = os.path.join(out_dir, f"v69_{args.name}.bin")
+                    tm.download(filename=out_path)
+                    print(f"re-downloaded artifact: {out_path} ({os.path.getsize(out_path) / 1024:.1f} KB)")
+            except Exception as e:
+                print(f"(no target model on this job: {e})")
+            # If it's a profile job, dump the perf summary.
+            if hasattr(job, "download_profile"):
+                try:
+                    r = job.download_profile()
+                    print(r.get("execution_summary", {}))
+                except Exception:
+                    pass
     else:
         submit_and_run(name=args.name, N=args.n)
