@@ -92,6 +92,22 @@ int main(int argc, char *argv[]) {
         return vErr;
     }
 
+    // Path A.2 prototype CPU benchmark: fused decompress-matmul vs vanilla.
+    // Workload sized to match Dolphin 1B at n_ctx=4096 (per-layer-head shape).
+    // Override via env vars: SP_HEX_BENCH_NKV / SP_HEX_BENCH_HD / SP_HEX_BENCH_NQ.
+    int bench_nkv = 4096;
+    int bench_hd  = head_dim;
+    int bench_nq  = 8;
+    const char *e = NULL;
+    if ((e = getenv("SP_HEX_BENCH_NKV")) && *e) bench_nkv = atoi(e);
+    if ((e = getenv("SP_HEX_BENCH_HD"))  && *e) bench_hd  = atoi(e);
+    if ((e = getenv("SP_HEX_BENCH_NQ"))  && *e) bench_nq  = atoi(e);
+    int kqErr = sp_hex_kq_matmul_bench(bench_nkv, bench_hd, bench_nq);
+    if (kqErr) {
+        printf("ERROR: kq_matmul_bench failed (err=%d)\n", kqErr);
+        // non-fatal — print and continue
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

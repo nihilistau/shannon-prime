@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 // Build a deterministic input vector. Values are chosen so that the VHT2
 // transform produces a non-trivial spectrum (not all zeros, not constant)
@@ -686,3 +687,150 @@ int sp_hex_compress_decompress_validate(int head_dim) {
     return test_err;
 }
 #endif  // SP_HEXAGON_FASTRPC
+
+// ============================================================================
+// Path A.2 prototype — CPU-side fused decompress-matmul benchmark.
+// ============================================================================
+//
+// Compares two paths for computing K^T·Q (the attention score matmul):
+//
+//   (a) Reference: standard fp32 matmul over fp32 K + fp32 Q. This is the
+//       "vanilla" memory-bandwidth-bound path that today's attention pays.
+//
+//   (b) SP-fused: K is stored in SP-compressed packed-bytes form (per row).
+//       For each output element, decompress one K row from packed bytes via
+//       sp_band_dequantize, then dot product against the Q column. NO fp16
+//       K materialization in DDR — the decompress happens on-the-fly inside
+//       the dot-product loop.
+//
+// Validates: per-element RMS error between (a) and (b) reflects the SP
+// 4-band {5,5,4,3} reconstruction error profile (NOT a bug — same error
+// the post-decode hook produces today). Reports timings for both so we can
+// reason about whether CPU is fast enough or we need a cDSP-fused kernel.
+//
+// Workload sized to match Dolphin 1B at n_ctx=4096:
+//   n_kv = 4096   (full KV cache)
+//   hd   = 64     (Dolphin head_dim)
+//   n_q  = 8      (one attention "step", e.g. one head's queries)
+//
+// Pure CPU; no FastRPC. Useful even when the cDSP path is unavailable.
+int sp_hex_kq_matmul_bench(int n_kv, int hd, int n_q) {
+    if (n_kv <= 0 || hd < 8 || (hd & (hd - 1)) != 0 || n_q <= 0) {
+        printf("[sp_hex_kq_matmul_bench] invalid args: n_kv=%d hd=%d n_q=%d\n",
+               n_kv, hd, n_q);
+        return -1;
+    }
+    printf("\n[sp_hex_kq_matmul_bench] workload: n_kv=%d hd=%d n_q=%d\n",
+           n_kv, hd, n_q);
+
+    // Band config for K (4 bands at 5/5/4/3 — Dolphin K config).
+    sp_band_config_t bc;
+    int bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, hd, 4, bits);
+    printf("  bc.total_bytes=%d (10x compression vs %d-byte fp32 K row)\n",
+           bc.total_bytes, hd * 4);
+
+    // Allocate K (n_kv × hd) fp32 and Q (n_q × hd) fp32. Random fill.
+    float *K_orig = (float *)malloc(sizeof(float) * n_kv * hd);
+    float *Q      = (float *)malloc(sizeof(float) * n_q * hd);
+    float *KQ_ref = (float *)malloc(sizeof(float) * n_kv * n_q);
+    float *KQ_sp  = (float *)malloc(sizeof(float) * n_kv * n_q);
+    unsigned char *K_packed = (unsigned char *)malloc(
+        (size_t)n_kv * (size_t)bc.total_bytes);
+    if (!K_orig || !Q || !KQ_ref || !KQ_sp || !K_packed) {
+        printf("  alloc failed\n");
+        free(K_orig); free(Q); free(KQ_ref); free(KQ_sp); free(K_packed);
+        return -1;
+    }
+    unsigned int seed = 42u;
+    for (int i = 0; i < n_kv * hd; ++i) {
+        seed = seed * 1103515245u + 12345u;
+        K_orig[i] = ((float)((seed >> 16) & 0x7fff) / 32768.0f - 0.5f) * 2.0f;
+    }
+    for (int i = 0; i < n_q * hd; ++i) {
+        seed = seed * 1103515245u + 12345u;
+        Q[i] = ((float)((seed >> 16) & 0x7fff) / 32768.0f - 0.5f) * 2.0f;
+    }
+
+    struct timespec t0, t1;
+
+    // (a) Reference: standard fp32 matmul. KQ_ref[kv][q] = sum_h K[kv][h] * Q[q][h].
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int kv = 0; kv < n_kv; ++kv) {
+        const float *k_row = K_orig + (size_t)kv * hd;
+        for (int q = 0; q < n_q; ++q) {
+            const float *q_row = Q + (size_t)q * hd;
+            float s = 0.0f;
+            for (int h = 0; h < hd; ++h) s += k_row[h] * q_row[h];
+            KQ_ref[(size_t)kv * n_q + q] = s;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ref_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                    (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    printf("  (a) reference fp32 matmul:        %.3f ms\n", ref_ms);
+
+    // (b) SP-fused path. Step 1: pre-compress K (this is the cost the
+    // post-decode hook pays today, amortised across many gen steps).
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    float coeffs[1024] __attribute__((aligned(128)));
+    for (int kv = 0; kv < n_kv; ++kv) {
+        memcpy(coeffs, K_orig + (size_t)kv * hd, sizeof(float) * hd);
+        sp_vht2_forward_f32(coeffs, hd);
+        sp_band_quantize(coeffs, K_packed + (size_t)kv * bc.total_bytes, &bc);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double compress_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                         (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    printf("  (b1) one-time K compress:         %.3f ms (amortised across many attn calls)\n",
+           compress_ms);
+
+    // Step 2: fused matmul over compressed K. Decompress one row at a time,
+    // dot-product against all Q columns.
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int kv = 0; kv < n_kv; ++kv) {
+        const unsigned char *k_packed_row = K_packed + (size_t)kv * bc.total_bytes;
+        sp_band_dequantize(k_packed_row, coeffs, &bc);
+        sp_vht2_forward_f32(coeffs, hd);  // self-inverse
+        for (int q = 0; q < n_q; ++q) {
+            const float *q_row = Q + (size_t)q * hd;
+            float s = 0.0f;
+            for (int h = 0; h < hd; ++h) s += coeffs[h] * q_row[h];
+            KQ_sp[(size_t)kv * n_q + q] = s;
+        }
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double sp_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                   (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+    printf("  (b2) SP-fused matmul:             %.3f ms\n", sp_ms);
+
+    // Compare KQ_ref vs KQ_sp.
+    double sum_sq_err = 0.0;
+    double sum_sq_ref = 0.0;
+    float  max_abs_err = 0.0f;
+    for (int i = 0; i < n_kv * n_q; ++i) {
+        float err = KQ_ref[i] - KQ_sp[i];
+        sum_sq_err += (double)err * (double)err;
+        sum_sq_ref += (double)KQ_ref[i] * (double)KQ_ref[i];
+        float a = err < 0 ? -err : err;
+        if (a > max_abs_err) max_abs_err = a;
+    }
+    double rms = (n_kv * n_q > 0) ? sqrt(sum_sq_err / (n_kv * n_q)) : 0.0;
+    double rel_rms = (sum_sq_ref > 0) ? sqrt(sum_sq_err / sum_sq_ref) : 0.0;
+    printf("\n[sp_hex_kq_matmul_bench] correctness:\n");
+    printf("  RMS error:     %.6e\n", rms);
+    printf("  relative RMS:  %.6e (typical SP 4-band {5,5,4,3}: ~3%% on K-corr)\n", rel_rms);
+    printf("  max abs error: %.6e\n", max_abs_err);
+
+    printf("\n[sp_hex_kq_matmul_bench] perf (lower is better):\n");
+    printf("  vanilla matmul:     %.3f ms\n", ref_ms);
+    printf("  SP-fused matmul:    %.3f ms (%.2fx %s)\n",
+           sp_ms,
+           sp_ms / ref_ms,
+           sp_ms < ref_ms ? "FASTER" : "slower");
+    printf("  amortised compress: %.3f ms one-time, ~0 per attn call\n",
+           compress_ms);
+
+    free(K_orig); free(Q); free(KQ_ref); free(KQ_sp); free(K_packed);
+    return 0;
+}
