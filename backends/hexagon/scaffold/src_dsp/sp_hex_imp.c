@@ -506,308 +506,81 @@ int sp_hex_decompress_f32_batch(remote_handle64 h,
     return 0;
 }
 
-// ============================================================================
-// Phase 2.0 weight streaming probe — see IDL contract in inc/sp_hex.idl.
-// ============================================================================
-//
-// Single FastRPC call that runs the consumer side of the producer/consumer
-// ring buffer. The ARM thread feeds tiles in via pread() and signals via
-// flags[]; this loop polls flags[] for READY, decompresses a tile, dot-
-// products against the resident activation, and marks the slot CONSUMED.
-//
-// Memory ordering: rpcmem is shared between ARM and DSP via SMMU. We rely
-// on the ARM side using release-store on flags[slot] = READY (after the
-// pread() data is fully written) and acquire-load on this side checking
-// flags[slot] == READY before reading tile data. On Hexagon V69 the
-// hardware enforces ordering through a memory barrier issued via
-// __asm__ __volatile__("barrier" ::: "memory"). We use the GCC builtin
-// __sync_synchronize() which lowers to that barrier on V69.
-//
-// Slot states (in flags[slot]):
-//   0 = SP_TILE_EMPTY    (initial, or just consumed by DSP)
-//   1 = SP_TILE_READY    (ARM has filled the tile, DSP may consume)
-//   2 = SP_TILE_CONSUMED (DSP has read the tile; ARM may refill)
-//
-// The DSP transitions READY -> CONSUMED. The ARM transitions
-// EMPTY/CONSUMED -> READY. This avoids any mutex; the slot ownership is
-// implied by the flag value.
 
-#define SP_TILE_EMPTY    0u
-#define SP_TILE_READY    1u
-#define SP_TILE_CONSUMED 2u
+// ============================================================================
+// kq_matmul_fused — Phase 1.6/1.7 harness intercept replacement.
+// ============================================================================
+//
+// Scalar reference. Once wired end-to-end and correctness-validated, this
+// gets replaced with a fused HVX kernel (compose existing HVX VHT2 with
+// new HVX dequant + HVX FMA dot). The IDL contract stays identical so
+// the custom op doesn't need to change when we drop in the HVX kernel.
 
-int sp_hex_weight_stream_session(remote_handle64 h,
-                                  int n_tiles, int tile_bytes, int n_slots,
-                                  int head_dim,
-                                  const float *activation, int activation_len,
-                                  const unsigned char *tile_pool, int pool_len,
-                                  unsigned long *flags, int flags_len,
-                                  long long *stats, int stats_len) {
+int sp_hex_kq_matmul_fused(remote_handle64 h,
+                            const float *q_vec, int q_len,
+                            const unsigned char *k_packed, int packed_len,
+                            int head_dim, int n_kv, int n_q,
+                            float *kq_scores, int kq_len) {
     (void)h;
 
-    // ── Validate contract ────────────────────────────────────────────
-    if (n_tiles <= 0 || tile_bytes <= 0 || n_slots <= 0) {
-        FARF(ERROR, "[sp_hex] wsess: bad params n=%d tb=%d sl=%d",
-             n_tiles, tile_bytes, n_slots);
-        return -1;
-    }
     if (head_dim < 8 || head_dim > 1024 ||
         (head_dim & (head_dim - 1)) != 0) {
-        FARF(ERROR, "[sp_hex] wsess: head_dim=%d must be pow2 in [8,1024]", head_dim);
+        FARF(ERROR, "[sp_hex] kq_fused: bad head_dim=%d", head_dim);
         return -1;
     }
-    if (activation_len != head_dim) {
-        FARF(ERROR, "[sp_hex] wsess: activation_len=%d != head_dim=%d",
-             activation_len, head_dim);
+    if (n_kv <= 0 || n_q <= 0) {
+        FARF(ERROR, "[sp_hex] kq_fused: bad n_kv=%d n_q=%d", n_kv, n_q);
         return -1;
     }
-    if (pool_len != n_slots * tile_bytes) {
-        FARF(ERROR, "[sp_hex] wsess: pool_len=%d != n_slots=%d * tile_bytes=%d",
-             pool_len, n_slots, tile_bytes);
+    if (q_len != n_q * head_dim) {
+        FARF(ERROR, "[sp_hex] kq_fused: q_len=%d != n_q=%d * hd=%d",
+             q_len, n_q, head_dim);
         return -1;
     }
-    if (flags_len != n_slots) {
-        FARF(ERROR, "[sp_hex] wsess: flags_len=%d != n_slots=%d",
-             flags_len, n_slots);
-        return -1;
-    }
-    if (stats_len < 4) {
-        FARF(ERROR, "[sp_hex] wsess: stats_len=%d < 4", stats_len);
+    if (kq_len != n_kv * n_q) {
+        FARF(ERROR, "[sp_hex] kq_fused: kq_len=%d != n_kv=%d * n_q=%d",
+             kq_len, n_kv, n_q);
         return -1;
     }
 
-    // ── Decide how the tile is interpreted ──────────────────────────
-    // For this probe each tile is a contiguous run of SP-compressed K
-    // band records (4-band 5/5/4/3 config). Caller picks tile_bytes as
-    // a multiple of bc.total_bytes; we work out vectors-per-tile.
     sp_band_config_t bc;
     int default_bits[4] = {5, 5, 4, 3};
     sp_band_config_init(&bc, head_dim, 4, default_bits);
-    int per_vec_bytes = bc.total_bytes;
-    if (tile_bytes % per_vec_bytes != 0) {
-        FARF(ERROR, "[sp_hex] wsess: tile_bytes=%d not a multiple of per_vec_bytes=%d",
-             tile_bytes, per_vec_bytes);
+    int per_pos_bytes = bc.total_bytes;
+    if (packed_len != n_kv * per_pos_bytes) {
+        FARF(ERROR, "[sp_hex] kq_fused: packed_len=%d != n_kv=%d * pp=%d",
+             packed_len, n_kv, per_pos_bytes);
         return -1;
     }
-    int vecs_per_tile = tile_bytes / per_vec_bytes;
 
-    // Activation stays resident — copy into stack scratch (small,
-    // ≤ 4 KB at head_dim=1024).
-    float activation_local[1024] __attribute__((aligned(128)));
-    memcpy(activation_local, activation, sizeof(float) * head_dim);
+    // Per-row scratch — VTCM-resident in the HVX upgrade. Stack for now.
+    float k_row[1024] __attribute__((aligned(128)));
 
-    // ── Main consumer loop ───────────────────────────────────────────
-    long long total_pcycles    = 0;
-    long long wait_pcycles     = 0;
-    long long compute_pcycles  = 0;
-    long long bytes_consumed   = 0;
-    double    accumulator      = 0.0;  // sink for dot products so the
-                                       // compiler can't optimise them away
+    // kv outer, q inner — reuses decompressed K row across all Q heads.
+    // That's the whole reason for "fused" in the name. A naive bulk
+    // dequant + bulk dot would ship 4x more bytes back to ARM and lose
+    // VTCM cache locality on the HVX upgrade.
+    for (int kv = 0; kv < n_kv; ++kv) {
+        const unsigned char *packed = k_packed + (size_t)kv * (size_t)per_pos_bytes;
 
-    float coeffs[1024] __attribute__((aligned(128)));
-
-    uint64_t loop_start = HAP_perf_get_pcycles();
-
-    for (int t = 0; t < n_tiles; ++t) {
-        const int slot = t % n_slots;
-        volatile unsigned long *slot_flag = (volatile unsigned long *)&flags[slot];
-
-        // 1) Wait for the producer to mark this slot READY.
-        uint64_t wait_t0 = HAP_perf_get_pcycles();
-        while (*slot_flag != SP_TILE_READY) {
-            // Tight spin. Yielding via qurt_thread_yield would cost more
-            // pcycles than the typical wait window (we expect <50 µs at
-            // 1.5 GB/s for 16 KB tiles). Producer transition is a single
-            // atomic store on the ARM side.
+        int rc = sp_hex_band_dequantize_scalar(packed, per_pos_bytes, head_dim,
+                                                /*max_bands=*/-1, k_row);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] kq_fused: dequant rc=%d kv=%d", rc, kv);
+            return rc;
         }
-        __sync_synchronize();  // acquire fence — make tile data visible
-        wait_pcycles += (long long)(HAP_perf_get_pcycles() - wait_t0);
+        sp_hex_vht2_f32(k_row, head_dim);  // self-inverse — HVX path
+                                            // engages internally on V69+
 
-        // 2) Compute on this tile.
-        const unsigned char *tile = tile_pool + (size_t)slot * (size_t)tile_bytes;
-
-        uint64_t comp_t0 = HAP_perf_get_pcycles();
-        for (int v = 0; v < vecs_per_tile; ++v) {
-            const unsigned char *vp = tile + (size_t)v * (size_t)per_vec_bytes;
-            int rc = sp_hex_band_dequantize_scalar(vp, per_vec_bytes, head_dim,
-                                                    /*max_bands=*/-1, coeffs);
-            if (rc != 0) {
-                FARF(ERROR, "[sp_hex] wsess: dequant rc=%d t=%d v=%d", rc, t, v);
-                return rc;
-            }
-            sp_hex_vht2_f32(coeffs, head_dim);
-
-            // Dot product against resident activation.
+        for (int q = 0; q < n_q; ++q) {
+            const float *q_row = q_vec + (size_t)q * (size_t)head_dim;
             float dot = 0.0f;
             for (int i = 0; i < head_dim; ++i) {
-                dot += activation_local[i] * coeffs[i];
+                dot += q_row[i] * k_row[i];
             }
-            accumulator += dot;
+            kq_scores[(size_t)kv * (size_t)n_q + (size_t)q] = dot;
         }
-        compute_pcycles += (long long)(HAP_perf_get_pcycles() - comp_t0);
-
-        // 3) Mark the slot CONSUMED so the producer can refill.
-        __sync_synchronize();  // release fence — make sure all reads done
-        *slot_flag = SP_TILE_CONSUMED;
-
-        bytes_consumed += tile_bytes;
     }
 
-    total_pcycles = (long long)(HAP_perf_get_pcycles() - loop_start);
-
-    // Anti-DCE: stash a tiny reduction so the compiler can't optimise
-    // the matmul away. The ARM caller reads stats[3] back as a sanity.
-    long long acc_bits;
-    {
-        double ad = accumulator;
-        memcpy(&acc_bits, &ad, sizeof(acc_bits));
-    }
-
-    stats[0] = bytes_consumed;
-    stats[1] = total_pcycles;
-    stats[2] = wait_pcycles;
-    stats[3] = compute_pcycles;
-    if (stats_len >= 5) stats[4] = acc_bits;
-
-    FARF(HIGH, "[sp_hex] wsess: %d tiles, %lld bytes, total=%lld wait=%lld comp=%lld pcycles",
-         n_tiles, bytes_consumed, total_pcycles, wait_pcycles, compute_pcycles);
-    return 0;
-}
-
-
-// ============================================================================
-// V-specific compress/decompress (1 band, 3 bits — different from K's 4-band
-// 5/5/4/3 config). The kernels are identical to the K path but use V's bc.
-// ============================================================================
-
-int sp_hex_compress_f32_v(remote_handle64 h,
-                           const float *in_vec, int in_len,
-                           int head_dim,
-                           unsigned char *out_packed, int out_capacity,
-                           int *packed_used) {
-    (void)h;
-    if (!packed_used) return -1;
-    *packed_used = 0;
-    if (in_len != head_dim) return -1;
-    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
-
-    sp_band_config_t bc;
-    int v_bits[1] = {3};
-    sp_band_config_init(&bc, head_dim, 1, v_bits);
-    if (bc.total_bytes > out_capacity) {
-        FARF(ERROR, "[sp_hex] compress_v: packed=%d > capacity=%d",
-             bc.total_bytes, out_capacity);
-        return -1;
-    }
-
-    float coeffs[1024] __attribute__((aligned(128)));
-    memcpy(coeffs, in_vec, sizeof(float) * head_dim);
-    sp_hex_vht2_f32(coeffs, head_dim);
-
-    // Use math core sp_band_quantize directly (takes bc), bypassing
-    // sp_hex_band_quantize_scalar which has K's config hard-coded via
-    // sp_hex_default_band_config. V's 1-band 3-bit config doesn't satisfy
-    // HVX preconditions (head_dim >= 128 && % 128 == 0) anyway, so
-    // scalar-only is fine here.
-    sp_band_quantize(coeffs, out_packed, &bc);
-    *packed_used = bc.total_bytes;
-    return 0;
-}
-
-int sp_hex_decompress_f32_v(remote_handle64 h,
-                             const unsigned char *packed_in, int packed_len,
-                             int head_dim, int max_bands,
-                             float *out_vec, int out_len) {
-    (void)h;
-    if (out_len != head_dim) return -1;
-    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
-
-    sp_band_config_t bc;
-    int v_bits[1] = {3};
-    sp_band_config_init(&bc, head_dim, 1, v_bits);
-    if (packed_len < bc.total_bytes) {
-        FARF(ERROR, "[sp_hex] decompress_v: packed_len=%d < expected=%d",
-             packed_len, bc.total_bytes);
-        return -1;
-    }
-    float coeffs[1024] __attribute__((aligned(128)));
-    if (max_bands < 0 || max_bands >= bc.n_bands) {
-        sp_band_dequantize(packed_in, coeffs, &bc);
-    } else {
-        sp_band_dequantize_partial(packed_in, coeffs, &bc, max_bands);
-    }
-    sp_hex_vht2_f32(coeffs, head_dim);
-    memcpy(out_vec, coeffs, sizeof(float) * head_dim);
-    return 0;
-}
-
-int sp_hex_compress_f32_v_batch(remote_handle64 h,
-                                 const float *in_vecs, int in_len,
-                                 int head_dim, int n_vectors,
-                                 unsigned char *out_packed, int out_capacity,
-                                 int *packed_used) {
-    (void)h;
-    if (!packed_used) return -1;
-    *packed_used = 0;
-    if (n_vectors <= 0) return -1;
-    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
-    if (in_len != n_vectors * head_dim) return -1;
-
-    sp_band_config_t bc;
-    int v_bits[1] = {3};
-    sp_band_config_init(&bc, head_dim, 1, v_bits);
-    int per_vec_bytes = bc.total_bytes;
-    int total_needed = n_vectors * per_vec_bytes;
-    if (total_needed > out_capacity) {
-        FARF(ERROR, "[sp_hex] compress_v_batch: needed=%d > cap=%d",
-             total_needed, out_capacity);
-        return -1;
-    }
-
-    float coeffs[1024] __attribute__((aligned(128)));
-    for (int i = 0; i < n_vectors; ++i) {
-        const float *in_vec = in_vecs + (size_t)i * (size_t)head_dim;
-        unsigned char *out_slot = out_packed + (size_t)i * (size_t)per_vec_bytes;
-        memcpy(coeffs, in_vec, sizeof(float) * head_dim);
-        sp_hex_vht2_f32(coeffs, head_dim);
-
-        sp_band_quantize(coeffs, out_slot, &bc);
-    }
-    *packed_used = total_needed;
-    return 0;
-}
-
-int sp_hex_decompress_f32_v_batch(remote_handle64 h,
-                                   const unsigned char *packed_in, int packed_len,
-                                   int head_dim, int n_vectors, int max_bands,
-                                   float *out_vecs, int out_len) {
-    (void)h;
-    if (n_vectors <= 0) return -1;
-    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
-    if (out_len != n_vectors * head_dim) return -1;
-
-    sp_band_config_t bc;
-    int v_bits[1] = {3};
-    sp_band_config_init(&bc, head_dim, 1, v_bits);
-    int per_vec_bytes = bc.total_bytes;
-    if (packed_len != n_vectors * per_vec_bytes) {
-        FARF(ERROR, "[sp_hex] decompress_v_batch: packed_len=%d != n=%d * pv=%d",
-             packed_len, n_vectors, per_vec_bytes);
-        return -1;
-    }
-
-    float coeffs[1024] __attribute__((aligned(128)));
-    for (int i = 0; i < n_vectors; ++i) {
-        const unsigned char *in_slot = packed_in + (size_t)i * (size_t)per_vec_bytes;
-        float *out_vec = out_vecs + (size_t)i * (size_t)head_dim;
-
-        if (max_bands < 0 || max_bands >= bc.n_bands) {
-            sp_band_dequantize(in_slot, coeffs, &bc);
-        } else {
-            sp_band_dequantize_partial(in_slot, coeffs, &bc, max_bands);
-        }
-        sp_hex_vht2_f32(coeffs, head_dim);
-        memcpy(out_vec, coeffs, sizeof(float) * head_dim);
-    }
     return 0;
 }

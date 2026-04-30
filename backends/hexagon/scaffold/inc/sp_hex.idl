@@ -193,6 +193,36 @@ interface sp_hex : remote_handle64 {
                              rout sequence<float> out_vecs);
 
    // -------------------------------------------------------------------
+   // kq_matmul_fused ? Phase 1.6/1.7 harness intercept replacement.
+   // Single FastRPC dispatch per attention op, replaces the custom op's
+   // ARM-scalar inner loop with a DSP fused decompress-matmul that runs
+   // on HVX once the kernel upgrade lands. K archive lives in rpcmem
+   // (Phase 1.6 made it persistent), so DSP reads it zero-copy via SMMU.
+   //
+   // Args:
+   //   q_vec     : n_q * head_dim contiguous fp32 (Q rows from build_attn_mha
+   //               after permute, ready for dot products against K).
+   //   k_packed  : n_kv * total_bytes_per_pos packed K bytes
+   //               (4-band 5/5/4/3 K config = 42 bytes at hd=128).
+   //   head_dim  : pow2 in [8, 1024].
+   //   n_kv      : K positions in this attention window.
+   //   n_q       : Q heads/queries.
+   //   kq_scores : n_kv * n_q fp32 output, layout matches ggml mul_mat
+   //               result [n_kv, n_q] column-major.
+   //
+   // DSP loop (HVX target): kv outer, q inner so each decompressed K
+   // row stays VTCM-resident and is reused across all Q heads. First
+   // implementation is scalar reference for IDL-wiring validation; HVX
+   // kernel slots in transparently once correctness passes.
+   // -------------------------------------------------------------------
+   long kq_matmul_fused(in sequence<float> q_vec,
+                        in sequence<octet> k_packed,
+                        in long head_dim,
+                        in long n_kv,
+                        in long n_q,
+                        rout sequence<float> kq_scores);
+
+   // -------------------------------------------------------------------
    // weight_stream_session ? Phase 2.0 standalone probe for the
    // "Zero-RAM-Footprint" weight streaming thesis.
    //
@@ -242,6 +272,46 @@ interface sp_hex : remote_handle64 {
                               in sequence<octet> tile_pool,
                               rout sequence<unsigned long> flags,
                               rout sequence<long long> stats);
+
+   // -------------------------------------------------------------------
+   // kq_matmul_fused ? Phase 1.6/1.7 harness intercept fix.
+   //
+   // Single FastRPC dispatch per attention op. Replaces the custom op's
+   // ARM-scalar inner loop with a DSP fused decompress-matmul that runs
+   // on HVX. The K archive lives in rpcmem (already mapped by Phase 1.6
+   // post_compute / kcap), so the DSP reads it zero-copy via SMMU.
+   //
+   // Args:
+   //   q_vec        : Q rows, n_q * head_dim contiguous fp32. Same Q
+   //                  layout as ggml_mul_mat second operand after the
+   //                  build_attn_mha permute.
+   //   k_packed     : packed SP-compressed K archive bytes for this
+   //                  attention op. Layout: n_kv * total_bytes_per_pos
+   //                  contiguous octets, where total_bytes_per_pos is
+   //                  whatever sp_band_config_t reports for the K config
+   //                  (4-band 5/5/4/3 = 42 bytes at hd=128).
+   //   head_dim     : K/Q vector length, power of 2 in [8, 1024].
+   //   n_kv         : number of K positions to dot against.
+   //   n_q          : number of Q heads/queries.
+   //   kq_scores    : output n_kv * n_q contiguous fp32, layout matching
+   //                  ggml's mul_mat result [n_kv, n_q] column-major.
+   //
+   // DSP loop (HVX target):
+   //   for kv in [0, n_kv):
+   //     decompress packed[kv] -> coeffs (HVX dequant + HVX VHT2)
+   //     for q in [0, n_q): kq_scores[kv][q] = dot(q_vec[q], coeffs)
+   //   coeffs stay in VTCM the whole time so the decompress is
+   //   bandwidth-free.
+   //
+   // First implementation will be scalar reference to validate the IDL
+   // wiring. HVX kernel slots in once correctness passes.
+   // -------------------------------------------------------------------
+   long kq_matmul_fused(in sequence<float> q_vec,
+                        in sequence<octet> k_packed,
+                        in long head_dim,
+                        in long n_kv,
+                        in long n_q,
+                        rout sequence<float> kq_scores);
 
    // -------------------------------------------------------------------
    // V-specific compress/decompress: V uses a different band config than
