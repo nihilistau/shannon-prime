@@ -360,11 +360,19 @@ Invoke-Tool $ArmCC ($ArmCFlags + $ArmIncs + @(
 )) "ndk stub link"
 
 Step "8/8" "ndk clang++: link main-$TestName.out"
+# rpcmem.a is the static archive that provides rpcmem_init/alloc/free/deinit.
+# The upstream Halide DMA examples don't reference these (they use alloc_ion
+# via /dev/ion), but on modern Android (Q+) /dev/ion is gone and dma_heap
+# is SELinux-locked for shell-user apps, so the rpcmem path is the only
+# one that actually works. Working S22U build (Hexagon IDE-generated) links
+# this same archive for the same reason.
+$RpcmemArchive = "$env:HEXAGON_SDK_ROOT\ipc\fastrpc\rpcmem\prebuilt\android_aarch64\rpcmem.a"
 Invoke-Tool $ArmCxx ($ArmCxxFlags + $ArmIncs + @(
     "bin\main-$TestName.o",
     "-llog","-fPIE","-pie","-lcdsprpc",
     "-L","$env:HEXAGON_SDK_ROOT\ipc\fastrpc\remote\ship\android_aarch64",
     "..\..\utils\bin\ion_allocation.o",
+    $RpcmemArchive,
     "-L","..\..\utils",
     "-l$($TestName)_stub",
     "-L","bin\host",

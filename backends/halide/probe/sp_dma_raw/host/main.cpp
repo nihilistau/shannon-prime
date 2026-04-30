@@ -18,8 +18,11 @@
 //
 // usage: ./test-sp-dma-raw [iterations]
 
-#include "buffer.h"
-#include "ion_allocation.h"
+// We deliberately don't include "buffer.h" / "ion_allocation.h" — those
+// would route through alloc_ion(), which on modern Android (Q+) fails
+// for shell-user apps because SELinux blocks direct /dev/dma_heap/qcom,system
+// ioctls. We use rpcmem_alloc instead — the cdsprpc daemon (running as
+// `system`) handles the dma_heap ioctl on our behalf.
 #include "rpcmem.h"
 #include "remote.h"            // remote_session_control + DSPRPC_CONTROL_UNSIGNED_MODULE
 #include "sp_dma_raw.h"        // FastRPC stub (generated from .idl)
@@ -99,7 +102,7 @@ static float dequantize(int unsigned_code, int max_val, float scale) {
 int main(int argc, char *argv[]) {
     int iterations = (argc > 1) ? std::atoi(argv[1]) : 100;
 
-    alloc_init();
+    rpcmem_init();
 
     // Enable UNSIGNED PD on the cDSP. The phone is bootloader-locked and
     // we don't have a Qualcomm-issued testsig for it; without unsigned PD
@@ -132,16 +135,28 @@ int main(int argc, char *argv[]) {
     const int packed_band_stride = 128;
     const int coeffs_stride      = 32;  // == max coeffs per band
 
-    // Allocate ION buffers (rpcmem-backed, contiguous, DMA-friendly).
-    buffer_2d<uint8_t> packed_in(packed_band_stride, N_BANDS);
-    buffer_2d<float>   coeffs_out(coeffs_stride, N_BANDS);
+    // Allocate via rpcmem. cdsprpc handles the dma_heap ioctl as `system`
+    // user; direct /dev/dma_heap access from shell-user apps is SELinux-
+    // blocked on production stock Android. RPCMEM_HEAP_ID_SYSTEM maps to
+    // the same qcom,system dmabuf heap, just routed through the daemon.
+    const int heap_id = RPCMEM_HEAP_ID_SYSTEM;
+    const size_t packed_bytes = (size_t)packed_band_stride * N_BANDS;
+    const size_t coeffs_bytes = (size_t)coeffs_stride * N_BANDS * sizeof(float);
+
+    uint8_t *packed_buf =
+        (uint8_t*)rpcmem_alloc(heap_id, RPCMEM_DEFAULT_FLAGS, packed_bytes);
+    float *coeffs_buf =
+        (float*)rpcmem_alloc(heap_id, RPCMEM_DEFAULT_FLAGS, coeffs_bytes);
+    if (!packed_buf || !coeffs_buf) {
+        std::fprintf(stderr, "rpcmem_alloc failed: packed=%p coeffs=%p\n",
+                     packed_buf, coeffs_buf);
+        return 1;
+    }
+    std::memset(packed_buf, 0, packed_bytes);
+    std::memset(coeffs_buf, 0, coeffs_bytes);
 
     // Ground-truth + reference output we expect.
     std::vector<float> ref_coeffs(N_BANDS * coeffs_stride, 0.0f);
-
-    // Pack per band.
-    uint8_t *packed_buf = packed_in.get_buffer();
-    std::memset(packed_buf, 0, packed_band_stride * N_BANDS);
     for (int b = 0; b < N_BANDS; ++b) {
         int codes[64] = {0};
         for (int i = 0; i < COEFFS_PER_BAND[b]; ++i) {
@@ -169,7 +184,7 @@ int main(int argc, char *argv[]) {
     // matches without a cast.
     unsigned long long avg_time = 0;
     int rc = sp_dma_raw_run(
-        packed_in.get_buffer(), packed_band_stride * N_BANDS,
+        packed_buf, packed_band_stride * N_BANDS,
         packed_band_stride,
         N_BANDS,
         /*is_input_ubwc=*/0,
@@ -178,7 +193,7 @@ int main(int argc, char *argv[]) {
         MAX_VAL_PER_BAND,  N_BANDS,
         COEFFS_PER_BAND,   N_BANDS,
         coeffs_stride,
-        coeffs_out.get_buffer(), coeffs_stride * N_BANDS,
+        coeffs_buf, coeffs_stride * N_BANDS,
         iterations,
         &avg_time);
 
@@ -196,7 +211,9 @@ int main(int argc, char *argv[]) {
         TestReport tr("sp_dma_raw_probe", 0, "microseconds",
                       Mode::Device_Standalone, Result::Fail);
         tr.print();
-        alloc_finalize();
+        rpcmem_free(packed_buf);
+        rpcmem_free(coeffs_buf);
+        rpcmem_deinit();
         return rc;
     }
 
@@ -210,7 +227,7 @@ int main(int argc, char *argv[]) {
         float band_max = 0.0f;
         for (int i = 0; i < COEFFS_PER_BAND[b]; ++i) {
             int idx = b * coeffs_stride + i;
-            float got = coeffs_out.get_buffer()[idx];
+            float got = coeffs_buf[idx];
             float ref = ref_coeffs[idx];
             float err = std::fabs(got - ref);
             if (err > band_max) band_max = err;
@@ -231,8 +248,8 @@ int main(int argc, char *argv[]) {
                   Mode::Device_Standalone, r);
     tr.print();
 
-    packed_in.free_buff();
-    coeffs_out.free_buff();
-    alloc_finalize();
+    rpcmem_free(packed_buf);
+    rpcmem_free(coeffs_buf);
+    rpcmem_deinit();
     return (r == Result::Pass) ? 0 : 1;
 }

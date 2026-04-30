@@ -1,6 +1,53 @@
 # Mode D Stage 1 build notes — what I tried, what's blocked
 
-## TL;DR
+## TL;DR — STAGE 1 BINARY ANSWER OBTAINED 2026-05-01
+
+**`halide_hexagon_dma_allocate_engine()` fails in unsigned PD on a
+production-locked Samsung Galaxy S22 Ultra cDSP.** Stack trace from the
+`adsprpc` driver shows the DSP-side process called `qurt_exit()` from
+inside `halide_hexagon_allocate_dma_resource+0x64`, before any DMA
+descriptor or eDmaFmt_RawData call could be reached. Host-side
+return: `Error 0x4e ... Operation not permitted`.
+
+This means: **on a stock locked S22U with no testsig, Halide DMA is
+unreachable end-to-end**, regardless of frame format or byte payload.
+The answer to Stage 1's literal question ("does eDmaFmt_RawData accept
+non-camera bytes") is therefore "we can't reach that layer in this
+PD context." We hit a permissions wall earlier than expected.
+
+What this means for Mode C / Mode D strategy:
+
+  - Mode C via Halide-DMA streaming requires either (a) a signed PD
+    (testsig issued for the device or a dev-kit), or (b) a lower-level
+    DMA path that's allowed in unsigned PD (likely cmem-based
+    dmaWrapper rather than Halide's runtime), or (c) a non-DMA
+    streaming path (rpcmem + manual L2 prefetch + HVX dot-product
+    loops, which is what shannon-prime-hexagon already does today
+    via FastRPC for compress_f32_batch).
+  - Mode D (CV-ISP MFNR) requires Stage 1 to succeed first as the
+    foundation, AND adds a second permissions wall around CVP handle
+    creation. Likely also signed-PD-only.
+  - The cleanest near-term path is to STAY on the proven Mode C
+    rpcmem flow (already shipping) and use the signed-PD requirement
+    to gate when we re-introduce true UBWCDMA optimization.
+
+What did succeed:
+
+  - Full Windows build chain works (build-example.ps1 commit cc1364c)
+    without the Compute add-on, using vendored Halide mini_hexagon_dma.h
+    + thin compat shims for the missing SDK headers.
+  - libsp_dma_raw_skel.so loads and `remote_handle_open` succeeds on
+    the cDSP after we enable unsigned PD via remote_session_control.
+  - oemconfig.so built from SDK example sources, satisfies the
+    Halide-DMA runtime's OEM-config dependency.
+  - Host driver cleanly allocates rpcmem buffers (replaced the
+    SDK example's alloc_ion buffer_2d which fails on Android Q+
+    SELinux because /dev/dma_heap is gated for shell-user apps).
+  - FastRPC dispatched into our `sp_dma_raw_run` IDL method on the
+    DSP, where the failure occurred — meaning everything UP TO the
+    DMA engine allocation works.
+
+## Original layered context (pre-2026-05-01)
 
 Scaffold is committed and copied into the SDK example tree at
 `C:\Qualcomm\HALIDE_Tools\2.4.07\Halide\Examples\standalone\device\apps\sp_dma_raw\`.
