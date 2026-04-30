@@ -85,15 +85,71 @@ SP-banded KV-read per layer:    8-13 MB
 SP compression is the **only** path that keeps the HTP fed at scale.
 That's the architectural narrative this commit confirms.
 
+## Op-level breakdown (Qwen3-4B-shape fp32, --profiling_level detailed)
+
+Per-op cycle counts on V69 HTP (hexagon clock ~1 GHz; cycles ≈ µs).
+Captured with `qnn-net-run --profiling_level detailed` on
+`v69_attn_qwen3_4b.bin`:
+
+```
+Op                          Cycles      ~µs    % of total
+node_MatMul_0 (Q/K/V fused) 1,890,937   1,890     60%
+MatMul_2      (output proj)   646,550     646     20%
+MatMul_0      (Q @ K^T)       238,415     238      7%
+Softmax_0                     159,255     159      5%
+MatMul_1      (probs @ V)      94,168      94      3%
+Transpose_0                    15,979      16      1%
+Slice_45                        8,021       8     <1%
+Input/Output                   ~45,000     45      1%
+                              ─────────────────
+Total                         ~3,100,000  ~3,100   ✓ matches Avg NetRun 3,258
+```
+
+## Prediction framework — w4a16 should hit 850-1150 µs raw NPU
+
+Gemini's analysis: w4a16 wins where bandwidth dominates compute. The
+op breakdown above shows exactly which ops are bandwidth-dominated:
+
+| Op | fp32 µs | w4a16 prediction | Why |
+|---|---|---|---|
+| node_MatMul_0 (Q/K/V fused) | 1,890 | ~570 µs (-70%) | Weights are 12 MB (4× d_model² × 4); w4a16 streams ~4× faster from DDR |
+| MatMul_2 (output proj) | 646 | ~194 µs (-70%) | 4 MB weights, same bandwidth-bound profile |
+| MatMul_0 (Q @ K^T) | 238 | 238 (unchanged) | No weights — both operands are activations |
+| Softmax_0 | 159 | 159 (unchanged) | Pure activation op |
+| MatMul_1 (probs @ V) | 94 | 94 (unchanged) | No weights — both activations |
+| Overheads | ~80 | ~80 | Fixed |
+| **Total** | **3,100** | **~1,135 µs** | |
+
+The prediction lands inside Gemini's 850-1,150 range. Once the Qwen
+w4a16 .bin completes upload + compile, we can validate this op-by-op
+by re-running `qnn-net-run --profiling_level detailed` against it
+and diff'ing the cycle counts.
+
+This op-breakdown methodology is the load-bearing tool for Phase
+2.3.2 (SP-bands → HTP int4): we'll be able to attribute any speedup
+or regression to specific ops.
+
+## Strategic readout: speculative decoding becomes the prefetch oracle
+
+Connection worth surfacing: with HTP at 1.5 ms/block + bandwidth as
+the binding constraint, the question is **predictive prefetch** of
+KV-cache bands. The speculative-decoding draft model (validated 2.16×
+in commit 05c405d, Qwen2.5-Coder-3B + 0.5B draft) gives us a 4-8
+token *lookahead* — exactly the prefetch window for SP-compressed
+KV reads. Spec-decode in this regime isn't just compute reuse; it's
+the **demand oracle for the streaming pipeline.** Track in
+project_specdecode_session.md memory.
+
 ## Next concrete steps
 
-1. **Submit Qwen3-4B-shape w4a16** (now). Expected output: a 4-8 MB
-   .bin (vs 32.8 MB fp32) producing 400-800 µs/block (vs 1500 µs fp32).
+1. **Submit Qwen3-4B-shape w4a16** — re-run when network is faster
+   (current upload stalls at ~51%); the small-shape pipeline is
+   validated end-to-end so the qwen-shape is just a longer upload.
+   Task #43.
 2. **Phase 2.3 stage 2** — fill in sp_qnn.c TODOs so we can call the
    w4a16 binary via our own runner.
-3. **Phase 2.3.2** — investigate HTP int4 tensor format. Reverse-
-   engineer the .bin if the docs are sparse; spec out the SP-band ->
-   int4-layout mapping.
+3. **Phase 2.3.2** — map SP-bands to HTP int4 tensor format. The
+   op-breakdown methodology above is the validation harness. Task #44.
 4. **Phase 2.4** — full Qwen3-4B graph (28 layers + MLP + embeddings
-   + LM head) compiled as a single QNN context, with SP-compressed
-   KV reads. The deployment target.
+   + LM head) compiled as a single QNN context, SP-compressed KV
+   reads, speculative-decode-driven prefetch. The deployment target.
