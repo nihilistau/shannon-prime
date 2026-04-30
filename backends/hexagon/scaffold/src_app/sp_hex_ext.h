@@ -53,6 +53,14 @@ int sp_hex_disk_tier_proof(int head_dim);
 // any new IDL method goes on the bridge hot path.
 int sp_hex_compress_decompress_validate(int head_dim);
 
+// Path A.2 prototype — CPU benchmark of fused decompress-matmul vs vanilla
+// matmul. Validates the math + measures CPU-side perf so we know whether
+// CPU is fast enough or we need a cDSP-fused kernel.
+//   n_kv: number of K rows (e.g., 4096 for Dolphin n_ctx)
+//   hd:   head_dim, power of 2 in [8, 1024]
+//   n_q:  number of Q queries to dot against each K row
+int sp_hex_kq_matmul_bench(int n_kv, int hd, int n_q);
+
 #ifdef __cplusplus
 }
 #endif
