@@ -282,4 +282,80 @@ void sp_hex_vht2_f32_hvx_qf32(float *data, int n) {
     }
 }
 
+
+// ────────────────────────────────────────────────────────────────────
+// HVX fp32 dot product — sf×sf via qf32 intermediate.
+// ────────────────────────────────────────────────────────────────────
+//
+// Same numerical pattern as sp_hex_vht2_f32_hvx_qf32: convert sf→qf32
+// for arithmetic, qf32→sf for the final reduction, so the result is
+// bit-equivalent to scalar within fp32 epsilon × O(log N) accumulation
+// rounding (the qf32 boundary conversion overhead — ~3.8e-6 worst-abs
+// at head_dim=1024 per the 2026-04-29 measurements).
+//
+// Loop emits one HVX_Vector load + one fma per 32 fp32 elements. At
+// head_dim=128 that's 4 fmas + 1 horizontal reduce. The reduce uses
+// Q6_V_vror_VR to fold the 32-lane accumulator down to lane 0 in
+// log2(32) = 5 steps; faster than a scalar lane-extract loop and the
+// pattern matches what the SDK's HVX cookbook uses for fp32 reductions.
+//
+// Caller must hold qurt_hvx_lock(QURT_HVX_MODE_128B). a/b must be
+// 128-byte aligned; head_dim must be a multiple of 32 (the dispatcher
+// in sp_hex_imp.c takes the scalar path for hd<32).
+
+void sp_hex_dot_f32_hvx(const float *a, const float *b, int head_dim,
+                         float *out);
+
+void sp_hex_dot_f32_hvx(const float *a, const float *b, int head_dim,
+                         float *out) {
+    if (!a || !b || !out || head_dim < 32 || (head_dim & 31) != 0) {
+        // Fall through to scalar — should not be reached when caller
+        // gates on (head_dim & 31) == 0.
+        float s = 0.0f;
+        for (int i = 0; i < head_dim; ++i) s += a[i] * b[i];
+        *out = s;
+        return;
+    }
+
+    HVX_Vector zero_sf = Q6_V_vsplat_R(0);
+    // Initialise qf32 accumulator to qf32 zero via the documented
+    // sf→qf32 conversion (mixed-add by 0).
+    HVX_Vector acc_qf  = Q6_Vqf32_vadd_VsfVsf(zero_sf, zero_sf);
+
+    const HVX_Vector *va = (const HVX_Vector *)a;
+    const HVX_Vector *vb = (const HVX_Vector *)b;
+    const int n_vec = head_dim / 32;
+
+    for (int i = 0; i < n_vec; ++i) {
+        HVX_Vector a_sf = va[i];
+        HVX_Vector b_sf = vb[i];
+        // sf×sf → qf32. Q6_Vqf32_vmpy_VsfVsf is the "mixed multiply"
+        // path documented in the V69 ISA manual as numerically stable
+        // through chains of accumulation.
+        HVX_Vector prod_qf = Q6_Vqf32_vmpy_VsfVsf(a_sf, b_sf);
+        acc_qf = Q6_Vqf32_vadd_Vqf32Vqf32(acc_qf, prod_qf);
+    }
+
+    // qf32 → IEEE sf for the horizontal reduce.
+    HVX_Vector acc_sf = Q6_Vsf_equals_Vqf32(acc_qf);
+
+    // Horizontal reduce 32 fp32 lanes → lane 0 via butterfly.
+    // Each step rotates by N×4 bytes (= N lanes of fp32) and adds.
+    // Use Q6_V_vror_VR which takes a byte-rotation count in R.
+    // After log2(32)=5 steps, lane 0 holds the full sum.
+    for (int rot_lanes = 16; rot_lanes >= 1; rot_lanes >>= 1) {
+        HVX_Vector r = Q6_V_vror_VR(acc_sf, rot_lanes * 4);
+        // sf + sf → qf32 → sf (round-trip needed because there's no
+        // direct sf+sf→sf vector add on V69; the qf32 intermediate is
+        // the bit-equivalent path).
+        HVX_Vector sum_qf = Q6_Vqf32_vadd_VsfVsf(acc_sf, r);
+        acc_sf = Q6_Vsf_equals_Vqf32(sum_qf);
+    }
+
+    // Lane 0 holds the dot. Extract via aligned store + read.
+    float lanes[32] __attribute__((aligned(128)));
+    *(HVX_Vector *)lanes = acc_sf;
+    *out = lanes[0];
+}
+
 #endif  // __HVX__

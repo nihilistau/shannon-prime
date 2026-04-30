@@ -508,13 +508,161 @@ int sp_hex_decompress_f32_batch(remote_handle64 h,
 
 
 // ============================================================================
+// V-specific compress/decompress (1 band, 3 bits — different from K's 4-band
+// 5/5/4/3 config). The kernels are identical to the K path but use V's bc.
+// ============================================================================
+
+int sp_hex_compress_f32_v(remote_handle64 h,
+                           const float *in_vec, int in_len,
+                           int head_dim,
+                           unsigned char *out_packed, int out_capacity,
+                           int *packed_used) {
+    (void)h;
+    if (!packed_used) return -1;
+    *packed_used = 0;
+    if (in_len != head_dim) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    if (bc.total_bytes > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_v: packed=%d > capacity=%d",
+             bc.total_bytes, out_capacity);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+    memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+    sp_hex_vht2_f32(coeffs, head_dim);
+
+    // Use math core sp_band_quantize directly (takes bc), bypassing
+    // sp_hex_band_quantize_scalar which has K's config hard-coded via
+    // sp_hex_default_band_config. V's 1-band 3-bit config doesn't satisfy
+    // HVX preconditions (head_dim >= 128 && % 128 == 0) anyway, so
+    // scalar-only is fine here.
+    sp_band_quantize(coeffs, out_packed, &bc);
+    *packed_used = bc.total_bytes;
+    return 0;
+}
+
+int sp_hex_decompress_f32_v(remote_handle64 h,
+                             const unsigned char *packed_in, int packed_len,
+                             int head_dim, int max_bands,
+                             float *out_vec, int out_len) {
+    (void)h;
+    if (out_len != head_dim) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    if (packed_len < bc.total_bytes) {
+        FARF(ERROR, "[sp_hex] decompress_v: packed_len=%d < expected=%d",
+             packed_len, bc.total_bytes);
+        return -1;
+    }
+    float coeffs[1024] __attribute__((aligned(128)));
+    if (max_bands < 0 || max_bands >= bc.n_bands) {
+        sp_band_dequantize(packed_in, coeffs, &bc);
+    } else {
+        sp_band_dequantize_partial(packed_in, coeffs, &bc, max_bands);
+    }
+    sp_hex_vht2_f32(coeffs, head_dim);
+    memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+    return 0;
+}
+
+int sp_hex_compress_f32_v_batch(remote_handle64 h,
+                                 const float *in_vecs, int in_len,
+                                 int head_dim, int n_vectors,
+                                 unsigned char *out_packed, int out_capacity,
+                                 int *packed_used) {
+    (void)h;
+    if (!packed_used) return -1;
+    *packed_used = 0;
+    if (n_vectors <= 0) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+    if (in_len != n_vectors * head_dim) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    int per_vec_bytes = bc.total_bytes;
+    int total_needed = n_vectors * per_vec_bytes;
+    if (total_needed > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_v_batch: needed=%d > cap=%d",
+             total_needed, out_capacity);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+    for (int i = 0; i < n_vectors; ++i) {
+        const float *in_vec = in_vecs + (size_t)i * (size_t)head_dim;
+        unsigned char *out_slot = out_packed + (size_t)i * (size_t)per_vec_bytes;
+        memcpy(coeffs, in_vec, sizeof(float) * head_dim);
+        sp_hex_vht2_f32(coeffs, head_dim);
+
+        sp_band_quantize(coeffs, out_slot, &bc);
+    }
+    *packed_used = total_needed;
+    return 0;
+}
+
+int sp_hex_decompress_f32_v_batch(remote_handle64 h,
+                                   const unsigned char *packed_in, int packed_len,
+                                   int head_dim, int n_vectors, int max_bands,
+                                   float *out_vecs, int out_len) {
+    (void)h;
+    if (n_vectors <= 0) return -1;
+    if (head_dim < 8 || head_dim > 1024 || (head_dim & (head_dim - 1)) != 0) return -1;
+    if (out_len != n_vectors * head_dim) return -1;
+
+    sp_band_config_t bc;
+    int v_bits[1] = {3};
+    sp_band_config_init(&bc, head_dim, 1, v_bits);
+    int per_vec_bytes = bc.total_bytes;
+    if (packed_len != n_vectors * per_vec_bytes) {
+        FARF(ERROR, "[sp_hex] decompress_v_batch: packed_len=%d != n=%d * pv=%d",
+             packed_len, n_vectors, per_vec_bytes);
+        return -1;
+    }
+
+    float coeffs[1024] __attribute__((aligned(128)));
+    for (int i = 0; i < n_vectors; ++i) {
+        const unsigned char *in_slot = packed_in + (size_t)i * (size_t)per_vec_bytes;
+        float *out_vec = out_vecs + (size_t)i * (size_t)head_dim;
+
+        if (max_bands < 0 || max_bands >= bc.n_bands) {
+            sp_band_dequantize(in_slot, coeffs, &bc);
+        } else {
+            sp_band_dequantize_partial(in_slot, coeffs, &bc, max_bands);
+        }
+        sp_hex_vht2_f32(coeffs, head_dim);
+        memcpy(out_vec, coeffs, sizeof(float) * head_dim);
+    }
+    return 0;
+}
+
+// ============================================================================
 // kq_matmul_fused — Phase 1.6/1.7 harness intercept replacement.
 // ============================================================================
 //
-// Scalar reference. Once wired end-to-end and correctness-validated, this
-// gets replaced with a fused HVX kernel (compose existing HVX VHT2 with
-// new HVX dequant + HVX FMA dot). The IDL contract stays identical so
-// the custom op doesn't need to change when we drop in the HVX kernel.
+// HVX-accelerated path on V69+. Composes:
+//   1. scalar band_dequantize (small per-row work — n_kv decompresses)
+//   2. HVX qf32 VHT2 forward (self-inverse) — sp_hex_vht2_f32_hvx_qf32
+//   3. HVX qf32 dot product — sp_hex_dot_f32_hvx
+//
+// The hot loop is dot product (n_kv × n_q operations vs n_kv decompresses).
+// HVX runs 32 fp32 lanes per cycle; at head_dim=128 that's 4 fmas + a
+// butterfly reduce per dot. The decompressed K row is reused across all
+// Q heads — the "fused" in the name.
+
+#ifdef __HVX__
+extern void sp_hex_vht2_f32_hvx_qf32(float *data, int n);
+extern void sp_hex_dot_f32_hvx(const float *a, const float *b, int head_dim,
+                                float *out);
+#endif
 
 int sp_hex_kq_matmul_fused(remote_handle64 h,
                             const float *q_vec, int q_len,
@@ -553,13 +701,25 @@ int sp_hex_kq_matmul_fused(remote_handle64 h,
         return -1;
     }
 
-    // Per-row scratch — VTCM-resident in the HVX upgrade. Stack for now.
+    // Per-row scratch — 128-byte aligned for HVX vmem loads.
     float k_row[1024] __attribute__((aligned(128)));
+    float q_aligned_buf[1024] __attribute__((aligned(128)));
+
+#ifdef __HVX__
+    // HVX requires per-thread lock. FastRPC dispatchers can rotate methods
+    // across worker threads, so locking in sp_hex_open doesn't reliably
+    // carry. Lock here per call. Failure means HVX is unavailable; we
+    // fall back to scalar so the math is still right.
+    const int hvx_ok = (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0);
+    const int hd_vec_ok = (head_dim >= 32) && ((head_dim & 31) == 0);
+    const int q_aligned = ((((uintptr_t)q_vec) & 127) == 0);
+#else
+    const int hvx_ok = 0;
+    const int hd_vec_ok = 0;
+    const int q_aligned = 0;
+#endif
 
     // kv outer, q inner — reuses decompressed K row across all Q heads.
-    // That's the whole reason for "fused" in the name. A naive bulk
-    // dequant + bulk dot would ship 4x more bytes back to ARM and lose
-    // VTCM cache locality on the HVX upgrade.
     for (int kv = 0; kv < n_kv; ++kv) {
         const unsigned char *packed = k_packed + (size_t)kv * (size_t)per_pos_bytes;
 
@@ -567,20 +727,46 @@ int sp_hex_kq_matmul_fused(remote_handle64 h,
                                                 /*max_bands=*/-1, k_row);
         if (rc != 0) {
             FARF(ERROR, "[sp_hex] kq_fused: dequant rc=%d kv=%d", rc, kv);
+#ifdef __HVX__
+            if (hvx_ok) qurt_hvx_unlock();
+#endif
             return rc;
         }
-        sp_hex_vht2_f32(k_row, head_dim);  // self-inverse — HVX path
-                                            // engages internally on V69+
+
+#ifdef __HVX__
+        if (hvx_ok && hd_vec_ok) {
+            sp_hex_vht2_f32_hvx_qf32(k_row, head_dim);
+        } else
+#endif
+        {
+            sp_hex_vht2_f32(k_row, head_dim);
+        }
 
         for (int q = 0; q < n_q; ++q) {
             const float *q_row = q_vec + (size_t)q * (size_t)head_dim;
             float dot = 0.0f;
-            for (int i = 0; i < head_dim; ++i) {
-                dot += q_row[i] * k_row[i];
+#ifdef __HVX__
+            if (hvx_ok && hd_vec_ok) {
+                const float *q_in = q_row;
+                if (!q_aligned) {
+                    memcpy(q_aligned_buf, q_row, sizeof(float) * head_dim);
+                    q_in = q_aligned_buf;
+                }
+                sp_hex_dot_f32_hvx(q_in, k_row, head_dim, &dot);
+            } else
+#endif
+            {
+                for (int i = 0; i < head_dim; ++i) {
+                    dot += q_row[i] * k_row[i];
+                }
             }
             kq_scores[(size_t)kv * (size_t)n_q + (size_t)q] = dot;
         }
     }
 
+#ifdef __HVX__
+    if (hvx_ok) qurt_hvx_unlock();
+#endif
     return 0;
+}
 }
