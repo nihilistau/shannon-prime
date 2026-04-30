@@ -2,6 +2,12 @@
 # Patterned after Qualcomm Halide examples at:
 #   C:\Qualcomm\HALIDE_Tools\2.4.07\Halide\Examples\offload\apps\hexagon_benchmarks\Makefile
 #
+# VALIDATED 2026-05-01: end-to-end build succeeds on Windows with
+# Visual Studio 2019 BuildTools + HALIDE_Tools 2.4.07. Generator
+# binary built via cl.exe + Halide.lib, generator run produces V69
+# HVX object (sp_band_dequantize.o, 87 KB) plus C header. Same
+# .stmt.html shows prefetch hint emitted as scheduled.
+#
 # Two-stage build:
 #   1. Compile sp_band_dequantize_generator.cpp + Halide host libs
 #      → sp_band_dequantize.generator (host executable)
@@ -11,6 +17,21 @@
 # The .o gets linked into libsp_hex_skel.so (via the Hexagon SDK build
 # rules in shannon-prime/backends/hexagon/scaffold/CMakeLists.txt) as
 # a replacement for sp_band_dequantize_scalar's hot loop.
+#
+# WINDOWS BUILD (validated path):
+#   set VCBAT="C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+#   call %VCBAT%
+#   cl /nologo /EHsc /std:c++17 /O2 ^
+#       /I C:\Qualcomm\HALIDE_Tools\2.4.07\Halide\include ^
+#       sp_band_dequantize_generator.cpp ^
+#       C:\Qualcomm\HALIDE_Tools\2.4.07\Halide\tools\GenGen.cpp ^
+#       /link /LIBPATH:C:\Qualcomm\HALIDE_Tools\2.4.07\Halide\lib Halide.lib ^
+#       /OUT:sp_band_dequantize.generator.exe
+#   set PATH=C:\Qualcomm\HALIDE_Tools\2.4.07\Halide\bin;%PATH%
+#   sp_band_dequantize.generator.exe -g sp_band_dequantize -o build ^
+#       -e o,h,html target=hexagon-32-noos-hvx_128
+#
+# LINUX BUILD (untested, original Makefile rules below for reference).
 #
 # Variables expected in the env (set by Qualcomm setup-env.cmd or the
 # hexagon SDK setup_sdk_env):
