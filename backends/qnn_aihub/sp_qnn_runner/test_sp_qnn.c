@@ -85,6 +85,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "  avg:        %" PRIu64 " us\n", br.avg_us);
         fprintf(stderr, "  max:        %" PRIu64 " us\n", br.max_us);
         fprintf(stderr, "  reference (qnn-net-run Phase 2.2 min): 1916 us\n");
+
+        /* Phase 2.4 budget check: how many calls/sec does this shape
+         * sustain? At 1.5 ms steady state, 28 layers per token,
+         * we need >=28 calls / desired-tok-period. */
+        double avg_s   = br.avg_us / 1e6;
+        double rate    = 1.0 / avg_s;
+        double tok_28l = rate / 28.0;   /* if dispatching all 28 layers
+                                           sequentially through the shim */
+        double tok_1   = rate;          /* if the .bin is the full layer */
+        fprintf(stderr, "\n=== Phase 2.4 budget projection ===\n");
+        fprintf(stderr, "  sustained calls/sec:        %.0f\n", rate);
+        fprintf(stderr, "  tok/sec @ 28 layers/call:   %.1f  (current .bin is 1 attn block)\n", tok_28l);
+        fprintf(stderr, "  tok/sec @ 1 layer/call:     %.1f  (if full graph compiled)\n", tok_1);
+        fprintf(stderr, "  fp32 -> w4a16 prediction:   %.1f -> %.1f tok/sec @ 28 layers\n",
+                tok_28l, tok_28l * (1500.0 / 800.0));  /* ~1.9x speedup */
     }
 
     free(in_buf);
