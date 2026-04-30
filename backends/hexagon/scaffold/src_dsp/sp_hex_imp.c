@@ -643,3 +643,129 @@ int sp_hex_decompress_f32_v_batch(remote_handle64 h,
     }
     return 0;
 }
+
+// ============================================================================
+// kq_matmul_fused — Phase 1.6/1.7 harness intercept replacement.
+// ============================================================================
+//
+// HVX-accelerated path on V69+. Composes:
+//   1. scalar band_dequantize (small per-row work — n_kv decompresses)
+//   2. HVX qf32 VHT2 forward (self-inverse) — sp_hex_vht2_f32_hvx_qf32
+//   3. HVX qf32 dot product — sp_hex_dot_f32_hvx
+//
+// The hot loop is dot product (n_kv × n_q operations vs n_kv decompresses).
+// HVX runs 32 fp32 lanes per cycle; at head_dim=128 that's 4 fmas + a
+// butterfly reduce per dot. The decompressed K row is reused across all
+// Q heads — the "fused" in the name.
+
+#ifdef __HVX__
+extern void sp_hex_vht2_f32_hvx_qf32(float *data, int n);
+extern void sp_hex_dot_f32_hvx(const float *a, const float *b, int head_dim,
+                                float *out);
+#endif
+
+int sp_hex_kq_matmul_fused(remote_handle64 h,
+                            const float *q_vec, int q_len,
+                            const unsigned char *k_packed, int packed_len,
+                            int head_dim, int n_kv, int n_q,
+                            float *kq_scores, int kq_len) {
+    (void)h;
+
+    if (head_dim < 8 || head_dim > 1024 ||
+        (head_dim & (head_dim - 1)) != 0) {
+        FARF(ERROR, "[sp_hex] kq_fused: bad head_dim=%d", head_dim);
+        return -1;
+    }
+    if (n_kv <= 0 || n_q <= 0) {
+        FARF(ERROR, "[sp_hex] kq_fused: bad n_kv=%d n_q=%d", n_kv, n_q);
+        return -1;
+    }
+    if (q_len != n_q * head_dim) {
+        FARF(ERROR, "[sp_hex] kq_fused: q_len=%d != n_q=%d * hd=%d",
+             q_len, n_q, head_dim);
+        return -1;
+    }
+    if (kq_len != n_kv * n_q) {
+        FARF(ERROR, "[sp_hex] kq_fused: kq_len=%d != n_kv=%d * n_q=%d",
+             kq_len, n_kv, n_q);
+        return -1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    int per_pos_bytes = bc.total_bytes;
+    if (packed_len != n_kv * per_pos_bytes) {
+        FARF(ERROR, "[sp_hex] kq_fused: packed_len=%d != n_kv=%d * pp=%d",
+             packed_len, n_kv, per_pos_bytes);
+        return -1;
+    }
+
+    // Per-row scratch — 128-byte aligned for HVX vmem loads.
+    float k_row[1024] __attribute__((aligned(128)));
+    float q_aligned_buf[1024] __attribute__((aligned(128)));
+
+#ifdef __HVX__
+    // HVX requires per-thread lock. FastRPC dispatchers can rotate methods
+    // across worker threads, so locking in sp_hex_open doesn't reliably
+    // carry. Lock here per call. Failure means HVX is unavailable; we
+    // fall back to scalar so the math is still right.
+    const int hvx_ok = (qurt_hvx_lock(QURT_HVX_MODE_128B) == 0);
+    const int hd_vec_ok = (head_dim >= 32) && ((head_dim & 31) == 0);
+    const int q_aligned = ((((uintptr_t)q_vec) & 127) == 0);
+#else
+    const int hvx_ok = 0;
+    const int hd_vec_ok = 0;
+    const int q_aligned = 0;
+#endif
+
+    // kv outer, q inner — reuses decompressed K row across all Q heads.
+    for (int kv = 0; kv < n_kv; ++kv) {
+        const unsigned char *packed = k_packed + (size_t)kv * (size_t)per_pos_bytes;
+
+        int rc = sp_hex_band_dequantize_scalar(packed, per_pos_bytes, head_dim,
+                                                /*max_bands=*/-1, k_row);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] kq_fused: dequant rc=%d kv=%d", rc, kv);
+#ifdef __HVX__
+            if (hvx_ok) qurt_hvx_unlock();
+#endif
+            return rc;
+        }
+
+#ifdef __HVX__
+        if (hvx_ok && hd_vec_ok) {
+            sp_hex_vht2_f32_hvx_qf32(k_row, head_dim);
+        } else
+#endif
+        {
+            sp_hex_vht2_f32(k_row, head_dim);
+        }
+
+        for (int q = 0; q < n_q; ++q) {
+            const float *q_row = q_vec + (size_t)q * (size_t)head_dim;
+            float dot = 0.0f;
+#ifdef __HVX__
+            if (hvx_ok && hd_vec_ok) {
+                const float *q_in = q_row;
+                if (!q_aligned) {
+                    memcpy(q_aligned_buf, q_row, sizeof(float) * head_dim);
+                    q_in = q_aligned_buf;
+                }
+                sp_hex_dot_f32_hvx(q_in, k_row, head_dim, &dot);
+            } else
+#endif
+            {
+                for (int i = 0; i < head_dim; ++i) {
+                    dot += q_row[i] * k_row[i];
+                }
+            }
+            kq_scores[(size_t)kv * (size_t)n_q + (size_t)q] = dot;
+        }
+    }
+
+#ifdef __HVX__
+    if (hvx_ok) qurt_hvx_unlock();
+#endif
+    return 0;
+}

@@ -834,3 +834,4 @@ int sp_hex_kq_matmul_bench(int n_kv, int hd, int n_q) {
     free(K_orig); free(Q); free(KQ_ref); free(KQ_sp); free(K_packed);
     return 0;
 }
+

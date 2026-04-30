@@ -107,7 +107,6 @@ int main(int argc, char *argv[]) {
         printf("ERROR: kq_matmul_bench failed (err=%d)\n", kqErr);
         // non-fatal — print and continue
     }
-
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }
