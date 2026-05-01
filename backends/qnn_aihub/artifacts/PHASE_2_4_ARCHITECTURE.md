@@ -68,25 +68,57 @@ resulting V73-targeted .bins on our V69 device, this validates:
 
 ### Stage 2.4a-ii: retarget to Samsung Galaxy S22 Ultra 5G
 
-Modify the export driver to use our device. Concrete change:
+**Strategic clarification (2026-05-01)**: The `qai-hub-models` LLM export
+declares `VALID_TARGET_RUNTIMES = Literal[TargetRuntime.GENIE]` — but
+this is a Python type-hint only, NOT an API constraint. Inspection of
+`models/common.py` confirms:
 
-```python
-# In qwen3_4b/export.py:
-# Change DEFAULT_EXPORT_DEVICE = "Snapdragon 8 Elite QRD"
-# To:    DEFAULT_EXPORT_DEVICE = "Samsung Galaxy S22 Ultra 5G"
+```
+class TargetRuntime(Enum):
+    TFLITE              = "tflite"
+    QNN_DLC             = "qnn_dlc"
+    QNN_CONTEXT_BINARY  = "qnn_context_binary"  ← what we want
+    ...
+    GENIE               = "genie"
 ```
 
-Risk: AI Hub may reject — Qwen3-4B w4a16 is documented as Genie-only,
-and Genie pre-built artifacts target V73+. The compile job itself may
-fail because the QNN HTP V69 backend lacks an op or precision support
-needed by Qwen3-4B's shape.
+`hub.submit_compile_job(target=TargetRuntime.QNN_CONTEXT_BINARY)` is
+the unrestricted API path. The Genie wrapper is what produces the
+Qualcomm-managed deployment artifacts (with their own runtime); the
+underlying QNN context binaries are independent of that.
 
-If it fails, we have two fallbacks:
+**The path: hijack the export pipeline at the final compile step.**
+
+qai-hub-models gives us for free:
+  - PyTorch checkpoint download (Qwen3-4B from HuggingFace)
+  - Tokenizer + position processor
+  - LLM-aware ONNX export (split into 4 PP + 4 TG ONNXes)
+  - AIMET-based w4a16 quantization with calibration data
+  - Per-split context-graph naming convention
+
+We substitute at the final step:
+  - Their default: `submit_compile_job(target=GENIE, device=8 Elite QRD)`
+  - Ours:         `submit_compile_job(target=QNN_CONTEXT_BINARY, device=S22 Ultra 5G)`
+
+Two implementation paths:
+  (A) **Subclass / fork** `_shared/llm/export.py:export_main` —
+      copy ~60 lines, change the target+device. Self-contained.
+  (B) **Lower-level orchestration** — call the underlying ONNX-build
+      and submit functions directly, skipping the wrapper entirely.
+      More code but more control (e.g., we could use our own
+      submit_w4a16.py / submit_qwen_shape.py harness).
+
+Path (A) is faster to first .bin. Path (B) is cleaner for shannon-prime-
+llama integration. Recommend (A) for stage 2.4a-ii, then refactor to
+(B) as we land Phase 2.4c.
+
+Risk: V69 may lack op coverage for Qwen3-4B shape. Mitigations:
   1. Try `Precision.w8a16` instead of w4a16 (broader op support)
-  2. Try a smaller variant — `qwen2_5_7b_instruct` may have laxer
-     V69 support since it's an older arch
-  3. Compile against `qwen2_5_3b` if available — closer to our existing
-     Qwen2.5-Coder-3B baseline, easier perf comparison
+  2. Try a smaller variant — `llama_v3_2_1b_instruct` (1B params,
+     simpler arch) is on the qai-hub-models list and gives a faster
+     iteration loop
+  3. Compile against `qwen2_5_7b_instruct` (older arch, well-trodden
+     V69 path)
 
 ### Stage 2.4a-iii: run the splits via sp_qnn shim
 
