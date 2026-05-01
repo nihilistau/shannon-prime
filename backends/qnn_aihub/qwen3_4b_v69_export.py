@@ -80,6 +80,19 @@ from qai_hub_models.models.qwen3_4b.model import (
     NUM_SPLITS,
 )
 
+# NOTE 2026-05-01: the QNN_CONTEXT_BINARY override below DOES NOT WORK.
+# qai_hub_models has GENIE hardcoded in multiple places beyond the
+# argparse layer (LLM_AIMETOnnx.get_hub_compile_options raises RuntimeError,
+# export.py declares VALID_TARGET_RUNTIMES = Literal[TargetRuntime.GENIE],
+# prepare_genie_assets is the bundling step). A partial run on this script
+# crashed at submit_compile_job with:
+#   RuntimeError: Unsupported target_runtime provided: TargetRuntime.QNN_CONTEXT_BINARY.
+#   Only Genie runtime is supported.
+# Cache state preserved at /home/claude/.qaihm/.../qwen34_w4a16_adascale/
+# (PP ONNX, model.data, encodings) — not lost.
+# Strategy needs rethinking before next run; the dict-override hijack is
+# too shallow.
+
 
 # === The two strategic overrides ==========================================
 
