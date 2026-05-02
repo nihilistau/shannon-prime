@@ -445,20 +445,39 @@ static uint32_t dtype_bytes(Qnn_DataType_t dt) {
     }
 }
 
-/* Cache one tensor template into our flat sp_qnn_tensor_info struct. */
+/* Cache one tensor template into our flat sp_qnn_tensor_info struct.
+ * Includes quantization params for SCALE_OFFSET encoded tensors —
+ * critical for UFIXED_POINT_16 (dtype 1046) tensors which AI Hub
+ * exports use for activations. Without these, the host can't encode
+ * inputs (mask, cos/sin, embeddings) into the .bin's expected format. */
 static void cache_tensor_info(const Qnn_Tensor_t *t, sp_qnn_tensor_info *out) {
+    Qnn_QuantizeParams_t qp;
     if (t->version == QNN_TENSOR_VERSION_1) {
         out->name              = t->v1.name;
         out->rank              = t->v1.rank;
         out->dims              = t->v1.dimensions;
         out->dtype             = (uint32_t)t->v1.dataType;
         out->bytes_per_element = dtype_bytes(t->v1.dataType);
+        qp                     = t->v1.quantizeParams;
     } else {
         out->name              = t->v2.name;
         out->rank              = t->v2.rank;
         out->dims              = t->v2.dimensions;
         out->dtype             = (uint32_t)t->v2.dataType;
         out->bytes_per_element = dtype_bytes(t->v2.dataType);
+        qp                     = t->v2.quantizeParams;
+    }
+    /* Default: not quantized. */
+    out->quant_encoding   = (uint32_t)qp.quantizationEncoding;
+    out->quant_scale      = 1.0f;
+    out->quant_offset     = 0;
+    if (qp.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
+        out->quant_scale  = qp.scaleOffsetEncoding.scale;
+        out->quant_offset = qp.scaleOffsetEncoding.offset;
+    } else if (qp.quantizationEncoding ==
+               QNN_QUANTIZATION_ENCODING_BW_SCALE_OFFSET) {
+        out->quant_scale  = qp.bwScaleOffsetEncoding.scale;
+        out->quant_offset = qp.bwScaleOffsetEncoding.offset;
     }
 }
 
