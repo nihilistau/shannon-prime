@@ -1,0 +1,66 @@
+{
+  "dialog": {
+    "version": 1,
+    "type": "basic",
+    "max-num-tokens": 64,
+    "context": {
+      "version": 1,
+      "size": 2048,
+      "n-vocab": 151936,
+      "bos-token": 151643,
+      "eos-token": [
+        151645
+      ],
+      "pad-token": 151643
+    },
+    "sampler": {
+      "version": 1,
+      "seed": 42,
+      "temp": 0.0,
+      "top-k": 1,
+      "top-p": 0.0
+    },
+    "tokenizer": {
+      "version": 1,
+      "path": "tokenizer.json"
+    },
+    "engine": {
+      "version": 1,
+      "n-threads": 3,
+      "backend": {
+        "version": 1,
+        "type": "QnnHtp",
+        "QnnHtp": {
+          "version": 1,
+          "spill-fill-bufsize": 0,
+          "use-mmap": true,
+          "mmap-budget": 1500,
+          "poll": false,
+          "cpu-mask": "0xe0",
+          "kv-dim": 128,
+          "allow-async-init": false,
+          "enable-graph-switching": true
+        },
+        "extensions": "htp_backend_ext_config.json"
+      },
+      "model": {
+        "version": 1,
+        "type": "binary",
+        "positional-encoding": {
+          "type": "rope",
+          "rope-dim": 64,
+          "rope-theta": 1000000
+        },
+        "binary": {
+          "version": 1,
+          "ctx-bins": [
+            "qwen3_4b_1_of_4.bin",
+            "qwen3_4b_2_of_4.bin",
+            "qwen3_4b_3_of_4.bin",
+            "qwen3_4b_4_of_4.bin"
+          ]
+        }
+      }
+    }
+  }
+}
