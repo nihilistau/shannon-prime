@@ -77,6 +77,36 @@ int sp_llama_qnn_kq_dispatch(sp_llama_qnn_kq_cache *cache,
                              void *attn_out,     size_t out_bytes,
                              uint64_t *exec_us);
 
+/* ─────────────────────────────────────────────────────────────────
+ * Plain matmul dispatch (no softmax fusion).
+ *
+ * Used by shannon-prime-engine's forward_native path, which does its
+ * own scale + causal-mask + softmax in CPU between the K@Q^T matmul
+ * and the V·attn matmul. The KQ+Softmax-fused variant above doesn't
+ * fit because the scale/mask need to happen between matmul and
+ * softmax.
+ *
+ * Computes C[M, N] = A[M, K] @ B[K, N]   (plain matmul, no transpose).
+ *
+ * Caller is responsible for any transpose (e.g. for KQ matmul where
+ * K_full is naturally [N_kv, head_dim], the caller transposes to
+ * [head_dim, N_kv] before passing as B). Cheap on CPU at typical
+ * head_dim × N_kv sizes.
+ *
+ * Same lazy graphFinalize-per-shape pattern as the kq_softmax cache.
+ * ───────────────────────────────────────────────────────────────── */
+typedef struct sp_llama_qnn_matmul_cache sp_llama_qnn_matmul_cache;
+
+sp_llama_qnn_matmul_cache *sp_llama_qnn_matmul_cache_create(void);
+void                       sp_llama_qnn_matmul_cache_destroy(sp_llama_qnn_matmul_cache **c);
+
+int sp_llama_qnn_matmul_dispatch(sp_llama_qnn_matmul_cache *cache,
+                                 uint32_t M, uint32_t K, uint32_t N,
+                                 const void *a_data, size_t a_bytes,    /* [M, K] fp16 */
+                                 const void *b_data, size_t b_bytes,    /* [K, N] fp16 */
+                                 void       *c_data, size_t c_bytes,    /* [M, N] fp16 */
+                                 uint64_t   *exec_us);
+
 #ifdef __cplusplus
 }
 #endif

@@ -185,3 +185,121 @@ int sp_llama_qnn_kq_dispatch(sp_llama_qnn_kq_cache *cache,
     pthread_mutex_unlock(&cache->mu);
     return (rc == SP_QNN_OK) ? 0 : -3;
 }
+
+/* ─────────────────────────────────────────────────────────────────
+ * Plain matmul cache + dispatch (no softmax fusion).
+ *
+ * Matches sp_qnn_runtime_matmul_create's graph:
+ *   C[M, N] = A[M, K] @ B[K, N]
+ *
+ * Used by shannon-prime-engine's forward_native_attention to dispatch
+ * the per-head Q@K^T matmul: caller transposes K_full from
+ * [N_kv, head_dim] to [head_dim, N_kv] before passing as B, since the
+ * QNN graph is plain MatMul with no transpose params.
+ *
+ * Same lazy graphFinalize-per-shape model as the kq_softmax cache;
+ * separate so the two coexist without one shape evicting the other.
+ * ──────────────────────────────────────────────────────────────── */
+
+#define SP_LLAMA_QNN_MM_CACHE_MAX 64
+
+typedef struct {
+    uint32_t       M, K, N;
+    sp_qnn_handle *h;
+} mm_slot_t;
+
+struct sp_llama_qnn_matmul_cache {
+    mm_slot_t       slots[SP_LLAMA_QNN_MM_CACHE_MAX];
+    int             n_slots;
+    pthread_mutex_t mu;
+    int             qnn_init_done;
+};
+
+sp_llama_qnn_matmul_cache *sp_llama_qnn_matmul_cache_create(void) {
+    sp_llama_qnn_matmul_cache *c = calloc(1, sizeof(*c));
+    if (!c) return NULL;
+    pthread_mutex_init(&c->mu, NULL);
+    return c;
+}
+
+void sp_llama_qnn_matmul_cache_destroy(sp_llama_qnn_matmul_cache **c_io) {
+    if (!c_io || !*c_io) return;
+    sp_llama_qnn_matmul_cache *c = *c_io;
+    pthread_mutex_lock(&c->mu);
+    for (int i = 0; i < c->n_slots; ++i) {
+        if (c->slots[i].h) sp_qnn_destroy(&c->slots[i].h);
+    }
+    pthread_mutex_unlock(&c->mu);
+    pthread_mutex_destroy(&c->mu);
+    if (c->qnn_init_done) sp_qnn_shutdown();
+    free(c);
+    *c_io = NULL;
+}
+
+static mm_slot_t *find_or_create_mm_slot(sp_llama_qnn_matmul_cache *c,
+                                          uint32_t M, uint32_t K, uint32_t N) {
+    for (int i = 0; i < c->n_slots; ++i) {
+        if (c->slots[i].M == M && c->slots[i].K == K && c->slots[i].N == N) {
+            return &c->slots[i];
+        }
+    }
+    if (c->n_slots >= SP_LLAMA_QNN_MM_CACHE_MAX) {
+        fprintf(stderr, "[sp_llama_qnn] matmul cache full at %d shapes\n", c->n_slots);
+        return NULL;
+    }
+    if (!c->qnn_init_done) {
+        if (sp_qnn_init(NULL, NULL) != SP_QNN_OK) {
+            fprintf(stderr, "[sp_llama_qnn] sp_qnn_init failed\n");
+            return NULL;
+        }
+        c->qnn_init_done = 1;
+    }
+
+    mm_slot_t *s = &c->slots[c->n_slots];
+    s->M = M; s->K = K; s->N = N; s->h = NULL;
+
+    fprintf(stderr,
+        "[sp_llama_qnn] new matmul shape: A[%u,%u] @ B[%u,%u] -> C[%u,%u] "
+        "(graphFinalize ~50ms)\n", M, K, K, N, M, N);
+    if (sp_qnn_runtime_matmul_create(M, K, N, QNN_DATATYPE_FLOAT_16,
+                                     &s->h) != SP_QNN_OK) {
+        fprintf(stderr, "[sp_llama_qnn] matmul_create failed for shape\n");
+        return NULL;
+    }
+    c->n_slots++;
+    return s;
+}
+
+int sp_llama_qnn_matmul_dispatch(sp_llama_qnn_matmul_cache *cache,
+                                  uint32_t M, uint32_t K, uint32_t N,
+                                  const void *a_data, size_t a_bytes,
+                                  const void *b_data, size_t b_bytes,
+                                  void       *c_data, size_t c_bytes,
+                                  uint64_t   *exec_us) {
+    if (!cache || !a_data || !b_data || !c_data) return -1;
+
+    static int s_first_dispatch_logged = 0;
+    if (!s_first_dispatch_logged) {
+        s_first_dispatch_logged = 1;
+        fprintf(stderr,
+            "[sp_llama_qnn] FIRST MATMUL DISPATCH: M=%u K=%u N=%u\n", M, K, N);
+    }
+
+    pthread_mutex_lock(&cache->mu);
+    mm_slot_t *s = find_or_create_mm_slot(cache, M, K, N);
+    if (!s) { pthread_mutex_unlock(&cache->mu); return -2; }
+
+    /* Per-call: rebind A and B with caller buffers. No persistence
+     * (yet) — matmul A and B both change per call in the typical use
+     * case (different Q each step, different K rows after KV append).
+     * If a future use case has a stable B matrix, sp_qnn_alloc_persistent
+     * can be added here mirroring the kq cache pattern. */
+    const void  *ins[]   = { a_data, b_data };
+    const size_t in_sz[] = { a_bytes, b_bytes };
+    void        *outs[]   = { c_data };
+    const size_t out_sz[] = { c_bytes };
+
+    sp_qnn_status rc = sp_qnn_execute(s->h, ins, in_sz, outs, out_sz, exec_us);
+    pthread_mutex_unlock(&cache->mu);
+    return (rc == SP_QNN_OK) ? 0 : -3;
+}
