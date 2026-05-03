@@ -445,20 +445,39 @@ static uint32_t dtype_bytes(Qnn_DataType_t dt) {
     }
 }
 
-/* Cache one tensor template into our flat sp_qnn_tensor_info struct. */
+/* Cache one tensor template into our flat sp_qnn_tensor_info struct.
+ * Includes quantization params for SCALE_OFFSET encoded tensors —
+ * critical for UFIXED_POINT_16 (dtype 1046) tensors which AI Hub
+ * exports use for activations. Without these, the host can't encode
+ * inputs (mask, cos/sin, embeddings) into the .bin's expected format. */
 static void cache_tensor_info(const Qnn_Tensor_t *t, sp_qnn_tensor_info *out) {
+    Qnn_QuantizeParams_t qp;
     if (t->version == QNN_TENSOR_VERSION_1) {
         out->name              = t->v1.name;
         out->rank              = t->v1.rank;
         out->dims              = t->v1.dimensions;
         out->dtype             = (uint32_t)t->v1.dataType;
         out->bytes_per_element = dtype_bytes(t->v1.dataType);
+        qp                     = t->v1.quantizeParams;
     } else {
         out->name              = t->v2.name;
         out->rank              = t->v2.rank;
         out->dims              = t->v2.dimensions;
         out->dtype             = (uint32_t)t->v2.dataType;
         out->bytes_per_element = dtype_bytes(t->v2.dataType);
+        qp                     = t->v2.quantizeParams;
+    }
+    /* Default: not quantized. */
+    out->quant_encoding   = (uint32_t)qp.quantizationEncoding;
+    out->quant_scale      = 1.0f;
+    out->quant_offset     = 0;
+    if (qp.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET) {
+        out->quant_scale  = qp.scaleOffsetEncoding.scale;
+        out->quant_offset = qp.scaleOffsetEncoding.offset;
+    } else if (qp.quantizationEncoding ==
+               QNN_QUANTIZATION_ENCODING_BW_SCALE_OFFSET) {
+        out->quant_scale  = qp.bwScaleOffsetEncoding.scale;
+        out->quant_offset = qp.bwScaleOffsetEncoding.offset;
     }
 }
 
@@ -1107,8 +1126,22 @@ sp_qnn_status sp_qnn_runtime_matmul_create(uint32_t M, uint32_t K, uint32_t N,
     /* Dim arrays — leak intentionally on this prototype path. Persistent
      * for the lifetime of the handle (no destroy support yet for runtime
      * graphs; that's fine for the bench harness). bin_data stays NULL so
-     * unmap_file in destroy is a no-op. */
-    static uint32_t dim_storage[6];
+     * unmap_file in destroy is a no-op.
+     *
+     * Per-handle allocation (was: `static uint32_t dim_storage[6];` —
+     * which silently aliased dim metadata across every graph this
+     * function created. Single-shape sessions worked; multi-shape
+     * sessions saw graphExecute fail with QNN_GRAPH_ERROR_INVALID_TENSOR
+     * (0x1774) on every prior graph as soon as a new graph clobbered
+     * dim_storage. Engine forward path triggers this because both KQ
+     * and the dense weight matmuls hit this path with different
+     * (M, K, N) tuples). */
+    uint32_t *dim_storage = (uint32_t *)calloc(6, sizeof(uint32_t));
+    if (!dim_storage) {
+        fprintf(stderr, "[sp_qnn] dim_storage alloc failed\n");
+        sp_qnn_destroy(&h);
+        return SP_QNN_ERR_INVALID;
+    }
     uint32_t *dims_a = &dim_storage[0]; dims_a[0] = M; dims_a[1] = K;
     uint32_t *dims_b = &dim_storage[2]; dims_b[0] = K; dims_b[1] = N;
     uint32_t *dims_c = &dim_storage[4]; dims_c[0] = M; dims_c[1] = N;
@@ -1218,7 +1251,16 @@ sp_qnn_status sp_qnn_runtime_kq_softmax_create(uint32_t M_q,
     Qnn_Tensor_t mid_kq_logits;
     memset(&mid_kq_logits, 0, sizeof(mid_kq_logits));
 
-    static uint32_t kq_dims[8];
+    /* Per-handle dim allocation — same fix as sp_qnn_runtime_matmul_create
+     * above. Static was a single-shape-session shortcut; multi-shape
+     * sessions would alias dims across graphs and trip
+     * QNN_GRAPH_ERROR_INVALID_TENSOR (0x1774) at execute time. */
+    uint32_t *kq_dims = (uint32_t *)calloc(8, sizeof(uint32_t));
+    if (!kq_dims) {
+        fprintf(stderr, "[sp_qnn] kq_dims alloc failed\n");
+        sp_qnn_destroy(&h);
+        return SP_QNN_ERR_INVALID;
+    }
     uint32_t *dims_q   = &kq_dims[0]; dims_q[0]   = M_q;  dims_q[1]   = K_dim;
     uint32_t *dims_k   = &kq_dims[2]; dims_k[0]   = N_kv; dims_k[1]   = K_dim;
     uint32_t *dims_log = &kq_dims[4]; dims_log[0] = M_q;  dims_log[1] = N_kv;

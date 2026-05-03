@@ -193,6 +193,20 @@ typedef struct {
     const uint32_t *dims;       /* rank entries */
     uint32_t     bytes_per_element;
     uint32_t     dtype;          /* QNN_DATATYPE_* */
+    /* Quantization params for SCALE_OFFSET / BW_SCALE_OFFSET tensors.
+     * Critical for UFIXED_POINT_16/8 tensors which AI Hub-exported
+     * Qwen-style .bins use for activations: input mask, position_ids,
+     * residual streams, and logits are all uint16-quantized. To send
+     * a fp32 value `v` to such a tensor:
+     *     uint16 q = round(v / quant_scale) + quant_offset
+     * To recover fp32 from a tensor's output bytes:
+     *     fp32 v = (q - quant_offset) * quant_scale
+     * For non-quantized tensors quant_scale=1.0 and quant_offset=0
+     * so identity formulas apply.
+     * quant_encoding mirrors Qnn_QuantizationEncoding_t. */
+    uint32_t     quant_encoding;
+    float        quant_scale;
+    int32_t      quant_offset;
 } sp_qnn_tensor_info;
 
 sp_qnn_status sp_qnn_get_io_info(sp_qnn_handle *h,
