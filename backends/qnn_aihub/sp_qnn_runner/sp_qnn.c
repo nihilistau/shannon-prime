@@ -25,6 +25,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 /* QNN headers from the QAIRT install. The build script's -I path
@@ -61,9 +62,23 @@ typedef struct {
     Qnn_LogHandle_t     log;
     uint32_t            power_cfg_id;     /* shared HTP burst mode cfg */
     int                 device_initialized;
+
+    /* Drain context: kept alive from sp_qnn_drain_htp() until the next
+     * sp_qnn_load_binary() call. Purpose: prevents the DSP from entering
+     * the "no active contexts" idle state between the end of graph-switching
+     * prefill (all 4 prefill contexts freed) and the start of the first
+     * decode graphExecute. When all contexts are freed, the HTP DSP resets
+     * its power state (DCVS vote lapses, VTCM/HVX may be powered down).
+     * The first decode graphExecute then blocks waiting for DSP power-up,
+     * causing the observed fastrpc_wait_for_completion hang. Keeping this
+     * empty context alive prevents the power-state reset. Freed lazily:
+     * on next load_binary (before contextCreateFromBinary), or on shutdown. */
+    Qnn_ContextHandle_t drain_ctx;
 } sp_qnn_lib_t;
 
 static sp_qnn_lib_t g_lib = {0};
+static int g_ctx_create_count = 0;   /* diagnostic: total contextCreate calls */
+static int g_ctx_free_count = 0;     /* diagnostic: total contextFree calls */
 
 /* Per-handle persistent ION-backed tensor allocation tracking.
  * Phase 2.6b: when sp_qnn_alloc_persistent() registers a MemHandle for
@@ -322,8 +337,64 @@ static sp_qnn_status sp_qnn_init_device(void) {
     return SP_QNN_OK;
 }
 
+void sp_qnn_drain_htp(void) {
+    /* Prefill→decode transition: reset the QNN backend+device to open a
+     * fresh FastRPC session for decode.
+     *
+     * After graph-switching prefill (4 × load→execute→destroy), graphExecute
+     * on the first decode context can block in fastrpc_wait_for_completion.
+     * Resetting the backend+device (which closes and reopens the /dev/cdsp
+     * fd) clears accumulated FastRPC session state and allows decode to
+     * proceed.
+     *
+     * This fix was validated at 128 tokens of decode on S22U (Qwen3-4B,
+     * 4-split graph-switching, ~20 tok/s).
+     *
+     * Cost: ~200-500ms one-time at the prefill→decode boundary.
+     */
+    if (!g_lib.device_initialized) {
+        fprintf(stderr, "[sp_qnn] drain_htp: backend not initialized, skip\n");
+        return;
+    }
+
+    fprintf(stderr, "[sp_qnn] drain_htp: resetting backend+device "
+                    "(creates=%d frees=%d)...\n",
+            g_ctx_create_count, g_ctx_free_count);
+
+    /* Free drain context if alive from a previous call. */
+    if (g_lib.drain_ctx) {
+        g_lib.qnn.contextFree(g_lib.drain_ctx, NULL);
+        g_lib.drain_ctx = NULL;
+    }
+
+    /* Tear down: burst mode, device, backend, log. */
+    htp_disable_burst_mode_shared();
+    if (g_lib.device)  g_lib.qnn.deviceFree(g_lib.device);
+    if (g_lib.backend) g_lib.qnn.backendFree(g_lib.backend);
+    if (g_lib.log)     g_lib.qnn.logFree(g_lib.log);
+    g_lib.device  = NULL;
+    g_lib.backend = NULL;
+    g_lib.log     = NULL;
+    g_lib.power_cfg_id = 0;
+    g_lib.device_initialized = 0;
+
+    /* Re-init: opens a fresh /dev/cdsp session. */
+    sp_qnn_status rc = sp_qnn_init_device();
+    if (rc != SP_QNN_OK) {
+        fprintf(stderr, "[sp_qnn] drain_htp: FATAL — re-init failed rc=%d\n", (int)rc);
+        return;
+    }
+
+    fprintf(stderr, "[sp_qnn] drain_htp: fresh backend+device ready for decode\n");
+}
+
 void sp_qnn_shutdown(void) {
     if (g_lib.device_initialized) {
+        /* Free drain context if one is still alive. */
+        if (g_lib.drain_ctx) {
+            g_lib.qnn.contextFree(g_lib.drain_ctx, NULL);
+            g_lib.drain_ctx = NULL;
+        }
         htp_disable_burst_mode_shared();
         if (g_lib.device)  g_lib.qnn.deviceFree(g_lib.device);
         if (g_lib.backend) g_lib.qnn.backendFree(g_lib.backend);
@@ -333,8 +404,13 @@ void sp_qnn_shutdown(void) {
         g_lib.log     = NULL;
         g_lib.device_initialized = 0;
     }
-    if (g_lib.system_dlh)  { dlclose(g_lib.system_dlh);  g_lib.system_dlh = NULL; }
-    if (g_lib.backend_dlh) { dlclose(g_lib.backend_dlh); g_lib.backend_dlh = NULL; }
+    /* Note: we deliberately skip dlclose() on backend_dlh/system_dlh here
+     * on some Android environments to avoid static-destructor crashes
+     * during process exit. The OS will clean up the mappings. */
+    if (getenv("SP_QNN_FORCE_DLCLOSE")) {
+        if (g_lib.system_dlh)  { dlclose(g_lib.system_dlh);  g_lib.system_dlh = NULL; }
+        if (g_lib.backend_dlh) { dlclose(g_lib.backend_dlh); g_lib.backend_dlh = NULL; }
+    }
     g_lib.initialized = 0;
 }
 
@@ -546,6 +622,78 @@ static void htp_disable_burst_mode_shared(void) {
     g_lib.power_cfg_id = 0;
 }
 
+/* Parse tensor schema from a context binary WITHOUT creating an HTP context.
+ * Uses QnnSystemContext only (CPU-side, no DSP resource allocation). The
+ * returned handle has n_inputs / n_outputs / inputs / outputs populated but
+ * context==NULL and graph==NULL. Use sp_qnn_get_io_info() on it — do NOT
+ * call sp_qnn_execute(). sp_qnn_destroy() is safe (contextFree skipped when
+ * context==NULL).
+ *
+ * Purpose: schema extraction during load() in qnn_bin_driver without burning
+ * any of the HTP's scarce context budget. Each full sp_qnn_load_binary +
+ * sp_qnn_destroy cycle leaves deferred cleanup work on the DSP; with 4 splits
+ * × 3 pre-decode passes this saturates the HTP cleanup queue and causes the
+ * first decode graphExecute to stall for minutes. Using sp_qnn_parse_schema
+ * instead reduces pre-decode HTP context creates to exactly 4 (the prefill).
+ */
+sp_qnn_status sp_qnn_parse_schema(const char *context_bin_path,
+                                   sp_qnn_handle **out_h) {
+    if (!g_lib.initialized || !context_bin_path || !out_h)
+        return SP_QNN_ERR_INVALID;
+
+    sp_qnn_handle *h = (sp_qnn_handle *)calloc(1, sizeof(*h));
+    if (!h) return SP_QNN_ERR_INVALID;
+
+    /* Step 1: mmap the binary (file-backed, no malloc overhead). */
+    if (read_file(context_bin_path, &h->bin_data, &h->bin_size) != 0) {
+        free(h);
+        return SP_QNN_ERR_READ_FILE;
+    }
+
+    /* Step 2: QnnSystem parse — CPU only, no HTP backend needed. */
+    if (g_lib.qsys.systemContextCreate(&h->sysCtx) != QNN_SUCCESS) {
+        unmap_file(h->bin_data, h->bin_size); free(h);
+        return SP_QNN_ERR_BINARY_INFO;
+    }
+    Qnn_ContextBinarySize_t info_size = 0;
+    if (g_lib.qsys.systemContextGetBinaryInfo(
+            h->sysCtx, h->bin_data, h->bin_size,
+            &h->binary_info, &info_size) != QNN_SUCCESS) {
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        unmap_file(h->bin_data, h->bin_size); free(h);
+        return SP_QNN_ERR_BINARY_INFO;
+    }
+
+    /* Step 3: resolve graph + tensor templates. */
+    const char *bin_graph_name = NULL;
+    const Qnn_Tensor_t *bin_inputs = NULL, *bin_outputs = NULL;
+    uint32_t n_in = 0, n_out = 0;
+    if (resolve_graph_info(h->binary_info, &bin_graph_name,
+                           &bin_inputs, &n_in, &bin_outputs, &n_out) != 0) {
+        g_lib.qsys.systemContextFree(h->sysCtx);
+        unmap_file(h->bin_data, h->bin_size); free(h);
+        return SP_QNN_ERR_BINARY_INFO;
+    }
+
+    /* Step 4: cache tensor info (context/graph remain NULL — schema only). */
+    h->n_inputs  = n_in;
+    h->n_outputs = n_out;
+    h->inputs    = (sp_qnn_tensor_info *)calloc(n_in,  sizeof(*h->inputs));
+    h->outputs   = (sp_qnn_tensor_info *)calloc(n_out, sizeof(*h->outputs));
+    if ((n_in > 0 && !h->inputs) || (n_out > 0 && !h->outputs)) {
+        sp_qnn_destroy(&h); return SP_QNN_ERR_INVALID;
+    }
+    for (uint32_t i = 0; i < n_in;  ++i)
+        cache_tensor_info(&bin_inputs[i],  &h->inputs[i]);
+    for (uint32_t i = 0; i < n_out; ++i)
+        cache_tensor_info(&bin_outputs[i], &h->outputs[i]);
+
+    /* Note: h->context == NULL, h->graph == NULL — sp_qnn_execute() will
+     * immediately return SP_QNN_ERR_INVALID on schema-only handles. */
+    *out_h = h;
+    return SP_QNN_OK;
+}
+
 sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
                                  const char *graph_name,
                                  sp_qnn_handle **out_h) {
@@ -602,20 +750,30 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
         return SP_QNN_ERR_BACKEND_CREATE;
     }
 
-    /* (5) Create context FROM the binary with HIGH priority hint, attached
-     *     to the SHARED backend + device. */
+    /* (5) Create context FROM the binary with NORMAL priority, attached
+     *     to the SHARED backend + device. Use NORMAL (= DEFAULT = 100),
+     *     not LOW (= 0), which was a bug — LOW contexts may be deprioritised
+     *     by the DSP scheduler behind idle cleanup work, causing the first
+     *     decode graphExecute to fire before the LOW-priority contextCreate
+     *     is fully processed on the DSP side. */
     QnnContext_Config_t prio_cfg;
     memset(&prio_cfg, 0, sizeof(prio_cfg));
     prio_cfg.option   = QNN_CONTEXT_CONFIG_OPTION_PRIORITY;
-    prio_cfg.priority = QNN_PRIORITY_HIGH;
+    prio_cfg.priority = QNN_PRIORITY_NORMAL;
     const QnnContext_Config_t *ctx_cfgs[] = { &prio_cfg, NULL };
 
-    if (g_lib.qnn.contextCreateFromBinary(g_lib.backend, g_lib.device,
-                                          ctx_cfgs,
-                                          h->bin_data, h->bin_size,
-                                          &h->context,
-                                          NULL /*profile*/) != QNN_SUCCESS) {
-        fprintf(stderr, "[sp_qnn] contextCreateFromBinary failed\n");
+    Qnn_ErrorHandle_t ctx_rc = g_lib.qnn.contextCreateFromBinary(
+        g_lib.backend, g_lib.device,
+        ctx_cfgs,
+        h->bin_data, h->bin_size,
+        &h->context,
+        NULL /*profile*/);
+    ++g_ctx_create_count;
+    fprintf(stderr, "[sp_qnn] contextCreate #%d (free_count=%d) rc=0x%lx\n",
+            g_ctx_create_count, g_ctx_free_count, (unsigned long)ctx_rc);
+    if (ctx_rc != QNN_SUCCESS) {
+        fprintf(stderr, "[sp_qnn] contextCreateFromBinary failed: 0x%lx\n",
+                (unsigned long)ctx_rc);
         g_lib.qsys.systemContextFree(h->sysCtx);
         unmap_file(h->bin_data, h->bin_size); free(h);
         return SP_QNN_ERR_CONTEXT_CREATE;
@@ -630,6 +788,10 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
         unmap_file(h->bin_data, h->bin_size); free(h);
         return SP_QNN_ERR_GRAPH_RETRIEVE;
     }
+
+    /* (6b) Drain note: callers that graph-switch (load→execute→destroy per step)
+     * should call sp_qnn_drain_htp() after the final destroy of a forward pass
+     * and before the first execute of the next pass. See sp_qnn_drain_htp(). */
 
     /* (9) Cache I/O tensor templates and metadata. We allocate three
      *     parallel arrays per side: the public sp_qnn_tensor_info, and
@@ -656,6 +818,7 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
     }
 
     fprintf(stderr, "[sp_qnn] context + graph ready\n");
+
     *out_h = h;
     return SP_QNN_OK;
 }
@@ -682,7 +845,12 @@ void sp_qnn_destroy(sp_qnn_handle **h_io) {
 
     /* Release per-handle resources only. Shared backend/device/log/burst
      * persist across handles and are released in sp_qnn_shutdown(). */
-    if (h->context) g_lib.qnn.contextFree(h->context, NULL);
+    if (h->context) {
+        g_lib.qnn.contextFree(h->context, NULL);
+        ++g_ctx_free_count;
+        fprintf(stderr, "[sp_qnn] contextFree #%d (create_count=%d)\n",
+                g_ctx_free_count, g_ctx_create_count);
+    }
     if (h->sysCtx)  g_lib.qsys.systemContextFree(h->sysCtx);
 
     free(h->in_tensors);
@@ -752,6 +920,8 @@ sp_qnn_status sp_qnn_execute(sp_qnn_handle *h,
     }
 
     /* Wall-clock the QNN call. */
+    fprintf(stderr, "[sp_qnn] graphExecute (ctx_creates=%d ctx_frees=%d)...\n",
+            g_ctx_create_count, g_ctx_free_count);
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
     Qnn_ErrorHandle_t rc = g_lib.qnn.graphExecute(
@@ -849,6 +1019,14 @@ sp_qnn_status sp_qnn_load_binary_list(const char *const *paths,
                                       sp_qnn_handle **out_handles) {
     if (!g_lib.initialized || !paths || n == 0 || !out_handles)
         return SP_QNN_ERR_INVALID;
+
+    /* SP_QNN_SEQUENTIAL_ONLY: bypass async path entirely for diagnosis.
+     * When set, falls through immediately to the per-binary fallback in
+     * the caller (qnn_bin_driver), same as the old single-load engine. */
+    if (getenv("SP_QNN_SEQUENTIAL_ONLY")) {
+        fprintf(stderr, "[sp_qnn] SP_QNN_SEQUENTIAL_ONLY: skipping async path\n");
+        return SP_QNN_ERR_CONTEXT_CREATE;
+    }
 
     /* Lazy-init shared backend+device. */
     if (sp_qnn_init_device() != SP_QNN_OK) return SP_QNN_ERR_BACKEND_CREATE;
@@ -957,8 +1135,18 @@ sp_qnn_status sp_qnn_load_binary_list(const char *const *paths,
         paramPtrs, list_cfg,
         NULL /*signal*/);
     if (rc != QNN_SUCCESS) {
-        fprintf(stderr, "[sp_qnn] createFromBinaryListAsync returned 0x%lx\n",
+        fprintf(stderr, "[sp_qnn] createFromBinaryListAsync returned 0x%lx — "
+                "resetting shared device to clear any partial HTP state\n",
                 (unsigned long)rc);
+        /* The failed async call may have partially consumed HTP working
+         * memory. Reset the shared device+backend so sequential fallback
+         * gets a clean HTP state budget. sp_qnn_init_device() will re-
+         * create them on the next sp_qnn_load_binary() call. */
+        htp_disable_burst_mode_shared();
+        if (g_lib.device)  { g_lib.qnn.deviceFree(g_lib.device);  g_lib.device  = NULL; }
+        if (g_lib.backend) { g_lib.qnn.backendFree(g_lib.backend); g_lib.backend = NULL; }
+        if (g_lib.log)     { g_lib.qnn.logFree(g_lib.log);         g_lib.log     = NULL; }
+        g_lib.device_initialized = 0;
         goto cleanup_fail;
     }
 

@@ -206,6 +206,12 @@ int sp_llama_qnn_kq_dispatch(sp_llama_qnn_kq_cache *cache,
 typedef struct {
     uint32_t       M, K, N;
     sp_qnn_handle *h;
+
+    /* Phase 4.14: ION-backed persistent weight B. Mirroring the K-cache
+     * persistence in kq_slot_t. If available, caller memcpys reconstructed
+     * weights (from ISP/VHT2) directly into this buffer. */
+    void  *ion_b_ptr;
+    size_t ion_b_bytes;
 } mm_slot_t;
 
 struct sp_llama_qnn_matmul_cache {
@@ -257,6 +263,8 @@ static mm_slot_t *find_or_create_mm_slot(sp_llama_qnn_matmul_cache *c,
 
     mm_slot_t *s = &c->slots[c->n_slots];
     s->M = M; s->K = K; s->N = N; s->h = NULL;
+    s->ion_b_ptr   = NULL;
+    s->ion_b_bytes = 0;
 
     fprintf(stderr,
         "[sp_llama_qnn] new matmul shape: A[%u,%u] @ B[%u,%u] -> C[%u,%u] "
@@ -266,6 +274,18 @@ static mm_slot_t *find_or_create_mm_slot(sp_llama_qnn_matmul_cache *c,
         fprintf(stderr, "[sp_llama_qnn] matmul_create failed for shape\n");
         return NULL;
     }
+
+    /* Try to allocate persistent B buffer (ION). B size = K * N * 2 (fp16). */
+    const size_t b_bytes = (size_t)K * (size_t)N * 2;
+    void *ion_ptr = NULL;
+    if (sp_qnn_alloc_persistent(s->h, /*tensor_idx=*/1, b_bytes, &ion_ptr) == SP_QNN_OK
+        && ion_ptr != NULL) {
+        s->ion_b_ptr   = ion_ptr;
+        s->ion_b_bytes = b_bytes;
+        fprintf(stderr, "[sp_llama_qnn] persistent B (%zu B) ION-bound for shape\n",
+                b_bytes);
+    }
+
     c->n_slots++;
     return s;
 }
@@ -289,12 +309,27 @@ int sp_llama_qnn_matmul_dispatch(sp_llama_qnn_matmul_cache *cache,
     mm_slot_t *s = find_or_create_mm_slot(cache, M, K, N);
     if (!s) { pthread_mutex_unlock(&cache->mu); return -2; }
 
-    /* Per-call: rebind A and B with caller buffers. No persistence
-     * (yet) — matmul A and B both change per call in the typical use
-     * case (different Q each step, different K rows after KV append).
-     * If a future use case has a stable B matrix, sp_qnn_alloc_persistent
-     * can be added here mirroring the kq cache pattern. */
-    const void  *ins[]   = { a_data, b_data };
+    /* Per-call: B can be persistent (Path A) or rebound (Path B).
+     * Path A: ION-backed. Copy weights into the already-bound buffer.
+     * Path B: clientBuf. Rebind every call. */
+    if (s->ion_b_ptr) {
+        if (b_bytes > s->ion_b_bytes) {
+            fprintf(stderr, "[sp_llama_qnn] b_bytes=%zu > ion buffer %zu\n",
+                    b_bytes, s->ion_b_bytes);
+            pthread_mutex_unlock(&cache->mu);
+            return -4;
+        }
+        /* Optimized path: if caller passed the ION pointer itself (e.g. they
+         * wrote to it directly via ISP), skip the redundant memcpy. */
+        if (b_data != s->ion_b_ptr && b_data != NULL) {
+            memcpy(s->ion_b_ptr, b_data, b_bytes);
+        }
+    } else {
+        sp_qnn_register_persistent_input(s->h, /*tensor_idx=*/1, b_data, b_bytes);
+    }
+
+    /* Per-call inputs: A always rebinds; B is NULL (uses persistent). */
+    const void  *ins[]   = { a_data, NULL };
     const size_t in_sz[] = { a_bytes, b_bytes };
     void        *outs[]   = { c_data };
     const size_t out_sz[] = { c_bytes };
@@ -302,4 +337,14 @@ int sp_llama_qnn_matmul_dispatch(sp_llama_qnn_matmul_cache *cache,
     sp_qnn_status rc = sp_qnn_execute(s->h, ins, in_sz, outs, out_sz, exec_us);
     pthread_mutex_unlock(&cache->mu);
     return (rc == SP_QNN_OK) ? 0 : -3;
+}
+
+void *sp_llama_qnn_matmul_get_ion_ptr(sp_llama_qnn_matmul_cache *cache,
+                                      uint32_t M, uint32_t K, uint32_t N) {
+    if (!cache) return NULL;
+    pthread_mutex_lock(&cache->mu);
+    mm_slot_t *s = find_or_create_mm_slot(cache, M, K, N);
+    void *ptr = s ? s->ion_b_ptr : NULL;
+    pthread_mutex_unlock(&cache->mu);
+    return ptr;
 }

@@ -254,4 +254,49 @@ interface sp_hex : remote_handle64 {
                                in long n_vectors,
                                in long max_bands,
                                rout sequence<float> out_vecs);
+
+   // -------------------------------------------------------------------
+   // logit_argmax_u16 — Phase 6: HVX argmax over a UFIXED_POINT_16 logit
+   // row. Called after Split 4 HTP execute for greedy token selection.
+   //
+   // dtype 1046 (UFIXED_POINT_16) raw uint16 ordering is monotone with
+   // fp32 ordering (same scale+offset for all vocab elements), so argmax
+   // on raw uint16 == argmax on decoded fp32. No decode needed.
+   //
+   // logits_row : one row of the [ar, vocab_size] logit tensor (ION-backed
+   //              for zero-copy DSP access via SMMU). Length = vocab_size.
+   // vocab_size : vocabulary size (151,936 for Qwen3-4B).
+   // token_id   : argmax result (0-based, first on tie).
+   //
+   // HVX perf: ~2,374 vector ops at 64 uint16/vector on V69.
+   // -------------------------------------------------------------------
+   long logit_argmax_u16(in sequence<unsigned short> logits_row,
+                         in long vocab_size,
+                         rout long token_id);
+
+   // -------------------------------------------------------------------
+   // probe_dma_raw — Phase 7B: raw DMA engine accessibility probe.
+   //
+   // Binary question: does the Hexagon DMA engine accept raw byte buffers
+   // in unsigned PD on this device? Halide DMA is blocked (EPERM), so
+   // we probe the dmaWrapper.h layer directly.
+   //
+   // src_buf        : SMMU-mapped rpcmem buffer reinterpreted as uint16
+   //                  (IDL uses sequence<unsigned short> so the existing
+   //                  _stub_method_10 / _skel_method templates handle
+   //                  the marshalling — no new qaic types needed).
+   // src_len_words  : number of uint16 words in src_buf (byte count / 2).
+   // timing_us      : wall-clock time for the DMA transfer attempt (µs).
+   //                  Set to -1 if DMA engine allocation fails before
+   //                  the transfer attempt.
+   //
+   // Returns 0 if DMA transfer succeeded, negative error code otherwise.
+   //   -1  : hDmaWrapper_AllocDma returned NULL (engine unavailable)
+   //   -2  : nDmaWrapper_DmaTransferSetup failed
+   //   -3  : nDmaWrapper_Move failed
+   //   -4  : nDmaWrapper_Wait failed
+   // -------------------------------------------------------------------
+   long probe_dma_raw(in sequence<unsigned short> src_buf,
+                      in long src_len_words,
+                      rout long timing_us);
 };

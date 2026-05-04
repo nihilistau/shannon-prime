@@ -986,6 +986,130 @@ void sp_hexagon_cache_clear_range(sp_hexagon_cache_t *cache, int start_pos, int 
 
 
 // ============================================================================
+// Phase 6: sp_hexagon_logit_argmax_u16 — lazy-session HVX argmax
+// ============================================================================
+//
+// Opens its own cDSP FastRPC session on first call (separate from the KV
+// cache ctx) so the QNN driver can call this without a full sp_hexagon_ctx_t.
+// The static handle is never closed (persists for the process lifetime) —
+// consistent with how sp_hex_device keeps its session open across tokens.
+//
+// For the QNN driver, the logit output buffer should be rpcmem_alloc'd before
+// QnnGraph_execute so the DSP reads it zero-copy via SMMU. If the buffer is
+// plain malloc'd, FastRPC marshals the ~300 KB copy; this is still correct
+// (argmax result is identical) at ~200µs copy overhead per decode step.
+//
+// On success: *token_id_out = argmax index (0-based), return 0.
+// On failure: return -1, caller falls back to ARM scan.
+
+static remote_handle64 g_logit_handle = (remote_handle64)-1;
+static int             g_logit_handle_ok = 0;
+
+static void sp_hexagon_logit_session_open_once(void) {
+    if (g_logit_handle_ok) return;
+    // Enable unsigned PD (best-effort; may already be enabled by ctx init).
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                               (void *)&data, sizeof(data));
+    }
+    char uri_buf[128];
+    snprintf(uri_buf, sizeof(uri_buf), "%s%s", sp_hex_URI, CDSP_DOMAIN);
+    int rc = sp_hex_open(uri_buf, &g_logit_handle);
+    if (rc != AEE_SUCCESS) {
+        fprintf(stderr, "[Shannon-Prime] hexagon logit: sp_hex_open failed 0x%x; "
+                        "HVX argmax unavailable\n", rc);
+        g_logit_handle = (remote_handle64)-1;
+        return;
+    }
+    g_logit_handle_ok = 1;
+}
+
+int sp_hexagon_logit_argmax_u16(const uint16_t *logits_row,
+                                 int vocab_size,
+                                 int *token_id_out) {
+    if (!logits_row || vocab_size <= 0 || !token_id_out) return -1;
+
+    if (!g_logit_handle_ok) {
+        if (!g_rpcmem_inited) {
+            rpcmem_init();
+            g_rpcmem_inited = 1;
+        }
+        sp_hexagon_logit_session_open_once();
+        if (!g_logit_handle_ok) return -1;
+    }
+
+    // qaic maps IDL "long" → C "int" in the generated stub.
+    int tok = -1;
+    int rc = sp_hex_logit_argmax_u16(g_logit_handle,
+                                      (const unsigned short *)logits_row,
+                                      vocab_size,
+                                      vocab_size,
+                                      &tok);
+    if (rc != AEE_SUCCESS || tok < 0) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "[Shannon-Prime] hexagon: logit_argmax_u16 rc=0x%x tok=%d; "
+                            "falling back to ARM scan\n", rc, tok);
+            warned = 1;
+        }
+        return -1;
+    }
+    *token_id_out = tok;
+    return 0;
+}
+
+// ============================================================================
+// Phase 7B — sp_hexagon_probe_dma_raw
+// ============================================================================
+//
+// Wraps sp_hex_probe_dma_raw (IDL method 18). Reuses the g_logit_handle
+// FastRPC session (same cDSP domain, same lifecycle — no second open needed).
+//
+// buf      : rpcmem-allocated buffer (SMMU-mapped for zero-copy DSP access).
+//            Must be valid for at least len_bytes bytes. Caller owns the buffer.
+// len_bytes: byte count. Must be > 0 and even (uint16 words).
+// result_out : set to the return code from sp_hex_probe_dma_raw (0=OK, neg=err).
+// timing_us_out : set to the µs reported by the DSP, or -1 on engine failure.
+//
+// Returns 0 if the FastRPC call itself succeeded (result_out may still be <0
+// if the DMA transfer failed inside the DSP). Returns -1 if the FastRPC
+// dispatch failed or args are invalid.
+int sp_hexagon_probe_dma_raw(const void *buf, int len_bytes,
+                              int *result_out, int *timing_us_out) {
+    if (!buf || len_bytes <= 0 || (len_bytes & 1) || !result_out || !timing_us_out)
+        return -1;
+
+    // Ensure the logit session is open (same handle reused for probe).
+    if (!g_logit_handle_ok) {
+        if (!g_rpcmem_inited) {
+            rpcmem_init();
+            g_rpcmem_inited = 1;
+        }
+        sp_hexagon_logit_session_open_once();
+        if (!g_logit_handle_ok) return -1;
+    }
+
+    int timing = -1;
+    int len_words = len_bytes / 2;
+    // IDL stub takes (const unsigned short* src_buf, int src_bufLen, int src_len_words, int* timing_us).
+    // src_bufLen is the sequence length in uint16 words.
+    int rc = sp_hex_probe_dma_raw(g_logit_handle,
+                                   (const unsigned short *)buf,
+                                   len_words,
+                                   len_words,
+                                   &timing);
+    *result_out   = rc;
+    *timing_us_out = timing;
+
+    fprintf(stderr, "[sp_hexagon] probe_dma_raw: rpc_rc=%d result=%d timing_us=%d\n",
+            rc, *result_out, *timing_us_out);
+    return (rc == AEE_SUCCESS) ? 0 : -1;
+}
+
+// ============================================================================
 // kq_matmul_fused — single FastRPC dispatch per attention op.
 // ============================================================================
 //
@@ -1132,5 +1256,12 @@ void sp_hexagon_cache_clear_range(sp_hexagon_cache_t *c, int s, int e) {
 int sp_hexagon_cache_kq_matmul_fused(const sp_hexagon_cache_t *c, int l, int h, int s, int n_kv, const float *q, int n_q, float *kq) {
     (void)c; (void)l; (void)h; (void)s; (void)n_kv; (void)q; (void)n_q; (void)kq;
     return -1;
+}
+
+int sp_hexagon_logit_argmax_u16(const uint16_t *logits_row,
+                                 int vocab_size,
+                                 int *token_id_out) {
+    (void)logits_row; (void)vocab_size; (void)token_id_out;
+    return -1;  // FastRPC not built; caller falls back to ARM scan
 }
 #endif  // SP_HEXAGON_FASTRPC
