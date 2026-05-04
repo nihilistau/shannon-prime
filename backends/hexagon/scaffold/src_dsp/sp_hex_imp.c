@@ -18,6 +18,17 @@
 #include "sp_hex.h"            // qaic-generated header from sp_hex.idl
 #include "sp_hex_kernels.h"    // forwards to SP math core
 #include "shannon_prime.h"     // sp_band_config_t / sp_band_quantize / etc.
+// Phase 7B: dmaWrapper.h types for the raw DMA probe.
+// The symbols (hDmaWrapper_AllocDma, nDmaWrapper_*) live in ubwcdma_dynlib.so
+// on the DSP. Declared #pragma weak so the skel loads even when that lib is
+// absent (as on S22U production). sp_hex_probe_dma_raw returns -1 if any
+// weak symbol resolves to NULL.
+#include "compat/dmaWrapper.h"
+#pragma weak hDmaWrapper_AllocDma
+#pragma weak nDmaWrapper_FreeDma
+#pragma weak nDmaWrapper_Move
+#pragma weak nDmaWrapper_Wait
+#pragma weak nDmaWrapper_DmaTransferSetup
 
 // Forward decl ? defined in sp_hex_kernels_hvx.c when HVX is available.
 // Used directly by the bench IDL to time the HVX path in isolation,
@@ -768,4 +779,109 @@ int sp_hex_kq_matmul_fused(remote_handle64 h,
     if (hvx_ok) qurt_hvx_unlock();
 #endif
     return 0;
+}
+
+// ============================================================================
+// Phase 6: logit_argmax_u16 — HVX argmax over UFIXED_POINT_16 logit row.
+// ============================================================================
+//
+// Dispatches to sp_hvx_logit_argmax_u16() from sp_hvx_logits.c, which runs
+// the vectorised max scan on the HVX vector units. The buffer arrives via
+// FastRPC from an ION-backed (rpcmem_alloc) host buffer — the cDSP accesses
+// it zero-copy via the SMMU, so no data is copied across the FastRPC boundary.
+//
+// Caller (qnn_bin_driver.cpp) allocates the Split 4 logit output buffer as
+// rpcmem so the HTP can write into it and the DSP can read from it without any
+// intermediate copy — 4 bytes (token_id int32) is the only data that crosses
+// the host/DSP boundary per decode step.
+// ============================================================================
+
+// Forward decl — defined in sp_hvx_logits.c.
+int sp_hvx_logit_argmax_u16(const uint16_t *buf, int vocab_size);
+
+// Signature matches qaic-generated sp_hex.h:
+//   __QAIC_HEADER(sp_hex_logit_argmax_u16)(remote_handle64 _h,
+//       const unsigned short* logits_row, int logits_rowLen,
+//       int vocab_size, int* token_id)
+// IDL "rout long" → C "int*" (qaic maps IDL long to C int in skel/stub).
+int sp_hex_logit_argmax_u16(remote_handle64 h,
+                             const unsigned short *logits_row,
+                             int logits_row_len,
+                             int vocab_size,
+                             int *token_id) {
+    (void)h;
+    if (!logits_row || !token_id) return -1;
+    if (vocab_size <= 0 || logits_row_len < vocab_size) return -1;
+
+#ifdef __HVX__
+    // Lock HVX for this thread — required before any HVX instruction.
+    // sp_hex_open() holds the lock for the session thread, but the IDL
+    // method may execute on a different QURT thread. Re-lock defensively.
+    int lock_rc = qurt_hvx_lock(QURT_HVX_MODE_128B);
+#endif
+
+    int idx = sp_hvx_logit_argmax_u16((const uint16_t *)logits_row, vocab_size);
+
+#ifdef __HVX__
+    if (lock_rc == 0) qurt_hvx_unlock();
+#endif
+
+    if (idx < 0) return -1;
+    *token_id = (int)idx;
+    FARF(RUNTIME_HIGH, "[sp_hex] logit_argmax_u16: token_id=%d vocab=%d",
+         *token_id, vocab_size);
+    return 0;
+}
+
+// ============================================================================
+// Phase 7B — Raw DMA probe (dmaWrapper.h).
+//
+// Binary probe: can the Hexagon DMA engine accept raw byte buffers in
+// unsigned PD? Halide DMA is blocked (0x4e EPERM); this tests the
+// lower-level dmaWrapper.h path before committing to async weight streaming.
+//
+// IDL marshalls src_buf as sequence<unsigned short> (matching logit_argmax_u16)
+// so the existing _skel_method / _stub_method_10 templates handle transport.
+// The actual transfer treats the buffer as raw bytes (eDmaFmt_RawData).
+//
+// src_buf       : DDR input buffer (rpcmem; SMMU-mapped → DSP sees VA directly)
+// src_bufLen    : number of uint16 words (buffer_bytes / 2)
+// src_len_words : same as src_bufLen (IDL "in long" mirrors the sequence length
+//                 so the DSP knows how many bytes are actually valid)
+// timing_us     : set to wall-clock duration of the transfer attempt (µs),
+//                 or -1 if AllocDma fails before the transfer.
+//
+// HAP_perf_get_pcycles() is used for timing. Cycle→µs: cycles / (Hexagon MHz).
+// On V69 at SVS2 the cDSP runs ~547 MHz; at NOM ~729 MHz. We report raw
+// µs via HAP_perf_get_pcycles with a nominal 700 MHz divisor — adequate
+// precision for a pass/fail probe.
+// ============================================================================
+int sp_hex_probe_dma_raw(remote_handle64 h,
+                          const unsigned short *src_buf,
+                          int src_buf_len,
+                          int src_len_words,
+                          int *timing_us) {
+    (void)h; (void)src_buf; (void)src_buf_len; (void)src_len_words;
+
+    // ── Phase 7B + testsig probe result (2026-05-05, S22U SM8450) ────────────
+    //
+    // Dispatch: confirmed working (sentinel 0x55 returned cleanly, no crash).
+    // ubwcdma_dynlib.so: PRESENT on device, loads into DSP process correctly.
+    //   hDmaWrapper_AllocDma weak symbol = non-NULL (library found in DSP path).
+    //
+    // Calling hDmaWrapper_AllocDma() in unsigned PD → DSP hardware fault.
+    //   FastRPC returns AEE_EBADPARM=14 (different from TLBMISS null-ptr=78).
+    //   The fault is a hardware-level privilege violation, not a library issue.
+    //
+    // Testsig (0x467f8091 for this device): generated and pushed to
+    //   /data/local/tmp/sp-engine/ (in ADSP_LIBRARY_PATH). Had no effect —
+    //   DMA hardware still faults. Testsig requires debug fuse absent on S22U.
+    //
+    // Conclusion: DMA engine inaccessible from unsigned PD regardless of
+    //   DMA library availability or testsig. Requires signed PD (Phase 9).
+    //
+    if (timing_us) *timing_us = -1;
+    FARF(RUNTIME_HIGH, "[sp_hex] probe_dma_raw: blocked (hDmaWrapper_AllocDma "
+         "faults in unsigned PD — testsig no help on production S22U)");
+    return 0x4E;  // EPERM: DMA engine inaccessible in unsigned PD
 }

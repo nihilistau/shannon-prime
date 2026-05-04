@@ -63,6 +63,32 @@ sp_qnn_status sp_qnn_init(const char *backend_lib_path,
 /* Optional: clean up the dlopen'd libs at process exit. */
 void sp_qnn_shutdown(void);
 
+/* Reset the QNN backend+device at the prefill→decode transition.
+ * Call this after all prefill QnnContext_free calls and before the first
+ * decode QnnContext_createFromBinary.
+ *
+ * Root cause: After graph-switching prefill (4 × load→execute→destroy),
+ * QnnGraph_execute on the first decode context blocks indefinitely in
+ * fastrpc_wait_for_completion. Confirmed NOT a timing issue: 30s sleep
+ * before or after contextCreateFromBinary, contextCreate drain barriers,
+ * and keepalive empty contexts all fail. The DSP remains responsive between
+ * attempts (contextCreate barriers return normally), but the 5th execute
+ * never gets a response.
+ *
+ * The underlying cause is FastRPC session state accumulation: after 4
+ * context create+free cycles the FastRPC kernel driver or DSP session layer
+ * retains stale state (leaked SMMU entries, a hung IPC slot, or a stale
+ * power wakelock) that prevents the next graphExecute from being acknowledged.
+ *
+ * Fix: call QnnBackend_free + QnnDevice_free, which closes the FastRPC
+ * /dev/cdsp session (flushing all pending contextFree IPCs), then
+ * QnnBackend_create + QnnDevice_create to open a fresh session. Decode
+ * contexts attach to the clean session and execute normally.
+ *
+ * One-time cost: ~200–500ms at the prefill→decode boundary.
+ */
+void sp_qnn_drain_htp(void);
+
 /* Load a QNN context binary from disk and prepare it for execution.
  * The binary must have been produced by a compile flow that targets
  * the same backend (HTP V69 in our case). On success, *out_h is a
@@ -76,9 +102,29 @@ sp_qnn_status sp_qnn_load_binary(const char *context_bin_path,
                                  const char *graph_name,  /* may be NULL */
                                  sp_qnn_handle **out_h);
 
-/* Free the handle and all resources it owns (context, graph, device,
- * profile). After this returns, *h is no longer valid.
+/* Parse tensor schema from a context binary WITHOUT creating an HTP context.
+ * QnnSystemContext only — no DSP resource allocation. The handle has
+ * n_inputs/n_outputs/inputs/outputs populated; context and graph are NULL.
+ * Use sp_qnn_get_io_info() only; do NOT call sp_qnn_execute().
+ * sp_qnn_destroy() is safe (contextFree skipped when context==NULL).
+ *
+ * Use this in place of sp_qnn_load_binary when you only need tensor metadata
+ * (buffer sizes, tensor names) and do not need to execute the graph. This
+ * avoids saturating the HTP's deferred-cleanup queue with short-lived contexts.
  */
+sp_qnn_status sp_qnn_parse_schema(const char *context_bin_path,
+                                   sp_qnn_handle **out_h);
+
+/* Load a list of QNN context binaries into a shared HTP resource pool.
+ * This is critical for V69 hardware where total context size exceeds 
+ * the working memory budget; shareResources=true lets contexts overlap.
+ */
+sp_qnn_status sp_qnn_load_binary_list(const char *const *paths,
+                                      const char *const *graph_names,
+                                      size_t n,
+                                      sp_qnn_handle **out_handles);
+
+/* Free the handle and all resources it owns. */
 void sp_qnn_destroy(sp_qnn_handle **h);
 
 /* === Runtime graph build (NO .bin) ===========================================

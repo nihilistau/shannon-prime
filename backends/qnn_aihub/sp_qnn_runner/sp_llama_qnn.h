@@ -107,6 +107,11 @@ int sp_llama_qnn_matmul_dispatch(sp_llama_qnn_matmul_cache *cache,
                                  void       *c_data, size_t c_bytes,    /* [M, N] fp16 */
                                  uint64_t   *exec_us);
 
+/* Phase 4.14: retrieve the persistent ION buffer for a shape's B tensor.
+ * Returns NULL if the shape hasn't been created yet or ION is unavailable. */
+void *sp_llama_qnn_matmul_get_ion_ptr(sp_llama_qnn_matmul_cache *cache,
+                                      uint32_t M, uint32_t K, uint32_t N);
+
 #ifdef __cplusplus
 }
 #endif

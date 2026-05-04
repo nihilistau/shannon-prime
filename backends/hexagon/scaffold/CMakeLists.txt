@@ -102,6 +102,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_imp
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels_hvx
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hvx_logits
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree
@@ -111,7 +112,9 @@ else()
     add_library(sp_hex_skel SHARED ${srcs})
 
     # SP core needs its own header dir on the include path.
-    target_include_directories(sp_hex_skel PRIVATE ${SP_CORE})
+    # compat/ holds the dmaWrapper shim headers for Phase 7B DMA probe.
+    target_include_directories(sp_hex_skel PRIVATE ${SP_CORE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/compat)
 
     # The SP core has static-inline helpers that are unused when only
     # shannon_prime.c + _pe.c + _sqfree.c are linked (the cauchy and
@@ -138,15 +141,18 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_imp
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels
         ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hex_kernels_hvx
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/sp_hvx_logits
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree
     )
-    target_include_directories(sp_hex_q PRIVATE ${SP_CORE})
+    target_include_directories(sp_hex_q PRIVATE ${SP_CORE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/compat)
     target_compile_options(sp_hex_q PRIVATE -Wno-unused-function -mhvx -mhvx-ieee-fp)
 
     add_library(sp_hex_skel_static STATIC ${srcs})
-    target_include_directories(sp_hex_skel_static PRIVATE ${SP_CORE})
+    target_include_directories(sp_hex_skel_static PRIVATE ${SP_CORE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src_dsp/compat)
     target_compile_options(sp_hex_skel_static PRIVATE -Wno-unused-function -mhvx -mhvx-ieee-fp)
 
     include_directories(${common_incs})

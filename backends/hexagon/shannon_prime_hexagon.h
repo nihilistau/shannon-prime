@@ -192,6 +192,44 @@ void sp_hexagon_cache_clear_range(sp_hexagon_cache_t *cache,
                                    int start_pos, int end_pos);
 
 // ============================================================================
+// Phase 6: HVX Logit Argmax — keep data on the DSP after Split 4.
+// ============================================================================
+//
+// Runs sp_hvx_logit_argmax_u16 on the cDSP via a lightweight lazy-opened
+// FastRPC session. The logit buffer is UFIXED_POINT_16 (dtype 1046, raw
+// uint16) — argmax on raw uint16 == argmax on fp32 because the quantization
+// applies a common scale+offset across all vocab elements (monotone ordering).
+//
+// For zero-copy: the caller should allocate `logits_row` with rpcmem_alloc
+// (RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, vocab_size * 2) and write
+// the Split 4 logit output directly into that buffer. FastRPC then passes
+// the same physical pages to the DSP via SMMU without a marshal copy.
+// If `logits_row` is a plain malloc'd buffer, FastRPC falls back to a
+// marshal copy (~300 KB for Qwen3-4B vocab=151936) — still correct but pays
+// the copy cost on every decode step.
+//
+// Returns:
+//   0  on success — *token_id_out holds the argmax index.
+//  -1  on error (FastRPC unavailable, invalid args, DSP kernel failure).
+//      Caller should fall back to the host-side ARM scan in that case.
+//
+// Thread safety: the lazy session open is guarded by a simple static flag;
+// concurrent first-call from multiple threads is safe (re-open is benign on
+// V69 — the handle is reference-counted by FastRPC). After the first call,
+// the static handle is read-only; concurrent calls are safe.
+int sp_hexagon_logit_argmax_u16(const uint16_t *logits_row,
+                                 int vocab_size,
+                                 int *token_id_out);
+
+// Phase 7B: Raw DMA probe. Attempts a DDR→VTCM transfer via dmaWrapper.h
+// (below the Halide DMA runtime). Returns 0 if the DMA engine accepted the
+// transfer; -1 if AllocDma failed; -2/-3/-4 for setup/move/wait failures.
+// *timing_us is set to the transfer duration in µs, or -1 on engine failure.
+// buf must be rpcmem-allocated (zero-copy SMMU path); len_bytes must be even.
+int sp_hexagon_probe_dma_raw(const void *buf, int len_bytes,
+                              int *result_out, int *timing_us_out);
+
+// ============================================================================
 // kq_matmul_fused — single FastRPC dispatch per attention op.
 // ============================================================================
 //
