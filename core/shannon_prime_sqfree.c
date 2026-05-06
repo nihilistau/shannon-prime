@@ -370,7 +370,9 @@ int sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
     sc->calibrating = false;
     sc->calib_sum = NULL;
     sc->calib_sum2 = NULL;
+    sc->calib_cov = NULL;
     sc->calib_n = 0;
+    sc->use_svd_entropy = !getenv("SHANNON_PRIME_NO_SVD_ENTROPY");
 
     // Init Vilenkin basis
     int factors[16];
@@ -488,6 +490,7 @@ void sp_sqfree_cache_free(sp_sqfree_cache_t *sc) {
     }
     free(sc->calib_sum);
     free(sc->calib_sum2);
+    free(sc->calib_cov);
     sp_knight_mask_free(&sc->mask);
     sp_vilenkin_free(&sc->vilenkin);
     memset(sc, 0, sizeof(*sc));
@@ -798,6 +801,13 @@ int sp_sqfree_calibrate_begin(sp_sqfree_cache_t *sc) {
         sc->calib_sum2 = NULL;
         return -1;
     }
+    // Allocate covariance accumulator for SVD entropy ranking
+    if (sc->use_svd_entropy) {
+        sc->calib_cov = (double *)calloc((size_t)pd * pd, sizeof(double));
+        if (!sc->calib_cov) {
+            sc->use_svd_entropy = false; // fall back to variance
+        }
+    }
     sc->calib_n = 0;
     sc->calibrating = true;
     return 0;
@@ -820,6 +830,21 @@ void sp_sqfree_calibrate_feed(sp_sqfree_cache_t *sc, const float *vec) {
         sc->calib_sum[i]  += v;
         sc->calib_sum2[i] += v * v;
     }
+
+    // Accumulate covariance outer product: C += x · x^T
+    if (sc->calib_cov) {
+        for (int i = 0; i < pd; i++) {
+            double xi = (double)sc->pad_scratch[i];
+            double *row = sc->calib_cov + (size_t)i * pd;
+            for (int j = i; j < pd; j++) {
+                double xj = (double)sc->pad_scratch[j];
+                double v = xi * xj;
+                row[j] += v;
+                if (j != i) sc->calib_cov[(size_t)j * pd + i] += v;
+            }
+        }
+    }
+
     sc->calib_n++;
 }
 
@@ -831,27 +856,61 @@ int sp_sqfree_calibrate_end(sp_sqfree_cache_t *sc) {
     double inv_n = 1.0 / (double)sc->calib_n;
 
     // Compute per-coefficient variance: Var = E[x²] − E[x]²
-    float *variance = (float *)malloc(pd * sizeof(float));
+    float *ranking = (float *)malloc(pd * sizeof(float));
     for (int i = 0; i < pd; i++) {
         double mean = sc->calib_sum[i] * inv_n;
         double var  = sc->calib_sum2[i] * inv_n - mean * mean;
-        variance[i] = (var > 0.0) ? (float)var : 0.0f;
+        ranking[i] = (var > 0.0) ? (float)var : 0.0f;
+    }
+
+    const char *method = "variance";
+
+    // Attempt SVD spectral-entropy ranking — captures inter-coefficient
+    // correlations that raw variance misses. Falls back to variance
+    // if Jacobi solver fails or covariance is degenerate.
+    if (sc->calib_cov && sc->use_svd_entropy) {
+        // Finalise covariance: C = E[xx^T] − E[x]E[x]^T
+        for (int i = 0; i < pd; i++) {
+            double mi = sc->calib_sum[i] * inv_n;
+            for (int j = 0; j < pd; j++) {
+                double mj = sc->calib_sum[j] * inv_n;
+                sc->calib_cov[i * pd + j] =
+                    sc->calib_cov[i * pd + j] * inv_n - mi * mj;
+            }
+        }
+
+        // sp_svd_entropy_scores is defined in shannon_prime.c
+        float *svd_scores = (float *)malloc(pd * sizeof(float));
+        if (svd_scores) {
+            if (sp_svd_entropy_scores(sc->calib_cov, svd_scores, pd) == 0) {
+                memcpy(ranking, svd_scores, pd * sizeof(float));
+                method = "svd-entropy";
+            }
+            free(svd_scores);
+        }
     }
 
     // Free accumulators
     free(sc->calib_sum);
     free(sc->calib_sum2);
+    free(sc->calib_cov);
     sc->calib_sum = NULL;
     sc->calib_sum2 = NULL;
+    sc->calib_cov = NULL;
 
-    // Rebuild Knight mask with variance ranking at L/2
+    // Rebuild Knight mask with ranking at L/2
     sp_knight_mask_free(&sc->mask);
     int sk_k = pd / 2;
-    sp_knight_mask_init(&sc->mask, pd, sk_k, variance);
+    sp_knight_mask_init(&sc->mask, pd, sk_k, ranking);
     sc->mask.residual_bits = sc->residual_bits;
     sc->mask.use_spinor = sc->use_spinor;
 
-    free(variance);
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime SQFREE] %s-ranked calibration "
+                        "(pad_dim=%d, n_vectors=%d)\n", method, pd, sc->calib_n);
+    }
+
+    free(ranking);
 
     // Re-initialise band quantisers for the (possibly changed) skeleton size.
     // Reuse the config's band bits if set, else defaults.
