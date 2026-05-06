@@ -28,7 +28,7 @@
 // Combined range: M1 × M2 ≈ 4.6 × 10^18 — enough for 16-bit weight
 // accumulation across 4096-dim hidden layers without overflow.
 //
-// The Garner constant C = M1^{-1} mod M2 = 1,073,741,810 is precomputed.
+// The Garner constant C = M1^{-1} mod M2 = 2,028,178,983 is precomputed.
 //
 // Integration:
 //   1. Quantize fp16 weights to scaled integers in [0, M_i)
@@ -52,7 +52,7 @@ extern "C" {
 
 #define SP_CRT_M1          2147483647ULL   // 2^31 - 1   (Mersenne prime)
 #define SP_CRT_M2          2147483629ULL   // 2^31 - 19  (coprime to M1)
-#define SP_CRT_GARNER_C    1073741810ULL   // M1^{-1} mod M2
+#define SP_CRT_GARNER_C    2028178983ULL   // M1^{-1} mod M2  (verified: M1*C mod M2 == 1)
 #define SP_CRT_RANGE       (SP_CRT_M1 * SP_CRT_M2)  // ~4.6e18
 
 // ============================================================================
@@ -60,14 +60,28 @@ extern "C" {
 // ============================================================================
 
 // Mersenne reduction: x mod (2^31 - 1) via shift-and-add.
-// Input: x < 2^62 (safe for any product of two 31-bit values).
+// Input: x < 2^63 (safe for accumulator values in modular matmul).
 // Output: result in [0, M1).
+//
+// With zero-centered quantization, negative values wrap to near M1,
+// so a single product of two ring elements can reach M1² ≈ 2^62.
+// An accumulator value after adding such a product can reach ~2^62.5.
+// We handle this by using uint64_t for the intermediate sum and doing
+// two rounds of fold-and-subtract.
 static inline uint32_t sp_crt_mersenne_reduce(uint64_t x) {
-    uint32_t lo = (uint32_t)(x & 0x7FFFFFFFU);
-    uint32_t hi = (uint32_t)(x >> 31);
-    uint32_t r = lo + hi;
-    // At most one subtraction needed (r < 2*M1)
-    return r >= SP_CRT_M1 ? r - (uint32_t)SP_CRT_M1 : r;
+    // Round 1: fold high bits down
+    uint64_t lo = x & 0x7FFFFFFFULL;
+    uint64_t hi = x >> 31;
+    uint64_t r = lo + hi;
+    // r < 2^31 + 2^32 = 3*2^31 after round 1 (if x < 2^63)
+    // Round 2: fold again if still >= 2^31
+    if (r >= 0x80000000ULL) {
+        lo = r & 0x7FFFFFFFULL;
+        hi = r >> 31;
+        r = lo + hi;
+    }
+    // Now r < 2*M1, at most one final subtraction
+    return (uint32_t)(r >= SP_CRT_M1 ? r - SP_CRT_M1 : r);
 }
 
 // Generic modular reduction for M2 (not Mersenne — uses standard remainder).
@@ -129,7 +143,10 @@ typedef struct {
 
 // Calibrate quantization parameters from observed value range.
 // After calling, use sp_crt_quantize_f32 to convert.
+// sp_crt_quant_calibrate_k is K-aware: limits the quantized range so that
+// K-dimensional accumulation stays within the M1×M2 CRT range.
 void sp_crt_quant_calibrate(sp_crt_quant_t *q, float min_val, float max_val);
+void sp_crt_quant_calibrate_k(sp_crt_quant_t *q, float min_val, float max_val, int K);
 
 // Quantize a float to a residue-ring integer for the given modulus.
 static inline uint32_t sp_crt_quantize_f32(const sp_crt_quant_t *q,
@@ -254,6 +271,12 @@ void sp_crt_vulkan_matmul_mod(const uint32_t *d_A, const uint32_t *d_B,
                                int M, int N, int K,
                                uint64_t modulus,
                                void *vk_queue);
+
+// ── Verification / test utilities ────────────────────────────────
+//
+// Round-trip test: quantize → split → matmul_mod → Garner → dequantize
+// for a single a × b multiplication. Returns 0 on success (error < 1%).
+int sp_crt_verify_roundtrip(float a, float b, float *error_out);
 
 #ifdef __cplusplus
 }

@@ -29,10 +29,17 @@
 // ============================================================================
 
 __device__ __forceinline__ uint32_t d_mersenne_reduce(uint64_t x) {
-    uint32_t lo = (uint32_t)(x & 0x7FFFFFFFU);
-    uint32_t hi = (uint32_t)(x >> 31);
-    uint32_t r = lo + hi;
-    return r >= SP_CRT_M1 ? r - (uint32_t)SP_CRT_M1 : r;
+    // Two-round fold for inputs up to 2^63 (zero-centered quantization
+    // produces ring values near M1, so products reach M1² ≈ 2^62).
+    uint64_t lo = x & 0x7FFFFFFFULL;
+    uint64_t hi = x >> 31;
+    uint64_t r = lo + hi;
+    if (r >= 0x80000000ULL) {
+        lo = r & 0x7FFFFFFFULL;
+        hi = r >> 31;
+        r = lo + hi;
+    }
+    return (uint32_t)(r >= SP_CRT_M1 ? r - SP_CRT_M1 : r);
 }
 
 // ============================================================================
@@ -69,14 +76,14 @@ __global__ void kernel_matmul_mersenne(const uint32_t * __restrict__ A,
 
         __syncthreads();
 
-        // Accumulate dot product for this tile
+        // Accumulate dot product for this tile, reducing every iteration.
+        // With zero-centered quantization, ring values can be near M1,
+        // so each product can reach M1² ≈ 2^62. Must reduce per-element.
         #pragma unroll
         for (int k = 0; k < CRT_TILE_DIM; k++) {
             acc += (uint64_t)sA[threadIdx.y][k] * sB[k][threadIdx.x];
+            acc = d_mersenne_reduce(acc);
         }
-
-        // Mersenne reduce after each tile to keep acc < 2^62
-        acc = d_mersenne_reduce(acc);
 
         __syncthreads();
     }
@@ -117,13 +124,12 @@ __global__ void kernel_matmul_mod(const uint32_t * __restrict__ A,
 
         __syncthreads();
 
+        // Reduce every iteration — products of ring values near M can reach M² ≈ 2^62.
         #pragma unroll
         for (int k = 0; k < CRT_TILE_DIM; k++) {
             acc += (uint64_t)sA[threadIdx.y][k] * sB[k][threadIdx.x];
+            acc %= modulus;
         }
-
-        // Reduce after each tile
-        acc %= modulus;
 
         __syncthreads();
     }
