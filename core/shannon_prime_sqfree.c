@@ -1016,7 +1016,8 @@ static int sp_kronecker_sub_indices(int pad_dim, const int *all_primes,
 
 int sp_hier_predictor_init(sp_hier_predictor_t *hp, int pad_dim,
                            int hier_level, int target_res_bits,
-                           int skel_n_bands, const int *skel_band_bits) {
+                           int skel_n_bands, const int *skel_band_bits,
+                           uint32_t skel_ternary_mask) {
     memset(hp, 0, sizeof(*hp));
     hp->pad_dim = pad_dim;
 
@@ -1074,7 +1075,8 @@ int sp_hier_predictor_init(sp_hier_predictor_t *hp, int pad_dim,
     int nb = (skel_n_bands > 0 && skel_n_bands <= SP_MAX_BANDS)
              ? skel_n_bands : 2;
     const int *bits = (skel_n_bands > 0) ? skel_band_bits : default_skel_bits;
-    sp_band_config_init(&hp->skel_bands, hp->n_skeleton, nb, bits);
+    sp_band_config_init_ext(&hp->skel_bands, hp->n_skeleton, nb, bits,
+                            skel_ternary_mask);
 
     hp->target_res_bits = (target_res_bits >= 1 && target_res_bits <= 4)
                           ? target_res_bits : 2;
@@ -1313,7 +1315,8 @@ void sp_hier_predict(const sp_hier_predictor_t *hp,
 int sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
                        int max_seq_len, int hier_level,
                        int skel_n_bands, const int *skel_band_bits,
-                       int target_res_bits) {
+                       int target_res_bits, int target_res_bits_v,
+                       uint32_t skel_ternary_mask) {
     memset(hc, 0, sizeof(*hc));
     hc->config = *cfg;
     hc->max_seq_len = max_seq_len;
@@ -1341,7 +1344,8 @@ int sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
     for (int s = 0; s < hc->n_slots; s++) {
         if (sp_hier_predictor_init(&hc->predictors[s], hc->pad_dim,
                                     hier_level, target_res_bits,
-                                    skel_n_bands, skel_band_bits) != 0) {
+                                    skel_n_bands, skel_band_bits,
+                                    skel_ternary_mask) != 0) {
             // Cleanup already-inited
             for (int j = 0; j < s; j++) sp_hier_predictor_free(&hc->predictors[j]);
             free(hc->predictors);
@@ -1350,11 +1354,19 @@ int sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
         }
     }
 
+    // Split K/V residual bits — resolve V default.
+    int k_rb = (target_res_bits >= 1 && target_res_bits <= 4) ? target_res_bits : 2;
+    int v_rb = (target_res_bits_v >= 1 && target_res_bits_v <= 4)
+               ? target_res_bits_v : k_rb;
+    hc->k_res_bits = k_rb;
+    hc->v_res_bits = v_rb;
+
     // Compute storage per position (using slot 0 as reference — all identical)
     sp_hier_predictor_t *hp0 = &hc->predictors[0];
-    int res_bytes = (hp0->n_target * hp0->target_res_bits + 7) / 8;
-    hc->k_bytes_per_pos = hp0->skel_bands.total_bytes + 4 + res_bytes;
-    hc->v_bytes_per_pos = hp0->skel_bands.total_bytes + 4 + res_bytes;
+    int k_res_bytes = (hp0->n_target * k_rb + 7) / 8;
+    int v_res_bytes = (hp0->n_target * v_rb + 7) / 8;
+    hc->k_bytes_per_pos = hp0->skel_bands.total_bytes + 4 + k_res_bytes;
+    hc->v_bytes_per_pos = hp0->skel_bands.total_bytes + 4 + v_res_bytes;
 
     // Allocate compressed storage
     hc->k_cache = (uint8_t **)calloc(hc->n_slots, sizeof(uint8_t *));
@@ -1374,11 +1386,13 @@ int sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
 
     if (getenv("SHANNON_PRIME_VERBOSE")) {
         fprintf(stderr, "[Shannon-Prime HIER] pad_dim=%d, skeleton=%d (%.1f%%), "
-                        "target=%d, skel_bands=%d bytes, res_bits=%d\n",
+                        "target=%d, skel_bands=%d bytes, res_bits=K%d/V%d, "
+                        "ternary_mask=0x%x\n",
                 hc->pad_dim, hp0->n_skeleton,
                 100.0 * hp0->n_skeleton / hc->pad_dim,
                 hp0->n_target, hp0->skel_bands.total_bytes,
-                hp0->target_res_bits);
+                hc->k_res_bits, hc->v_res_bits,
+                (unsigned)hp0->skel_bands.ternary_band_mask);
         fprintf(stderr, "[Shannon-Prime HIER] bytes/pos: K=%d V=%d (%.1f× vs fp16)\n",
                 hc->k_bytes_per_pos, hc->v_bytes_per_pos,
                 (float)(cfg->head_dim * 4) / (hc->k_bytes_per_pos + hc->v_bytes_per_pos));
@@ -1459,9 +1473,11 @@ int sp_hier_cache_calibrate_end_ema(sp_hier_cache_t *hc, float keep_frac) {
     return ok;
 }
 
-// Internal: compress one vector through the hierarchical pipeline
+// Internal: compress one vector through the hierarchical pipeline.
+// res_bits overrides hp->target_res_bits to support split K/V.
 static int sp_hier_compress_one(sp_hier_cache_t *hc, int slot,
-                                const float *vec, uint8_t *out) {
+                                const float *vec, uint8_t *out,
+                                int res_bits) {
     int hd = hc->config.head_dim;
     int pd = hc->pad_dim;
     sp_hier_predictor_t *hp = &hc->predictors[slot];
@@ -1506,7 +1522,7 @@ static int sp_hier_compress_one(sp_hier_cache_t *hc, int slot,
 
     // 8. Quantize residuals (levels_scratch is pre-allocated on hc)
     int n_res = hp->n_target;
-    int nbits = hp->target_res_bits;
+    int nbits = res_bits;  // caller passes hc->k_res_bits or hc->v_res_bits
     sp_quantize_residual(hc->target_scratch, n_res, nbits, mag,
                          hc->levels_scratch);
 
@@ -1524,9 +1540,11 @@ static int sp_hier_compress_one(sp_hier_cache_t *hc, int slot,
     return (int)(write_ptr - out);
 }
 
-// Internal: reconstruct one vector from hierarchical compressed bytes
+// Internal: reconstruct one vector from hierarchical compressed bytes.
+// res_bits overrides hp->target_res_bits to support split K/V.
 static void sp_hier_reconstruct_one(const sp_hier_cache_t *hc, int slot,
-                                    const uint8_t *in, float *vec_out) {
+                                    const uint8_t *in, float *vec_out,
+                                    int res_bits) {
     int hd = hc->config.head_dim;
     int pd = hc->pad_dim;
     const sp_hier_predictor_t *hp = &hc->predictors[slot];
@@ -1551,7 +1569,7 @@ static void sp_hier_reconstruct_one(const sp_hier_cache_t *hc, int slot,
 
     // 4. Dequantize residuals (levels_scratch is pre-allocated on hc)
     int n_res = hp->n_target;
-    int nbits = hp->target_res_bits;
+    int nbits = res_bits;  // caller passes hc->k_res_bits or hc->v_res_bits
     int res_bytes = (n_res * nbits + 7) / 8;
     uint8_t *levels = ((sp_hier_cache_t *)hc)->levels_scratch;
     int L = 1 << nbits;
@@ -1592,7 +1610,8 @@ void sp_hier_cache_write_k(sp_hier_cache_t *hc,
     int slot = layer * hc->config.n_heads_kv + head;
     if (slot < 0 || slot >= hc->n_slots) return;
     sp_hier_compress_one(hc, slot, k_vec,
-                         hc->k_cache[slot] + pos * hc->k_bytes_per_pos);
+                         hc->k_cache[slot] + pos * hc->k_bytes_per_pos,
+                         hc->k_res_bits);
 }
 
 void sp_hier_cache_write_v(sp_hier_cache_t *hc,
@@ -1602,7 +1621,8 @@ void sp_hier_cache_write_v(sp_hier_cache_t *hc,
     int slot = layer * hc->config.n_heads_kv + head;
     if (slot < 0 || slot >= hc->n_slots) return;
     sp_hier_compress_one(hc, slot, v_vec,
-                         hc->v_cache[slot] + pos * hc->v_bytes_per_pos);
+                         hc->v_cache[slot] + pos * hc->v_bytes_per_pos,
+                         hc->v_res_bits);
 }
 
 void sp_hier_cache_read_k(const sp_hier_cache_t *hc,
@@ -1613,7 +1633,7 @@ void sp_hier_cache_read_k(const sp_hier_cache_t *hc,
     if (slot < 0 || slot >= hc->n_slots) { memset(k_out, 0, hc->config.head_dim * sizeof(float)); return; }
     sp_hier_reconstruct_one(hc, slot,
                             hc->k_cache[slot] + pos * hc->k_bytes_per_pos,
-                            k_out);
+                            k_out, hc->k_res_bits);
 }
 
 void sp_hier_cache_read_v(const sp_hier_cache_t *hc,
@@ -1624,7 +1644,7 @@ void sp_hier_cache_read_v(const sp_hier_cache_t *hc,
     if (slot < 0 || slot >= hc->n_slots) { memset(v_out, 0, hc->config.head_dim * sizeof(float)); return; }
     sp_hier_reconstruct_one(hc, slot,
                             hc->v_cache[slot] + pos * hc->v_bytes_per_pos,
-                            v_out);
+                            v_out, hc->v_res_bits);
 }
 
 // ============================================================================

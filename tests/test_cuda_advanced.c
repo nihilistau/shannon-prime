@@ -256,13 +256,15 @@ static void test_hier_gpu(void) {
     sp_config_init(&cfg, hd, n_layers, n_heads);
 
     // Use CPU-side hier_cache to get structural metadata.
-    // sp_hier_cache_init(hc, cfg, max_seq, hier_level, skel_n_bands, skel_band_bits, target_res_bits)
+    // sp_hier_cache_init(hc, cfg, max_seq, hier_level, skel_n_bands, skel_band_bits, target_res_bits, target_res_bits_v, skel_ternary_mask)
     int skel_band_bits[] = {5, 5};
     sp_hier_cache_t hc_cpu;
     int rc = sp_hier_cache_init(&hc_cpu, &cfg, max_seq,
                                  /*hier_level=*/0,
                                  /*skel_n_bands=*/2, skel_band_bits,
-                                 /*target_res_bits=*/2);
+                                 /*target_res_bits=*/2,
+                                 /*target_res_bits_v=*/0,
+                                 /*skel_ternary_mask=*/0);
     CHECK(rc == 0, "CPU hier_cache init");
     if (rc != 0) return;
 

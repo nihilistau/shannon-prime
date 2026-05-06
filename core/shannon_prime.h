@@ -663,7 +663,8 @@ typedef struct {
 // Returns 0 on success.
 int  sp_hier_predictor_init(sp_hier_predictor_t *hp, int pad_dim,
                             int hier_level, int target_res_bits,
-                            int skel_n_bands, const int *skel_band_bits);
+                            int skel_n_bands, const int *skel_band_bits,
+                            uint32_t skel_ternary_mask);
 void sp_hier_predictor_free(sp_hier_predictor_t *hp);
 
 // Calibration: collect Vilenkin-domain vectors, fit W via ridge regression.
@@ -710,6 +711,11 @@ typedef struct {
     int                  n_slots;        // = n_layers × n_heads_kv
     sp_hier_predictor_t *predictors;     // [n_slots]
 
+    // Split K/V residual bits — allows e.g. K=1bit, V=2bit.
+    // Set by sp_hier_cache_init; if target_res_bits_v==0, both use target_res_bits.
+    int                  k_res_bits;
+    int                  v_res_bits;
+
     // Compressed storage
     uint8_t            **k_cache;        // [n_slots][max_seq × bytes_per_pos]
     uint8_t            **v_cache;
@@ -729,10 +735,12 @@ typedef struct {
 // hier_level: 0 = automatic, 1..n_primes-1 = explicit.
 // skel_bits_csv: band bit allocation for skeleton (e.g. "5,5" for 2 bands).
 // target_res_bits: 1-4 bits for target residuals.
+// target_res_bits_v: V residual bits; 0 → same as target_res_bits (K).
 int  sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
                         int max_seq_len, int hier_level,
                         int skel_n_bands, const int *skel_band_bits,
-                        int target_res_bits);
+                        int target_res_bits, int target_res_bits_v,
+                        uint32_t skel_ternary_mask);
 void sp_hier_cache_free(sp_hier_cache_t *hc);
 
 // Calibration: feeds Vilenkin-domain vectors to ALL slot predictors.
