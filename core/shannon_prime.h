@@ -512,8 +512,10 @@ typedef struct {
     bool                calibrating;         // true between begin/end
     double             *calib_sum;           // pad_dim doubles: Σ x_i
     double             *calib_sum2;          // pad_dim doubles: Σ x_i²
+    double             *calib_cov;           // pad_dim × pad_dim covariance accumulator
     int                 calib_n;             // number of vectors fed
     int                 max_seq_len;         // stashed for re-init
+    bool                use_svd_entropy;     // true = SVD spectral-entropy ranking (default)
 } sp_sqfree_cache_t;
 
 int  sp_sqfree_cache_init(sp_sqfree_cache_t *sc, const sp_config_t *cfg,
@@ -812,7 +814,9 @@ typedef struct {
     bool                calibrating;
     double             *calib_sum;        // head_dim doubles
     double             *calib_sum2;       // head_dim doubles
+    double             *calib_cov;        // head_dim × head_dim covariance accumulator
     int                 calib_n;
+    bool                use_svd_entropy;  // true = SVD spectral-entropy ranking (default)
 } sp_shadow_cache_t;
 
 // Initialize shadow cache. Backend allocates compressed storage.
@@ -1030,6 +1034,13 @@ float sp_correlation_f32(const float *a, const float *b, int n);
 
 // Compute compression ratio for current config.
 float sp_compression_ratio(const sp_config_t *cfg);
+
+// SVD spectral-entropy ranking for calibration.
+// Given an n×n covariance matrix (destroyed in-place by Jacobi),
+// compute per-dimension importance scores that capture inter-coefficient
+// correlations — an upgrade over raw marginal variance.
+// Returns 0 on success, -1 if Jacobi fails (fall back to variance).
+int sp_svd_entropy_scores(double *cov, float *scores, int n);
 
 // Print config summary to stderr.
 void sp_config_print(const sp_config_t *cfg);
