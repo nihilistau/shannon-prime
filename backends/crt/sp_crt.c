@@ -200,6 +200,17 @@ void sp_crt_free(sp_crt_context_t *ctx) {
     free(ctx->h_residue_0);
     free(ctx->h_residue_1);
     free(ctx->h_output);
+    if (ctx->gpu_ready) {
+        sp_crt_cuda_free(ctx->d_a_m1);
+        sp_crt_cuda_free(ctx->d_b_m1);
+        sp_crt_cuda_free(ctx->d_c_m1);
+        sp_crt_cuda_free(ctx->d_a_m2);
+        sp_crt_cuda_free(ctx->d_b_m2);
+        sp_crt_cuda_free(ctx->d_c_m2);
+        // Only destroy streams we created (stream_0/stream_1 may be caller-owned)
+        // For safety, always destroy — caller should set to NULL before free
+        // if they own the streams.
+    }
     memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -298,6 +309,120 @@ int sp_crt_matmul(sp_crt_context_t *ctx,
         double signed_val = sp_crt_garner_signed(ctx->h_residue_0[i],
                                                   ctx->h_residue_1[i]);
         d_C[i] = (float)(signed_val * inv_scale);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// GPU-accelerated CRT init + matmul
+// ============================================================================
+//
+// sp_crt_init_gpu: allocate device buffers for both residue rings.
+// sp_crt_matmul_gpu: quantize on host, H2D, dual-ring matmul on two
+//   CUDA streams, D2H, signed Garner on host. When streams are on
+//   different GPUs (Beast Canyon: RTX 2060 + Intel UHD), the two ring
+//   matmuls run in true parallel with zero inter-GPU communication.
+
+int sp_crt_init_gpu(sp_crt_context_t *ctx) {
+    if (!ctx->initialized) return -1;
+
+    size_t max_a = (size_t)ctx->M * ctx->K * sizeof(uint32_t);
+    size_t max_b = (size_t)ctx->K * ctx->N * sizeof(uint32_t);
+    size_t max_c = (size_t)ctx->M * ctx->N * sizeof(uint32_t);
+
+    // Allocate device memory for both rings
+    ctx->d_a_m1 = (uint32_t *)sp_crt_cuda_alloc(max_a);
+    ctx->d_b_m1 = (uint32_t *)sp_crt_cuda_alloc(max_b);
+    ctx->d_c_m1 = (uint32_t *)sp_crt_cuda_alloc(max_c);
+    ctx->d_a_m2 = (uint32_t *)sp_crt_cuda_alloc(max_a);
+    ctx->d_b_m2 = (uint32_t *)sp_crt_cuda_alloc(max_b);
+    ctx->d_c_m2 = (uint32_t *)sp_crt_cuda_alloc(max_c);
+
+    if (!ctx->d_a_m1 || !ctx->d_b_m1 || !ctx->d_c_m1 ||
+        !ctx->d_a_m2 || !ctx->d_b_m2 || !ctx->d_c_m2) {
+        sp_crt_cuda_free(ctx->d_a_m1); sp_crt_cuda_free(ctx->d_b_m1);
+        sp_crt_cuda_free(ctx->d_c_m1); sp_crt_cuda_free(ctx->d_a_m2);
+        sp_crt_cuda_free(ctx->d_b_m2); sp_crt_cuda_free(ctx->d_c_m2);
+        ctx->d_a_m1 = ctx->d_b_m1 = ctx->d_c_m1 = NULL;
+        ctx->d_a_m2 = ctx->d_b_m2 = ctx->d_c_m2 = NULL;
+        return -2;
+    }
+
+    // Create streams if caller didn't provide them
+    if (!ctx->stream_0) ctx->stream_0 = sp_crt_cuda_stream_create();
+    if (!ctx->stream_1) ctx->stream_1 = sp_crt_cuda_stream_create();
+    if (!ctx->stream_0 || !ctx->stream_1) return -3;
+
+    ctx->gpu_ready = 1;
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime CRT] GPU dispatch ready: "
+                        "6 device buffers, 2 streams\n");
+    }
+    return 0;
+}
+
+int sp_crt_matmul_gpu(sp_crt_context_t *ctx,
+                      const float *A, const float *B, float *C,
+                      int M, int N, int K) {
+    // Fall back to CPU if GPU not initialized
+    if (!ctx->gpu_ready) return sp_crt_matmul(ctx, A, B, C, M, N, K);
+    if (!ctx->initialized) return -1;
+    if (M * N > ctx->M * ctx->N) return -2;
+
+    size_t a_size = (size_t)M * K;
+    size_t b_size = (size_t)K * N;
+    size_t c_size = (size_t)M * N;
+
+    // --- Step 1: Quantize on CPU (zero-centered symmetric) ---
+    uint32_t *h_a_m1 = (uint32_t *)malloc(a_size * sizeof(uint32_t));
+    uint32_t *h_b_m1 = (uint32_t *)malloc(b_size * sizeof(uint32_t));
+    uint32_t *h_a_m2 = (uint32_t *)malloc(a_size * sizeof(uint32_t));
+    uint32_t *h_b_m2 = (uint32_t *)malloc(b_size * sizeof(uint32_t));
+    if (!h_a_m1 || !h_b_m1 || !h_a_m2 || !h_b_m2) {
+        free(h_a_m1); free(h_b_m1); free(h_a_m2); free(h_b_m2);
+        return -3;
+    }
+
+    sp_crt_cpu_quantize_symmetric(A, h_a_m1, (int)a_size, ctx->act_quant.scale, SP_CRT_M1);
+    sp_crt_cpu_quantize_symmetric(B, h_b_m1, (int)b_size, ctx->weight_quant.scale, SP_CRT_M1);
+    sp_crt_cpu_quantize_symmetric(A, h_a_m2, (int)a_size, ctx->act_quant.scale, SP_CRT_M2);
+    sp_crt_cpu_quantize_symmetric(B, h_b_m2, (int)b_size, ctx->weight_quant.scale, SP_CRT_M2);
+
+    // --- Step 2: H2D transfers (async on respective streams) ---
+    sp_crt_cuda_memcpy_h2d(ctx->d_a_m1, h_a_m1, a_size * sizeof(uint32_t), ctx->stream_0);
+    sp_crt_cuda_memcpy_h2d(ctx->d_b_m1, h_b_m1, b_size * sizeof(uint32_t), ctx->stream_0);
+    sp_crt_cuda_memcpy_h2d(ctx->d_a_m2, h_a_m2, a_size * sizeof(uint32_t), ctx->stream_1);
+    sp_crt_cuda_memcpy_h2d(ctx->d_b_m2, h_b_m2, b_size * sizeof(uint32_t), ctx->stream_1);
+
+    free(h_a_m1); free(h_b_m1); free(h_a_m2); free(h_b_m2);
+
+    // --- Step 3: Dual-ring matmul on both streams (concurrent) ---
+    // Ring M1 (Mersenne) on stream_0
+    sp_crt_cuda_matmul_mersenne(ctx->d_a_m1, ctx->d_b_m1, ctx->d_c_m1,
+                                 M, N, K, ctx->stream_0);
+    // Ring M2 (generic mod) on stream_1
+    sp_crt_cuda_matmul_mod(ctx->d_a_m2, ctx->d_b_m2, ctx->d_c_m2,
+                            M, N, K, SP_CRT_M2, ctx->stream_1);
+
+    // --- Step 4: D2H async on both streams ---
+    sp_crt_cuda_memcpy_d2h(ctx->h_residue_0, ctx->d_c_m1,
+                            c_size * sizeof(uint32_t), ctx->stream_0);
+    sp_crt_cuda_memcpy_d2h(ctx->h_residue_1, ctx->d_c_m2,
+                            c_size * sizeof(uint32_t), ctx->stream_1);
+
+    // --- Step 5: Synchronize both streams ---
+    sp_crt_cuda_stream_sync(ctx->stream_0);
+    sp_crt_cuda_stream_sync(ctx->stream_1);
+
+    // --- Step 6: Signed Garner reconstruction on host (i9 AVX-512) ---
+    const double inv_scale = 1.0 / (ctx->act_quant.scale * ctx->weight_quant.scale);
+
+    for (size_t i = 0; i < c_size; i++) {
+        double signed_val = sp_crt_garner_signed(ctx->h_residue_0[i],
+                                                  ctx->h_residue_1[i]);
+        C[i] = (float)(signed_val * inv_scale);
     }
 
     return 0;

@@ -187,6 +187,90 @@ extern "C" void sp_crt_cuda_matmul_mod(const uint32_t *d_A,
         d_A, d_B, d_C, M, N, K, modulus);
 }
 
+// ============================================================================
+// Zero-centered symmetric quantization kernel (GPU-side)
+// ============================================================================
+//
+// Maps positive floats → small ring integers, negative → M - |q|.
+// This is the GPU-side equivalent of sp_crt_quantize_symmetric in sp_crt.c.
+
+__global__ void kernel_quantize_symmetric(const float * __restrict__ input,
+                                           uint32_t * __restrict__ output,
+                                           int n,
+                                           double scale,
+                                           uint64_t modulus) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    double qd = (double)input[idx] * scale;
+    int64_t q = (qd >= 0.0) ? (int64_t)(qd + 0.5) : -(int64_t)(-qd + 0.5);
+
+    if (q >= 0) {
+        output[idx] = (uint32_t)((uint64_t)q % modulus);
+    } else {
+        uint64_t pos = (uint64_t)(-q);
+        pos %= modulus;
+        output[idx] = (pos == 0) ? 0 : (uint32_t)(modulus - pos);
+    }
+}
+
+extern "C" void sp_crt_cuda_quantize_symmetric(const float *d_input,
+                                                 uint32_t *d_output,
+                                                 int n,
+                                                 double scale,
+                                                 uint64_t modulus,
+                                                 void *stream) {
+    int block_size = 256;
+    int grid_size = (n + block_size - 1) / block_size;
+    kernel_quantize_symmetric<<<grid_size, block_size, 0, (cudaStream_t)stream>>>(
+        d_input, d_output, n, scale, modulus);
+}
+
+// ============================================================================
+// CUDA memory helpers for CRT GPU dispatch
+// ============================================================================
+
+extern "C" void* sp_crt_cuda_alloc(size_t bytes) {
+    void *ptr = NULL;
+    cudaError_t err = cudaMalloc(&ptr, bytes);
+    return (err == cudaSuccess) ? ptr : NULL;
+}
+
+extern "C" void sp_crt_cuda_free(void *ptr) {
+    if (ptr) cudaFree(ptr);
+}
+
+extern "C" int sp_crt_cuda_memcpy_h2d(void *dst, const void *src, size_t bytes, void *stream) {
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes,
+                                       cudaMemcpyHostToDevice, (cudaStream_t)stream);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int sp_crt_cuda_memcpy_d2h(void *dst, const void *src, size_t bytes, void *stream) {
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes,
+                                       cudaMemcpyDeviceToHost, (cudaStream_t)stream);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" int sp_crt_cuda_stream_sync(void *stream) {
+    cudaError_t err = cudaStreamSynchronize((cudaStream_t)stream);
+    return (err == cudaSuccess) ? 0 : -1;
+}
+
+extern "C" void* sp_crt_cuda_stream_create(void) {
+    cudaStream_t s;
+    cudaError_t err = cudaStreamCreate(&s);
+    return (err == cudaSuccess) ? (void*)s : NULL;
+}
+
+extern "C" void sp_crt_cuda_stream_destroy(void *stream) {
+    if (stream) cudaStreamDestroy((cudaStream_t)stream);
+}
+
+// ============================================================================
+// Host launchers (existing)
+// ============================================================================
+
 extern "C" void sp_crt_cuda_quantize(const float *d_input,
                                       uint32_t *d_output,
                                       int n,
