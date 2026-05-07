@@ -12,7 +12,10 @@
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
 #  include <windows.h>
+#  pragma comment(lib, "ws2_32.lib")
 #else
 #  include <time.h>
 #  include <sys/socket.h>
@@ -178,21 +181,17 @@ int sp_beast_init(sp_beast_engine_t *engine, const sp_beast_config_t *cfg) {
     sp_hetero_barrier_init(&engine->barrier);
 
     if (!cfg->force_cpu_only) {
-        // Add CUDA GPU if requested
-        if (cfg->cuda_device >= 0) {
-            sp_hetero_add_gpu(&engine->barrier, SP_GPU_CUDA, cfg->cuda_device);
-        } else {
-            // Auto-detect: try device 0
-            // TODO: actual CUDA runtime detection
-            fprintf(stderr, "[BOOT] CUDA: will init at first dispatch (lazy)\n");
-        }
+        // Try auto-detection first — finds CUDA discrete + Vulkan integrated
+        int n_detected = sp_hetero_detect_gpus(&engine->barrier);
 
-        // Add Vulkan/Xe GPU if requested
-        if (cfg->vulkan_device >= 0) {
-            sp_hetero_add_gpu(&engine->barrier, SP_GPU_VULKAN, cfg->vulkan_device);
-        } else {
-            // Auto-detect Intel Xe iGPU
-            fprintf(stderr, "[BOOT] Vulkan/Xe: will init at first dispatch (lazy)\n");
+        // If auto-detect didn't find GPUs, allow manual override
+        if (n_detected == 0) {
+            if (cfg->cuda_device >= 0) {
+                sp_hetero_add_gpu(&engine->barrier, SP_GPU_CUDA, cfg->cuda_device);
+            }
+            if (cfg->vulkan_device >= 0) {
+                sp_hetero_add_gpu(&engine->barrier, SP_GPU_VULKAN, cfg->vulkan_device);
+            }
         }
     } else {
         fprintf(stderr, "[BOOT] CPU-only mode (GPUs disabled)\n");
