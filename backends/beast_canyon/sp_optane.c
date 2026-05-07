@@ -511,20 +511,20 @@ static void sp_optane_build_expert_table(sp_optane_reservoir_t *res) {
 
         // Try per-expert pattern: blk.{L}.ffn_{gate|up|down}.{E}.weight
         if (sscanf(t->name, "blk.%d.ffn_gate.%d.", &layer, &expert) == 2) {
-            if (expert >= 0 && expert < res->n_experts) {
+            if (expert >= 0 && expert < res->n_experts && expert < SP_OPTANE_MAX_EXPERTS) {
                 res->experts[expert].gate_proj = t;
                 res->experts[expert].layer = layer;
                 res->experts[expert].total_bytes += t->n_bytes;
             }
         }
         else if (sscanf(t->name, "blk.%d.ffn_up.%d.", &layer, &expert) == 2) {
-            if (expert >= 0 && expert < res->n_experts) {
+            if (expert >= 0 && expert < res->n_experts && expert < SP_OPTANE_MAX_EXPERTS) {
                 res->experts[expert].up_proj = t;
                 res->experts[expert].total_bytes += t->n_bytes;
             }
         }
         else if (sscanf(t->name, "blk.%d.ffn_down.%d.", &layer, &expert) == 2) {
-            if (expert >= 0 && expert < res->n_experts) {
+            if (expert >= 0 && expert < res->n_experts && expert < SP_OPTANE_MAX_EXPERTS) {
                 res->experts[expert].down_proj = t;
                 res->experts[expert].total_bytes += t->n_bytes;
             }

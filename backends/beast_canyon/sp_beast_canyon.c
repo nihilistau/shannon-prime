@@ -155,13 +155,20 @@ int sp_beast_init(sp_beast_engine_t *engine, const sp_beast_config_t *cfg) {
     // Auto-size staging: enough for one expert's largest tensor
     size_t staging_elems = cfg->staging_elements;
     if (staging_elems == 0) {
-        // Find the largest expert projection tensor
+        // Find the largest expert projection tensor.
+        // Qwen3.6+ uses fused expert tensors (ffn_down_exps) rather than
+        // per-expert gate/up/down — most expert slots will be empty.
+        // Guard against NULL pointers and corrupted sizes.
         if (engine->reservoir.is_moe) {
             for (int e = 0; e < engine->reservoir.n_experts; e++) {
                 const sp_optane_expert_t *exp = &engine->reservoir.experts[e];
-                if (exp->gate_proj && exp->gate_proj->n_bytes > staging_elems * 2) {
+                if (!exp->gate_proj) continue;
+                size_t nbytes = exp->gate_proj->n_bytes;
+                // Sanity: reject sizes > 2 GB (corrupt parse artifact)
+                if (nbytes == 0 || nbytes > (size_t)2 * 1024 * 1024 * 1024) continue;
+                if (nbytes > staging_elems * 2) {
                     // Estimate elements from bytes (Q4_0: 32 elems per 18 bytes)
-                    staging_elems = exp->gate_proj->n_bytes * 32 / 18;
+                    staging_elems = nbytes * 32 / 18;
                 }
             }
         }
@@ -219,6 +226,24 @@ int sp_beast_init(sp_beast_engine_t *engine, const sp_beast_config_t *cfg) {
         fprintf(stderr, "[BOOT] Stage 5: Sidecar disabled (CPU handles Prime-PE)\n");
     }
 
+    // ── Stage 5b: Initialize Shadow-Steal (Level Zero UHD dispatch) ──
+    {
+        // Shadow-steal uses L0 to speculatively pre-compute MoE experts
+        // on the Intel UHD iGPU via Ring Bus USM.  Falls back to stub mode
+        // (instant-ready) if ze_loader.dll is absent or no iGPU detected.
+        size_t expert_dim = (engine->reservoir.n_embd > 0)
+                          ? (size_t)engine->reservoir.n_embd
+                          : 4096;
+        float tau = 0.7f;  // Default speculation threshold
+        int ss_rc = sp_shadow_steal_init(&engine->shadow_steal, expert_dim, tau);
+        if (ss_rc == 0) {
+            fprintf(stderr, "[BOOT] Shadow-Steal: initialized (expert_dim=%zu, tau=%.2f)\n",
+                    expert_dim, tau);
+        } else {
+            fprintf(stderr, "[BOOT] Shadow-Steal: init failed (rc=%d) — speculation disabled\n", ss_rc);
+        }
+    }
+
     // ── Stage 6: Initialize KV cache ────────────────────────────────
     fprintf(stderr, "[BOOT] Stage 6: Initializing Shannon-Prime KV cache...\n");
     // The KV cache uses the model's actual dimensions
@@ -258,6 +283,9 @@ void sp_beast_free(sp_beast_engine_t *engine) {
     fprintf(stderr, "[sp-beast] Shutting down Beast Canyon engine...\n");
 
     // Order matters: Level Zero/Vulkan before CUDA (per safeguard spec)
+    sp_shadow_steal_log_efficiency(&engine->shadow_steal);
+    sp_shadow_steal_free(&engine->shadow_steal);
+
     sp_beast_sidecar_disconnect(engine);
 
     // Free ping-pong buffers

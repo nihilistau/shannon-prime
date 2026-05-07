@@ -30,7 +30,7 @@ extern "C" {
 // ============================================================================
 
 #define SP_OPTANE_PAGE_SIZE      4096        // Optane 4KB page granularity
-#define SP_OPTANE_MAX_EXPERTS    64          // Max MoE experts (27B has 16)
+#define SP_OPTANE_MAX_EXPERTS    512         // Max MoE experts (Qwen3.6 has 256)
 #define SP_OPTANE_MAX_TENSORS    4096        // Max tensors in a GGUF file
 #define SP_OPTANE_PREFETCH_DIST  8           // Pages to prefetch ahead
 
