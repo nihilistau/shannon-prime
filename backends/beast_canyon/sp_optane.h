@@ -35,7 +35,7 @@ extern "C" {
 #define SP_OPTANE_PREFETCH_DIST  8           // Pages to prefetch ahead
 
 // GGUF magic and constants (from gguf spec)
-#define SP_GGUF_MAGIC            0x46475547  // "GGUF" little-endian
+#define SP_GGUF_MAGIC            0x46554747  // "GGUF" as uint32 LE
 #define SP_GGUF_VERSION_3        3
 
 // GGUF value types
