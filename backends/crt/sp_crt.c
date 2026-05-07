@@ -37,6 +37,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "sp_crt_vulkan.h"
+
+// Forward-declare the hetero barrier type for sp_crt_init_gpu_hetero
+#include "../beast_canyon/sp_hetero_sync.h"
+
 // ============================================================================
 // Quantization calibration — zero-centered symmetric
 // ============================================================================
@@ -201,15 +206,22 @@ void sp_crt_free(sp_crt_context_t *ctx) {
     free(ctx->h_residue_1);
     free(ctx->h_output);
     if (ctx->gpu_ready) {
+        // Ring M1 is always CUDA
         sp_crt_cuda_free(ctx->d_a_m1);
         sp_crt_cuda_free(ctx->d_b_m1);
         sp_crt_cuda_free(ctx->d_c_m1);
-        sp_crt_cuda_free(ctx->d_a_m2);
-        sp_crt_cuda_free(ctx->d_b_m2);
-        sp_crt_cuda_free(ctx->d_c_m2);
-        // Only destroy streams we created (stream_0/stream_1 may be caller-owned)
-        // For safety, always destroy — caller should set to NULL before free
-        // if they own the streams.
+
+        // Ring M2: Vulkan or CUDA
+        if (ctx->vk_ring2 && ctx->vk_ctx) {
+            sp_crt_vulkan_ctx_t *vk = (sp_crt_vulkan_ctx_t *)ctx->vk_ctx;
+            // Vulkan buffers are freed inside sp_crt_vulkan_free
+            sp_crt_vulkan_free(vk);
+            ctx->vk_ctx = NULL;
+        } else {
+            sp_crt_cuda_free(ctx->d_a_m2);
+            sp_crt_cuda_free(ctx->d_b_m2);
+            sp_crt_cuda_free(ctx->d_c_m2);
+        }
     }
     memset(ctx, 0, sizeof(*ctx));
 }
@@ -363,6 +375,105 @@ int sp_crt_init_gpu(sp_crt_context_t *ctx) {
     return 0;
 }
 
+// ============================================================================
+// Heterogeneous GPU init: CUDA (Ring M1) + Vulkan (Ring M2)
+// ============================================================================
+
+int sp_crt_init_gpu_hetero(sp_crt_context_t *ctx, void *barrier_ptr) {
+    sp_hetero_barrier_t *barrier = (sp_hetero_barrier_t *)barrier_ptr;
+    if (!ctx->initialized) return -1;
+    if (!barrier || barrier->n_gpus < 2) {
+        // Fall back to CUDA-only if we don't have 2 GPUs
+        fprintf(stderr, "[Shannon-Prime CRT] Hetero: need 2 GPUs, have %d — falling back to CUDA-only\n",
+                barrier ? barrier->n_gpus : 0);
+        return sp_crt_init_gpu(ctx);
+    }
+
+    // Verify GPU[0]=CUDA, GPU[1]=Vulkan
+    if (barrier->gpu[0].type != SP_GPU_CUDA ||
+        barrier->gpu[1].type != SP_GPU_VULKAN) {
+        fprintf(stderr, "[Shannon-Prime CRT] Hetero: expected GPU[0]=CUDA, GPU[1]=Vulkan — falling back\n");
+        return sp_crt_init_gpu(ctx);
+    }
+
+    size_t max_a = (size_t)ctx->M * ctx->K * sizeof(uint32_t);
+    size_t max_b = (size_t)ctx->K * ctx->N * sizeof(uint32_t);
+    size_t max_c = (size_t)ctx->M * ctx->N * sizeof(uint32_t);
+    int max_elems = ctx->M * ctx->N;  // largest buffer in elements
+    if (ctx->M * ctx->K > max_elems) max_elems = ctx->M * ctx->K;
+    if (ctx->K * ctx->N > max_elems) max_elems = ctx->K * ctx->N;
+
+    // --- Ring M1: CUDA on RTX 2060 (GPU[0]) ---
+    ctx->d_a_m1 = (uint32_t *)sp_crt_cuda_alloc(max_a);
+    ctx->d_b_m1 = (uint32_t *)sp_crt_cuda_alloc(max_b);
+    ctx->d_c_m1 = (uint32_t *)sp_crt_cuda_alloc(max_c);
+
+    if (!ctx->d_a_m1 || !ctx->d_b_m1 || !ctx->d_c_m1) {
+        fprintf(stderr, "[Shannon-Prime CRT] Hetero: CUDA alloc failed — falling back\n");
+        sp_crt_cuda_free(ctx->d_a_m1);
+        sp_crt_cuda_free(ctx->d_b_m1);
+        sp_crt_cuda_free(ctx->d_c_m1);
+        ctx->d_a_m1 = ctx->d_b_m1 = ctx->d_c_m1 = NULL;
+        return sp_crt_init_gpu(ctx);
+    }
+
+    // CUDA stream from barrier
+    ctx->stream_0 = barrier->gpu[0].stream;
+    if (!ctx->stream_0) ctx->stream_0 = sp_crt_cuda_stream_create();
+
+    // --- Ring M2: Vulkan on Intel UHD (GPU[1]) ---
+    sp_crt_vulkan_ctx_t *vk = sp_crt_vulkan_init(
+        barrier->gpu[1].context,   // VkInstance from hetero detect
+        barrier->gpu[1].device_id, // Physical device index
+        max_elems);
+
+    if (!vk) {
+        fprintf(stderr, "[Shannon-Prime CRT] Hetero: Vulkan init failed — Ring M2 on CUDA\n");
+        // Allocate Ring M2 on CUDA too (same GPU, two streams)
+        ctx->d_a_m2 = (uint32_t *)sp_crt_cuda_alloc(max_a);
+        ctx->d_b_m2 = (uint32_t *)sp_crt_cuda_alloc(max_b);
+        ctx->d_c_m2 = (uint32_t *)sp_crt_cuda_alloc(max_c);
+        if (!ctx->d_a_m2 || !ctx->d_b_m2 || !ctx->d_c_m2) {
+            sp_crt_cuda_free(ctx->d_a_m2);
+            sp_crt_cuda_free(ctx->d_b_m2);
+            sp_crt_cuda_free(ctx->d_c_m2);
+            ctx->d_a_m2 = ctx->d_b_m2 = ctx->d_c_m2 = NULL;
+            return -2;
+        }
+        ctx->stream_1 = sp_crt_cuda_stream_create();
+        ctx->vk_ring2 = 0;
+    } else {
+        // Vulkan success — allocate Ring M2 buffers on Vulkan device
+        ctx->d_a_m2 = sp_crt_vulkan_alloc(vk, max_a);
+        ctx->d_b_m2 = sp_crt_vulkan_alloc(vk, max_b);
+        ctx->d_c_m2 = sp_crt_vulkan_alloc(vk, max_c);
+        if (!ctx->d_a_m2 || !ctx->d_b_m2 || !ctx->d_c_m2) {
+            fprintf(stderr, "[Shannon-Prime CRT] Hetero: Vulkan buffer alloc failed\n");
+            sp_crt_vulkan_free(vk);
+            return -2;
+        }
+        ctx->stream_1 = sp_crt_vulkan_get_queue(vk);
+        ctx->vk_ctx = vk;
+        ctx->vk_ring2 = 1;
+
+        // Update barrier GPU[1] with our Vulkan handles for fence polling
+        barrier->gpu[1].stream = sp_crt_vulkan_get_queue(vk);
+        barrier->gpu[1].event  = sp_crt_vulkan_get_fence(vk);
+    }
+
+    ctx->gpu_ready = 1;
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime CRT] HETEROGENEOUS dispatch ready:\n"
+                        "  Ring M1 (Mersenne): CUDA on %s\n"
+                        "  Ring M2 (generic):  %s on %s\n",
+                barrier->gpu[0].name,
+                ctx->vk_ring2 ? "Vulkan" : "CUDA",
+                ctx->vk_ring2 ? barrier->gpu[1].name : barrier->gpu[0].name);
+    }
+    return 0;
+}
+
 int sp_crt_matmul_gpu(sp_crt_context_t *ctx,
                       const float *A, const float *B, float *C,
                       int M, int N, int K) {
@@ -390,31 +501,59 @@ int sp_crt_matmul_gpu(sp_crt_context_t *ctx,
     sp_crt_cpu_quantize_symmetric(A, h_a_m2, (int)a_size, ctx->act_quant.scale, SP_CRT_M2);
     sp_crt_cpu_quantize_symmetric(B, h_b_m2, (int)b_size, ctx->weight_quant.scale, SP_CRT_M2);
 
-    // --- Step 2: H2D transfers (async on respective streams) ---
+    // --- Step 2: H2D transfers ---
+    // Ring M1 always goes via CUDA (RTX 2060)
     sp_crt_cuda_memcpy_h2d(ctx->d_a_m1, h_a_m1, a_size * sizeof(uint32_t), ctx->stream_0);
     sp_crt_cuda_memcpy_h2d(ctx->d_b_m1, h_b_m1, b_size * sizeof(uint32_t), ctx->stream_0);
-    sp_crt_cuda_memcpy_h2d(ctx->d_a_m2, h_a_m2, a_size * sizeof(uint32_t), ctx->stream_1);
-    sp_crt_cuda_memcpy_h2d(ctx->d_b_m2, h_b_m2, b_size * sizeof(uint32_t), ctx->stream_1);
+
+    // Ring M2: Vulkan (Intel UHD) or CUDA (same GPU, second stream)
+    if (ctx->vk_ring2) {
+        sp_crt_vulkan_ctx_t *vk = (sp_crt_vulkan_ctx_t *)ctx->vk_ctx;
+        sp_crt_vulkan_memcpy_h2d(vk, ctx->d_a_m2, h_a_m2, a_size * sizeof(uint32_t));
+        sp_crt_vulkan_memcpy_h2d(vk, ctx->d_b_m2, h_b_m2, b_size * sizeof(uint32_t));
+    } else {
+        sp_crt_cuda_memcpy_h2d(ctx->d_a_m2, h_a_m2, a_size * sizeof(uint32_t), ctx->stream_1);
+        sp_crt_cuda_memcpy_h2d(ctx->d_b_m2, h_b_m2, b_size * sizeof(uint32_t), ctx->stream_1);
+    }
 
     free(h_a_m1); free(h_b_m1); free(h_a_m2); free(h_b_m2);
 
-    // --- Step 3: Dual-ring matmul on both streams (concurrent) ---
-    // Ring M1 (Mersenne) on stream_0
+    // --- Step 3: Dual-ring matmul (concurrent on both GPUs) ---
+    // Ring M1 (Mersenne) on CUDA stream_0
     sp_crt_cuda_matmul_mersenne(ctx->d_a_m1, ctx->d_b_m1, ctx->d_c_m1,
                                  M, N, K, ctx->stream_0);
-    // Ring M2 (generic mod) on stream_1
-    sp_crt_cuda_matmul_mod(ctx->d_a_m2, ctx->d_b_m2, ctx->d_c_m2,
-                            M, N, K, SP_CRT_M2, ctx->stream_1);
 
-    // --- Step 4: D2H async on both streams ---
+    // Ring M2 (generic mod) — Vulkan on Intel UHD or CUDA stream_1
+    if (ctx->vk_ring2) {
+        sp_crt_vulkan_ctx_t *vk = (sp_crt_vulkan_ctx_t *)ctx->vk_ctx;
+        sp_crt_vulkan_matmul_mod_dispatch(vk, ctx->d_a_m2, ctx->d_b_m2, ctx->d_c_m2,
+                                          M, N, K, (uint32_t)SP_CRT_M2);
+    } else {
+        sp_crt_cuda_matmul_mod(ctx->d_a_m2, ctx->d_b_m2, ctx->d_c_m2,
+                                M, N, K, SP_CRT_M2, ctx->stream_1);
+    }
+
+    // --- Step 4: D2H transfers ---
     sp_crt_cuda_memcpy_d2h(ctx->h_residue_0, ctx->d_c_m1,
                             c_size * sizeof(uint32_t), ctx->stream_0);
-    sp_crt_cuda_memcpy_d2h(ctx->h_residue_1, ctx->d_c_m2,
-                            c_size * sizeof(uint32_t), ctx->stream_1);
 
-    // --- Step 5: Synchronize both streams ---
+    if (ctx->vk_ring2) {
+        sp_crt_vulkan_ctx_t *vk = (sp_crt_vulkan_ctx_t *)ctx->vk_ctx;
+        sp_crt_vulkan_memcpy_d2h(vk, ctx->h_residue_1, ctx->d_c_m2,
+                                  c_size * sizeof(uint32_t));
+    } else {
+        sp_crt_cuda_memcpy_d2h(ctx->h_residue_1, ctx->d_c_m2,
+                                c_size * sizeof(uint32_t), ctx->stream_1);
+    }
+
+    // --- Step 5: Synchronize both GPUs ---
     sp_crt_cuda_stream_sync(ctx->stream_0);
-    sp_crt_cuda_stream_sync(ctx->stream_1);
+    if (ctx->vk_ring2) {
+        sp_crt_vulkan_ctx_t *vk = (sp_crt_vulkan_ctx_t *)ctx->vk_ctx;
+        sp_crt_vulkan_sync(vk);
+    } else {
+        sp_crt_cuda_stream_sync(ctx->stream_1);
+    }
 
     // --- Step 6: Signed Garner reconstruction on host (i9 AVX-512) ---
     const double inv_scale = 1.0 / (ctx->act_quant.scale * ctx->weight_quant.scale);

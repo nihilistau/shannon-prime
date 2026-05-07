@@ -197,6 +197,10 @@ typedef struct {
     uint32_t *d_c_m2;       // [M × N] output residues on GPU 1
     int       gpu_ready;    // 1 if device buffers are allocated
 
+    // Heterogeneous dispatch: Ring M2 on Vulkan (Intel UHD) instead of CUDA
+    int       vk_ring2;     // 1 if Ring M2 uses Vulkan compute
+    void     *vk_ctx;       // sp_crt_vulkan_ctx_t* (opaque, for Ring M2 Vulkan dispatch)
+
     int initialized;
 } sp_crt_context_t;
 
@@ -242,6 +246,14 @@ int sp_crt_matmul(sp_crt_context_t *ctx,
 // Call once after sp_crt_init. Free'd by sp_crt_free.
 
 int sp_crt_init_gpu(sp_crt_context_t *ctx);
+
+// Initialize GPU dispatch with heterogeneous split:
+//   Ring M1 (Mersenne) → CUDA on GPU 0 (e.g. RTX 2060)
+//   Ring M2 (generic)  → Vulkan on GPU 1 (e.g. Intel UHD)
+// barrier: initialized sp_hetero_barrier_t* (cast to void* to avoid
+// circular header dependency — sp_crt.h must not include sp_hetero_sync.h).
+// Falls back to CUDA-only if Vulkan init fails.
+int sp_crt_init_gpu_hetero(sp_crt_context_t *ctx, void *barrier);
 
 // GPU-dispatch matmul: quantize on GPU, dual-ring matmul on two
 // streams, Garner on host. Falls back to CPU if gpu_ready == 0.
