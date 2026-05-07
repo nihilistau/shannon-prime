@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <float.h>
+#include <stdbool.h>
 
 // ============================================================================
 // 1. QUATERNION WEIGHT MATRICES
