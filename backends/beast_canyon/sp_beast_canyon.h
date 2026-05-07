@@ -28,6 +28,10 @@
 #include "sp_optane.h"
 #include "sp_avx512_shredder.h"
 #include "sp_hetero_sync.h"
+#include "sp_shadow_steal.h"
+#include "sp_thermal_throttle.h"
+#include "sp_prefetch_telemetry.h"
+#include "sp_shredder_crt.h"
 #include "../../core/shannon_prime.h"
 
 #include <stdint.h>
@@ -69,6 +73,13 @@ typedef struct {
 
     // --- Shannon-Prime compression ---
     sp_config_t  sp_config;          // VHT2 + band config for KV cache
+
+    // --- Shadow-Steal ---
+    float        shadow_steal_tau;    // Confidence threshold (0 = disabled)
+    bool         enable_shadow_steal; // Master switch for speculative UHD dispatch
+
+    // --- Thermal ---
+    float        thermal_tau_base;    // Base tau for thermal homeostat (default 0.50)
 
     // --- Diagnostics ---
     bool         enable_dashboard;   // Real-time ASCII dashboard
@@ -137,6 +148,12 @@ typedef struct {
     sp_shredder_t          shredder;     // AVX-512 dequantization
     sp_hetero_barrier_t    barrier;      // Cross-GPU sync
     sp_sidecar_t           sidecar;      // S22U optional sidecar
+
+    // MoE speculation + telemetry subsystems
+    sp_shadow_steal_t      shadow_steal;    // Speculative UHD dispatch
+    sp_thermal_homeostat_t thermal;         // Thermal-aware throttle
+    sp_prefetch_telemetry_t telemetry;      // Speculation metrics
+    sp_shredder_crt_t      shredder_crt;   // Residue-aware CRT shredder
 
     // Ping-pong buffers (one per GPU)
     sp_pingpong_t          pingpong[2];  // [0] = GPU A, [1] = GPU B

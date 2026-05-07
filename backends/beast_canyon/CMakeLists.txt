@@ -15,6 +15,10 @@ set(SP_BEAST_SOURCES
     sp_hetero_sync.c
     sp_beast_canyon.c
     sp_diagnostics_bc.c
+    sp_shadow_steal.c
+    sp_thermal_throttle.c
+    sp_prefetch_telemetry.c
+    sp_shredder_crt.c
 )
 
 set(SP_BEAST_HEADERS
@@ -23,6 +27,10 @@ set(SP_BEAST_HEADERS
     sp_hetero_sync.h
     sp_beast_canyon.h
     sp_diagnostics_bc.h
+    sp_shadow_steal.h
+    sp_thermal_throttle.h
+    sp_prefetch_telemetry.h
+    sp_shredder_crt.h
 )
 
 # Library target
@@ -31,6 +39,7 @@ add_library(sp_beast_canyon STATIC ${SP_BEAST_SOURCES})
 target_include_directories(sp_beast_canyon
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../core
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../crt
 )
 
 # Platform flags
