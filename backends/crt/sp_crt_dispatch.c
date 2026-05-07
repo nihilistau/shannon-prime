@@ -5,6 +5,7 @@
 // Commercial license available — contact raydaniels@gmail.com
 
 #include "sp_crt_dispatch.h"
+#include "../beast_canyon/sp_hetero_sync.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -43,8 +44,22 @@ int sp_crt_dispatch_init(sp_crt_dispatch_t* d, int max_dim) {
     int rc = sp_crt_init(&d->crt, max_dim, max_dim, max_dim, NULL, NULL);
     if (rc != 0) return rc;
 
-    // Try GPU acceleration. Non-fatal if it fails (CPU fallback).
-    sp_crt_init_gpu(&d->crt);
+    // Try heterogeneous GPU acceleration (CUDA + Vulkan) first.
+    // Falls back to CUDA-only, then CPU if both fail. Non-fatal.
+    {
+        sp_hetero_barrier_t barrier;
+        memset(&barrier, 0, sizeof(barrier));
+        int det = sp_hetero_detect_gpus(&barrier);
+        if (det == 0 && barrier.n_gpus >= 2) {
+            int hrc = sp_crt_init_gpu_hetero(&d->crt, &barrier);
+            if (hrc != 0) {
+                fprintf(stderr, "[Shannon-Prime CRT] Hetero init failed (rc=%d), trying CUDA-only\n", hrc);
+                sp_crt_init_gpu(&d->crt);
+            }
+        } else {
+            sp_crt_init_gpu(&d->crt);
+        }
+    }
 
     // Transpose scratch: max_M * max_K floats for the ggml path.
     d->transpose_scratch = (float*)malloc((size_t)max_dim * max_dim * sizeof(float));
