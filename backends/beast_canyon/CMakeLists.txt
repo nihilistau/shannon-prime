@@ -35,8 +35,6 @@ target_include_directories(sp_beast_canyon
 
 # Platform flags
 if(MSVC)
-    # MSVC: AVX-512 is enabled by default on supporting CPUs.
-    # /arch:AVX512 ensures the compiler can use 512-bit instructions.
     target_compile_options(sp_beast_canyon PRIVATE /arch:AVX512 /O2)
 elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sp_beast_canyon PRIVATE
@@ -55,20 +53,64 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(sp_beast_canyon PRIVATE rt pthread)
 endif()
 
-# CUDA support
+# CUDA runtime support — beast_canyon only uses cudart (no .cu compilation).
+# This does NOT call enable_language(CUDA) which would require nvcc+MSVC.
+# On MinGW, MSVC .lib files can't link directly (security cookie symbols),
+# so we generate a MinGW import lib from the DLL at configure time.
 option(SP_WITH_CUDA "Enable NVIDIA CUDA dispatch" OFF)
 if(SP_WITH_CUDA)
-    find_package(CUDAToolkit REQUIRED)
-    target_compile_definitions(sp_beast_canyon PRIVATE SP_WITH_CUDA)
-    target_link_libraries(sp_beast_canyon PRIVATE CUDA::cudart)
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_compile_definitions(sp_beast_canyon PUBLIC SP_WITH_CUDA)
+        target_include_directories(sp_beast_canyon PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+
+        if(MINGW)
+            # MinGW can't link MSVC .lib — generate import lib from DLL
+            set(_cudart_dll "${CUDAToolkit_BIN_DIR}/cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
+            if(NOT EXISTS "${_cudart_dll}")
+                # Try bin/x64/ (CUDA 13+ layout)
+                set(_cudart_dll "${CUDAToolkit_BIN_DIR}/../bin/x64/cudart64_${CUDAToolkit_VERSION_MAJOR}.dll")
+            endif()
+            set(_mingw_cudart "${CMAKE_BINARY_DIR}/libcudart_mingw.a")
+            if(EXISTS "${_cudart_dll}" AND NOT EXISTS "${_mingw_cudart}")
+                set(_def "${CMAKE_BINARY_DIR}/cudart64.def")
+                execute_process(COMMAND gendef "${_cudart_dll}"
+                                WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+                                RESULT_VARIABLE _gendef_rc)
+                file(GLOB _def_files "${CMAKE_BINARY_DIR}/cudart64*.def")
+                if(_def_files)
+                    list(GET _def_files 0 _def)
+                    execute_process(COMMAND dlltool -d "${_def}" -l "${_mingw_cudart}"
+                                    RESULT_VARIABLE _dlltool_rc)
+                endif()
+            endif()
+            if(EXISTS "${_mingw_cudart}")
+                target_link_libraries(sp_beast_canyon PUBLIC "${_mingw_cudart}")
+                message(STATUS "Beast Canyon CUDA: ON (MinGW import lib from ${_cudart_dll})")
+            else()
+                message(WARNING "Beast Canyon: could not generate MinGW cudart import lib")
+                target_link_libraries(sp_beast_canyon PUBLIC CUDA::cudart)
+            endif()
+        else()
+            target_link_libraries(sp_beast_canyon PUBLIC CUDA::cudart)
+            message(STATUS "Beast Canyon CUDA: ON (cudart from ${CUDAToolkit_LIBRARY_DIR})")
+        endif()
+    else()
+        message(WARNING "Beast Canyon: SP_WITH_CUDA=ON but CUDAToolkit not found — CUDA disabled")
+    endif()
 endif()
 
 # Vulkan support
 option(SP_WITH_VULKAN "Enable Vulkan dispatch" OFF)
 if(SP_WITH_VULKAN)
-    find_package(Vulkan REQUIRED)
-    target_compile_definitions(sp_beast_canyon PRIVATE SP_WITH_VULKAN)
-    target_link_libraries(sp_beast_canyon PRIVATE Vulkan::Vulkan)
+    find_package(Vulkan QUIET)
+    if(Vulkan_FOUND)
+        target_compile_definitions(sp_beast_canyon PUBLIC SP_WITH_VULKAN)
+        target_link_libraries(sp_beast_canyon PUBLIC Vulkan::Vulkan)
+        message(STATUS "Beast Canyon Vulkan: ON (${Vulkan_LIBRARY})")
+    else()
+        message(WARNING "Beast Canyon: SP_WITH_VULKAN=ON but Vulkan not found — Vulkan disabled")
+    endif()
 endif()
 
 # Standalone test binary
