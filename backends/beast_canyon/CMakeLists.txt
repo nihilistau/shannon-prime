@@ -47,7 +47,7 @@ if(MSVC)
     target_compile_options(sp_beast_canyon PRIVATE /arch:AVX512 /O2)
 elseif(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(sp_beast_canyon PRIVATE
-        -mavx512f -mavx512bw -mavx512vl -mf16c -mfma
+        -mavx512f -mavx512bw -mavx512dq -mavx512vl -mf16c -mfma
         -O3 -march=native
     )
 endif()
