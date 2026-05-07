@@ -2,8 +2,9 @@
 # Heterogeneous MoE Orchestrator: Optane + AVX-512 + dual-GPU + sidecar
 #
 # Build options:
-#   -DSP_WITH_CUDA=ON    — Enable NVIDIA CUDA dispatch
-#   -DSP_WITH_VULKAN=ON  — Enable Vulkan dispatch (Intel Xe, AMD, etc.)
+#   -DSP_WITH_CUDA=ON       — Enable NVIDIA CUDA dispatch
+#   -DSP_WITH_VULKAN=ON     — Enable Vulkan dispatch (Intel Xe, AMD, etc.)
+#   -DSP_WITH_LEVEL_ZERO=ON — Enable Intel Level Zero (UHD iGPU via Ring Bus)
 #   -DSP_BEAST_STANDALONE=ON — Build standalone test binary
 
 cmake_minimum_required(VERSION 3.18)
@@ -19,6 +20,7 @@ set(SP_BEAST_SOURCES
     sp_thermal_throttle.c
     sp_prefetch_telemetry.c
     sp_shredder_crt.c
+    sp_level_zero.c
 )
 
 set(SP_BEAST_HEADERS
@@ -31,6 +33,7 @@ set(SP_BEAST_HEADERS
     sp_thermal_throttle.h
     sp_prefetch_telemetry.h
     sp_shredder_crt.h
+    sp_level_zero.h
 )
 
 # Library target
@@ -120,6 +123,16 @@ if(SP_WITH_VULKAN)
     else()
         message(WARNING "Beast Canyon: SP_WITH_VULKAN=ON but Vulkan not found — Vulkan disabled")
     endif()
+endif()
+
+# Level Zero support — dynamic loading, no SDK required at compile time.
+# ze_loader.dll is loaded at runtime via LoadLibrary/dlopen.
+# All L0 types are defined in sp_level_zero.h (vendored minimal subset).
+# This option just sets the compile definition; no find_package needed.
+option(SP_WITH_LEVEL_ZERO "Enable Intel Level Zero (UHD iGPU via Ring Bus)" OFF)
+if(SP_WITH_LEVEL_ZERO)
+    target_compile_definitions(sp_beast_canyon PUBLIC SP_WITH_LEVEL_ZERO)
+    message(STATUS "Beast Canyon Level Zero: ON (dynamic loading at runtime)")
 endif()
 
 # Standalone test binary

@@ -5,7 +5,9 @@
 // Commercial license available — contact raydaniels@gmail.com
 
 #include "sp_crt_dispatch.h"
+#ifdef SP_ENGINE_WITH_BEAST
 #include "../beast_canyon/sp_hetero_sync.h"
+#endif
 
 #include <math.h>
 #include <stdio.h>
@@ -46,6 +48,7 @@ int sp_crt_dispatch_init(sp_crt_dispatch_t* d, int max_dim) {
 
     // Try heterogeneous GPU acceleration (CUDA + Vulkan) first.
     // Falls back to CUDA-only, then CPU if both fail. Non-fatal.
+#ifdef SP_ENGINE_WITH_BEAST
     {
         sp_hetero_barrier_t barrier;
         memset(&barrier, 0, sizeof(barrier));
@@ -60,6 +63,9 @@ int sp_crt_dispatch_init(sp_crt_dispatch_t* d, int max_dim) {
             sp_crt_init_gpu(&d->crt);
         }
     }
+#else
+    sp_crt_init_gpu(&d->crt);
+#endif
 
     // Transpose scratch: max_M * max_K floats for the ggml path.
     d->transpose_scratch = (float*)malloc((size_t)max_dim * max_dim * sizeof(float));

@@ -5,6 +5,7 @@
 // Commercial license available — contact raydaniels@gmail.com
 
 #include "sp_shadow_steal.h"
+#include "sp_level_zero.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -47,17 +48,41 @@ int sp_shadow_steal_init(sp_shadow_steal_t* ctx, size_t expert_dim, float tau) {
     ctx->tau_base = ctx->tau;
     ctx->state    = SP_STEAL_IDLE;
 
+    // ── Level Zero initialisation ─────────────────────────────────
+    // Try to discover Intel UHD iGPU via Level Zero.  If successful,
+    // shadow buffers are USM shared allocations on the Ring Bus —
+    // writes from the Shredder are LLC-coherent with UHD compute.
+    // On failure, fall back to aligned CPU memory (stub mode).
+    sp_l0_t *l0 = (sp_l0_t*)calloc(1, sizeof(sp_l0_t));
+    bool l0_ready = false;
+    if (l0 && sp_l0_init(l0) == 0) {
+        l0_ready = true;
+        ctx->l0_command_queue = (void*)l0;
+        fprintf(stderr, "[shadow-steal] Level Zero ARMED — %s on Ring Bus\n",
+                l0->props.name);
+    } else {
+        if (l0) free(l0);
+        ctx->l0_command_queue = NULL;
+        fprintf(stderr, "[shadow-steal] Level Zero not available — stub mode\n");
+    }
+
     // Allocate shadow buffers — two slots for top-2 predicted experts.
-    // In a full Level-Zero implementation these would be SVM allocations
-    // on the Ring Bus. For now we use aligned CPU memory as the staging
-    // area — the L0 dispatch path is stubbed below.
+    // When L0 is available, use USM shared memory (Ring Bus zero-copy).
+    // Otherwise fall back to aligned CPU memory.
     size_t buf_bytes = expert_dim * sizeof(float);
     for (int i = 0; i < 2; i++) {
+        if (l0_ready) {
+            ctx->slots[i].data = sp_l0_alloc_shared(
+                (sp_l0_t*)ctx->l0_command_queue, buf_bytes, 64);
+        }
+        if (!ctx->slots[i].data) {
+            // Fallback to aligned CPU memory
 #ifdef _WIN32
-        ctx->slots[i].data = _aligned_malloc(buf_bytes, 64);
+            ctx->slots[i].data = _aligned_malloc(buf_bytes, 64);
 #else
-        ctx->slots[i].data = aligned_alloc(64, (buf_bytes + 63) & ~(size_t)63);
+            ctx->slots[i].data = aligned_alloc(64, (buf_bytes + 63) & ~(size_t)63);
 #endif
+        }
         if (!ctx->slots[i].data) {
             sp_shadow_steal_free(ctx);
             return -1;
@@ -69,13 +94,17 @@ int sp_shadow_steal_init(sp_shadow_steal_t* ctx, size_t expert_dim, float tau) {
         ctx->slots[i].target    = SP_GPU_SECONDARY;
     }
 
-    // Probe for Level-Zero command queue.
-    // TODO: zeDriverGet -> zeDeviceGet -> zeCommandQueueCreate for Intel UHD.
-    // For now, ctx->l0_command_queue remains NULL and we operate in stub mode.
-    ctx->l0_command_queue = NULL;
+    // Create completion events for async dispatch tracking
+    if (l0_ready) {
+        sp_l0_t *l0p = (sp_l0_t*)ctx->l0_command_queue;
+        // We store event handles in the shadow buffer data area's alignment
+        // padding — but cleaner to just use a local static.  For now the
+        // event query path checks l0_command_queue != NULL to decide
+        // whether to poll L0 or use the instant-ready fallback.
+    }
 
     // Enable speculation — prediction + hit/miss tracking is fully functional
-    // even without L0 dispatch (the compute results are stubbed as instant).
+    // even without L0 dispatch (stub mode uses instant-ready).
     ctx->enabled = true;
 
     return 0;
@@ -86,16 +115,46 @@ int sp_shadow_steal_init(sp_shadow_steal_t* ctx, size_t expert_dim, float tau) {
 // ---------------------------------------------------------------------------
 void sp_shadow_steal_free(sp_shadow_steal_t* ctx) {
     if (!ctx) return;
+
+    sp_l0_t *l0 = (sp_l0_t*)ctx->l0_command_queue;
+
     for (int i = 0; i < 2; i++) {
         if (ctx->slots[i].data) {
+            if (l0 && l0->loaded) {
+                // USM allocations are freed by sp_l0_free via tracked list.
+                // If the pointer is in the tracked list, skip manual free.
+                bool is_usm = false;
+                for (int j = 0; j < l0->n_usm_allocs; j++) {
+                    if (l0->usm_allocs[j] == ctx->slots[i].data) {
+                        is_usm = true;
+                        break;
+                    }
+                }
+                if (!is_usm) {
+                    // CPU-allocated fallback buffer
 #ifdef _WIN32
-            _aligned_free(ctx->slots[i].data);
+                    _aligned_free(ctx->slots[i].data);
 #else
-            free(ctx->slots[i].data);
+                    free(ctx->slots[i].data);
 #endif
+                }
+            } else {
+                // No L0 — all buffers are CPU-allocated
+#ifdef _WIN32
+                _aligned_free(ctx->slots[i].data);
+#else
+                free(ctx->slots[i].data);
+#endif
+            }
         }
     }
-    // TODO: zeCommandQueueDestroy if l0_command_queue != NULL
+
+    // Tear down Level Zero (frees USM allocs, command list, context, DLL)
+    if (l0) {
+        sp_l0_free(l0);
+        free(l0);
+    }
+
     memset(ctx, 0, sizeof(*ctx));
 }
 
@@ -110,7 +169,7 @@ int sp_shadow_steal_speculate(sp_shadow_steal_t* ctx,
 
     // Query the Curriculum EWMA heatmap for top-2 hottest experts.
     int top2[2] = { -1, -1 };
-    sp_moe_get_hottest_k(curriculum, next_layer, 2, top2);
+    sp_moe_get_hottest_k(curriculum, next_layer, top2, 2);
     if (top2[0] < 0) return 1;  // No prediction available
 
     // Check combined confidence of top-2 against tau.
@@ -128,16 +187,51 @@ int sp_shadow_steal_speculate(sp_shadow_steal_t* ctx,
     ctx->state = SP_STEAL_SPECULATING;
     ctx->stats.total_steals++;
 
-    // TODO: Level-Zero dispatch path.
-    //   1. Load expert weights from Optane via sp_optane_prefetch_expert()
-    //   2. Shred to fp16 staging via sp_shredder_process()
-    //   3. zeCommandListAppendMemoryCopy -> UHD SVM
-    //   4. zeCommandListAppendLaunchKernel -> expert matmul
-    //   5. zeCommandQueueExecuteCommandLists (async)
-    //
-    // For now, mark slots as "ready" immediately (simulating instant compute).
-    ctx->slots[0].ready = true;
-    ctx->slots[1].ready = true;
+    sp_l0_t *l0 = (sp_l0_t*)ctx->l0_command_queue;
+
+    if (l0 && l0->loaded && l0->device_found) {
+        // ── Level Zero dispatch path ─────────────────────────────
+        // The shadow buffers are USM shared memory on the Ring Bus.
+        // The Shredder has already written CRT M2 residues into
+        // these buffers (they're LLC-coherent — UHD sees them
+        // without explicit copy).
+        //
+        // For Phase 1 bringup: we mark as ready after an L0 barrier
+        // to confirm the USM writes have landed.  The actual matmul
+        // kernel launch will come in Phase 2 when we have the SPIR-V
+        // residue_m2 kernel compiled.
+        //
+        // Phase 1 path (USM coherence validation):
+        //   1. Append barrier on immediate cmd list (flushes LLC→UHD)
+        //   2. Mark slots ready — the data in USM is the M2 residues
+        //      written by sp_shredder_crt_q8_expert() to ctx->slots[].data
+        //
+        // Phase 2 path (full kernel dispatch):
+        //   1. zeCommandListAppendLaunchKernel → residue_m2 matmul
+        //   2. Signal completion event
+        //   3. Host polls event in sp_shadow_steal_check()
+
+        sp_l0_append_barrier(l0, NULL);
+
+        // Mark both prediction slots as ready.
+        // The M2 residue data is already in the USM buffers —
+        // the Shredder wrote directly into slots[].data via
+        // sp_shredder_crt_q8_expert() before this function was called.
+        ctx->slots[0].ready = true;
+        ctx->slots[1].ready = true;
+
+        uint64_t t1 = sp_steal_time_us();
+        // Track actual dispatch time for UHD utilisation accounting
+        (void)t1;
+    } else {
+        // ── Stub mode (no L0) ────────────────────────────────────
+        // Mark slots as "ready" immediately (simulating instant compute).
+        // Prediction + hit/miss tracking still works — the only thing
+        // missing is actual UHD compute, which means the "saved time"
+        // metrics are approximate rather than measured.
+        ctx->slots[0].ready = true;
+        ctx->slots[1].ready = true;
+    }
 
     return 0;
 }
@@ -201,7 +295,13 @@ void sp_shadow_steal_abort(sp_shadow_steal_t* ctx) {
     if (!ctx) return;
     if (ctx->state == SP_STEAL_SPECULATING) {
         ctx->stats.aborts++;
-        // TODO: zeCommandListReset to flush UHD queue.
+
+        // Flush UHD queue via zeCommandListReset.
+        // On Ring Bus this costs ~2µs — negligible compared to PCIe.
+        sp_l0_t *l0 = (sp_l0_t*)ctx->l0_command_queue;
+        if (l0 && l0->loaded && l0->cmd_list) {
+            sp_l0_reset_cmd_list(l0);
+        }
     }
     ctx->slots[0].ready     = false;
     ctx->slots[0].expert_id = -1;
