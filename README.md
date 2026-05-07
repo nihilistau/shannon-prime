@@ -173,7 +173,9 @@ shannon-prime-repos/                  ← parent dir holding all three
 │   │   ├── cuda/                     NVIDIA GPU kernels (incl. shannon_prime_hier.cu)
 │   │   ├── vulkan/                   Cross-platform GPU + GLSL shaders
 │   │   ├── torch/                    Pure PyTorch (31 + 69 sqfree tests)
-│   │   └── adreno/                   Qualcomm: NEON tiers, Hexagon HVX, big.LITTLE
+│   │   ├── adreno/                   Qualcomm: NEON tiers, Hexagon HVX, big.LITTLE
+│   │   └── crt/                      CRT multi-GPU dispatch, MoE curriculum,
+│   │                                  Top-2 speculative prefetch, Shor kernel
 │   ├── tools/
 │   │   ├── shannon_prime_llama.*            in-tree stub for the llama.cpp hook
 │   │   ├── shannon_prime_llama_sqfree.c     in-tree sqfree hook stub
