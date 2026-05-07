@@ -1327,6 +1327,7 @@ int sp_hier_cache_init(sp_hier_cache_t *hc, const sp_config_t *cfg,
     memset(hc, 0, sizeof(*hc));
     hc->config = *cfg;
     hc->max_seq_len = max_seq_len;
+    hc->max_skel_bands = -1;  // full reconstruction by default
     hc->pad_dim = sp_sqfree_pad_dim(cfg->head_dim);
 
     // Init Vilenkin basis
@@ -1562,8 +1563,13 @@ static void sp_hier_reconstruct_one(const sp_hier_cache_t *hc, int slot,
     float *pred  = ((sp_hier_cache_t *)hc)->pred_scratch;
     float *coeffs = ((sp_hier_cache_t *)hc)->coeff_scratch;
 
-    // 1. Dequantize skeleton
-    sp_band_dequantize(read_ptr, skel, &hp->skel_bands);
+    // 1. Dequantize skeleton (partial if max_skel_bands is set)
+    if (hc->max_skel_bands >= 0 && hc->max_skel_bands < hp->skel_bands.n_bands) {
+        sp_band_dequantize_partial(read_ptr, skel, &hp->skel_bands,
+                                   hc->max_skel_bands);
+    } else {
+        sp_band_dequantize(read_ptr, skel, &hp->skel_bands);
+    }
     read_ptr += hp->skel_bands.total_bytes;
 
     // 2. Predict targets from skeleton

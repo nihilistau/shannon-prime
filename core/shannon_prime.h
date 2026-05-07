@@ -722,6 +722,11 @@ typedef struct {
     int                  k_bytes_per_pos;
     int                  v_bytes_per_pos;
 
+    // Partial-load: limit skeleton dequantization to first N bands.
+    // -1 (default) = full reconstruction; 0..n_bands = partial.
+    // Set by sp_hier_cache_load_partial; affects all subsequent reads.
+    int                  max_skel_bands;
+
     // Scratch buffers (allocated once, reused every write/read)
     float               *pad_scratch;    // pad_dim
     float               *coeff_scratch;  // pad_dim
@@ -1141,6 +1146,15 @@ int sp_hier_cache_save(const sp_hier_cache_t *sc,
 int sp_hier_cache_load(sp_hier_cache_t *sc,
                        const char *prefix,
                        uint64_t expected_hash);
+
+// Partial load: same disk read as sp_hier_cache_load, but limits skeleton
+// dequantization to the first `max_bands` bands.  Subsequent read_k/read_v
+// calls reconstruct with reduced-fidelity skeletons (higher bands zeroed).
+// max_bands is clamped into [0, skel_bands.n_bands].
+int sp_hier_cache_load_partial(sp_hier_cache_t *sc,
+                               const char *prefix,
+                               uint64_t expected_hash,
+                               int max_bands);
 
 // Utility: compute FNV-1a hash of a string (for model_hash).
 uint64_t sp_fnv1a_hash(const char *str, size_t len);

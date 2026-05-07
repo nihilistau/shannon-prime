@@ -2146,3 +2146,24 @@ int sp_hier_cache_load(sp_hier_cache_t *sc,
 
     return max_loaded;
 }
+
+int sp_hier_cache_load_partial(sp_hier_cache_t *sc,
+                               const char *prefix,
+                               uint64_t expected_hash,
+                               int max_bands) {
+    // Full disk load — the data layout is the same regardless of partial mode.
+    int rc = sp_hier_cache_load(sc, prefix, expected_hash);
+    if (rc < 0) return rc;
+
+    // Clamp max_bands and store. Subsequent reads via sp_hier_reconstruct_one
+    // will use sp_band_dequantize_partial with this limit, zeroing the higher
+    // skeleton bands and producing a reduced-fidelity reconstruction.
+    if (sc->n_slots > 0) {
+        int n_skel_bands = sc->predictors[0].skel_bands.n_bands;
+        if (max_bands < 0)            max_bands = 0;
+        if (max_bands > n_skel_bands) max_bands = n_skel_bands;
+    }
+    sc->max_skel_bands = max_bands;
+
+    return rc;
+}
