@@ -1188,7 +1188,14 @@ static int sp_solve_spd(double *A, double *B, int ns, int nt) {
 int sp_hier_calibrate_end(sp_hier_predictor_t *hp) {
     if (!hp->calibrating || hp->calib_n < 1) return -1;
     if (hp->calib_n < 24) {
-        fprintf(stderr, "[Shannon-Prime HIER] WARNING: calibration needs >= 24 tokens (got %d). Ridge regression may underfit.\n", hp->calib_n);
+        static int calib_warn_count = 0;
+        if (calib_warn_count == 0) {
+            fprintf(stderr, "[Shannon-Prime HIER] WARNING: calibration needs >= 24 tokens (got %d). Ridge regression may underfit.\n", hp->calib_n);
+        }
+        ++calib_warn_count;
+        if (calib_warn_count == 2) {
+            fprintf(stderr, "[Shannon-Prime HIER] (suppressing further calibration warnings)\n");
+        }
     }
     hp->calibrating = false;
 
