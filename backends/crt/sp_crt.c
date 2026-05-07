@@ -12,6 +12,24 @@
 // This file contains the host-side Garner reconstruction, quantization
 // calibration, and the dispatch coordinator. GPU-specific kernels are
 // in sp_crt_cuda.cu and sp_crt_vulkan.c.
+//
+// QUANTIZATION DESIGN (v2 — zero-centered symmetric):
+//
+// We use zero-centered symmetric quantization: 0.0 maps to 0 in the ring,
+// positive values map to small positive integers, negative values map to
+// M - |q| (the modular representation of negative numbers).
+//
+// This eliminates the zero_point entirely, which means:
+//   - No cross-term correction in the matmul dequantization
+//   - No catastrophic cancellation from subtracting large similar values
+//   - Signed Garner reconstruction: values > M1*M2/2 are negative
+//
+// The K-aware ceiling ensures accumulation fits the CRT combined range:
+//   K × Q_max² < M1×M2/2   (factor 2 for signed range)
+//   Q_max < sqrt(M1×M2 / (2K))
+//
+// For K=64:  Q_max ≈ 1.90e8 (28-bit Int28 — well above fp16 mantissa)
+// For K=4096: Q_max ≈ 2.37e7 (25-bit — still excellent precision)
 
 #include "sp_crt.h"
 #include <math.h>
@@ -20,63 +38,115 @@
 #include <string.h>
 
 // ============================================================================
-// Quantization calibration
+// Quantization calibration — zero-centered symmetric
 // ============================================================================
 
 void sp_crt_quant_calibrate(sp_crt_quant_t *q, float min_val, float max_val) {
-    // Symmetric quantization around zero. The integer range is [0, M1-1]
-    // with zero_point at M1/2. We scale so the observed range maps to
-    // [1, M1-2] (leaving headroom for accumulation).
+    sp_crt_quant_calibrate_k(q, min_val, max_val, 1);
+}
 
-    float range = max_val - min_val;
-    if (range < 1e-8f) range = 1e-8f;
+void sp_crt_quant_calibrate_k(sp_crt_quant_t *q, float min_val, float max_val, int K) {
+    // Zero-centered symmetric: scale maps max_abs to Q_max.
+    // Negative floats become M - |q| in the ring (modular negative).
+    //
+    // K-aware ceiling: K × Q_max² < M1×M2 / 2 (signed range)
+    //   Q_max < sqrt(M1×M2 / (2K))
 
-    // Use ~30 bits of the Mersenne range for the value space.
-    // Reserve some headroom for K-dimensional accumulation.
-    double usable_range = (double)(SP_CRT_M1 - 2);
-    q->scale = usable_range / (double)range;
-    q->inv_scale = (double)range / usable_range;
-    q->zero_point = (int64_t)((-min_val) * q->scale + 0.5);
+    double max_abs = fabs(min_val);
+    if (fabs(max_val) > max_abs) max_abs = fabs(max_val);
+    if (max_abs < 1e-8) max_abs = 1e-8;
+    if (K < 1) K = 1;
+
+    // CRT signed range: half the combined modulus (positive half)
+    double crt_range = (double)SP_CRT_M1 * (double)SP_CRT_M2;
+    double q_max = sqrt(crt_range / (2.0 * (double)K)) * 0.9;  // 90% safety margin
+
+    // Cap at (M1-2)/2 — no point exceeding half a single ring
+    double ring_cap = (double)(SP_CRT_M1 - 2) / 2.0;
+    if (q_max > ring_cap) q_max = ring_cap;
+
+    q->scale = q_max / max_abs;
+    q->inv_scale = max_abs / q_max;
+    q->zero_point = 0;  // zero-centered: no offset
 }
 
 // ============================================================================
-// Host-side Garner batch reconstruction
+// Zero-centered quantization: float → ring element
 // ============================================================================
 //
-// Vectorizable inner loop: no data dependencies between iterations.
-// On x86-64 with AVX2, the compiler should auto-vectorize the uint64
-// arithmetic. On ARM, NEON handles it similarly.
+// Positive x → round(x * scale)              [small positive integer]
+// Negative x → M - round(|x| * scale)        [modular negative]
+// Zero     → 0
+
+static uint32_t sp_crt_quantize_symmetric(float val, double scale, uint64_t modulus) {
+    double qd = val * scale;
+    // Round to nearest integer (away from zero for .5)
+    int64_t q = (qd >= 0) ? (int64_t)(qd + 0.5) : -(int64_t)(-qd + 0.5);
+
+    if (q >= 0) {
+        return (uint32_t)((uint64_t)q % modulus);
+    } else {
+        // Modular negative: M - |q|
+        uint64_t pos = (uint64_t)(-q);
+        pos %= modulus;
+        return (pos == 0) ? 0 : (uint32_t)(modulus - pos);
+    }
+}
+
+static void sp_crt_cpu_quantize_symmetric(const float *input, uint32_t *output,
+                                           int n, double scale, uint64_t modulus) {
+    for (int i = 0; i < n; i++) {
+        output[i] = sp_crt_quantize_symmetric(input[i], scale, modulus);
+    }
+}
+
+// ============================================================================
+// Signed Garner reconstruction
+// ============================================================================
+//
+// Standard Garner gives X in [0, M1*M2). For signed interpretation:
+//   if X > M1*M2/2, the true value is X - M1*M2 (negative).
+//
+// We return a double to avoid int64 overflow concerns.
+
+static double sp_crt_garner_signed(uint32_t a1, uint32_t a2) {
+    const uint64_t m1 = SP_CRT_M1;
+    const uint64_t m2 = SP_CRT_M2;
+    const uint64_t gc = SP_CRT_GARNER_C;
+
+    uint64_t a1_m2 = (uint64_t)a1 % m2;
+    uint64_t diff = (a2 >= (uint32_t)a1_m2)
+                  ? ((uint64_t)a2 - a1_m2)
+                  : (m2 - a1_m2 + (uint64_t)a2);
+    uint64_t h = (diff * gc) % m2;
+    // X = a1 + h * M1.  h < M2 < 2^31, M1 < 2^31, so h*M1 < 2^62 — fits uint64.
+    uint64_t raw = (uint64_t)a1 + h * m1;
+
+    // Signed interpretation: if raw > M1*M2/2, it represents a negative value.
+    double half_range = (double)m1 * (double)m2 / 2.0;
+    double full_range = (double)m1 * (double)m2;
+    double val = (double)raw;
+    if (val > half_range) {
+        val -= full_range;
+    }
+    return val;
+}
+
+// ============================================================================
+// Host-side Garner batch reconstruction (signed, zero-centered)
+// ============================================================================
 
 void sp_crt_garner_batch(const uint32_t *residue_0,
                          const uint32_t *residue_1,
                          float *output,
                          size_t n,
                          const sp_crt_quant_t *quant) {
-    const uint64_t m1 = SP_CRT_M1;
-    const uint64_t m2 = SP_CRT_M2;
-    const uint64_t gc = SP_CRT_GARNER_C;
     const double inv_scale = quant->inv_scale;
-    const int64_t zp = quant->zero_point;
-
+    // For zero-centered quant, output = signed_garner(r0, r1) * inv_scale
+    // (no zero_point subtraction needed)
     for (size_t i = 0; i < n; i++) {
-        uint64_t a1 = (uint64_t)residue_0[i];
-        uint64_t a2 = (uint64_t)residue_1[i];
-
-        // Step 1: a1 mod m2
-        uint64_t a1_m2 = a1 % m2;
-
-        // Step 2: diff = (a2 - a1_m2) mod m2  (handles underflow)
-        uint64_t diff = (a2 >= a1_m2) ? (a2 - a1_m2) : (m2 - a1_m2 + a2);
-
-        // Step 3: h = (diff * GARNER_C) mod m2
-        // diff < m2 < 2^31, gc < m2 < 2^31 => product < 2^62, fits uint64.
-        uint64_t h = (diff * gc) % m2;
-
-        // Step 4: reconstruct X = a1 + h * m1
-        uint64_t reconstructed = a1 + h * m1;
-
-        // Step 5: dequantize to float
-        output[i] = (float)(((double)((int64_t)reconstructed - zp)) * inv_scale);
+        double signed_val = sp_crt_garner_signed(residue_0[i], residue_1[i]);
+        output[i] = (float)(signed_val * inv_scale);
     }
 }
 
@@ -90,10 +160,6 @@ int sp_crt_init(sp_crt_context_t *ctx, int max_M, int max_N, int max_K,
 
     size_t max_output = (size_t)max_M * max_N;
 
-    // Allocate pinned host buffers for async D2H of residue results.
-    // In a full CUDA build these would be cudaHostAlloc'd. For the
-    // portable C implementation, we use aligned malloc and let the
-    // CUDA/Vulkan layer pin them.
     ctx->h_residue_0 = (uint32_t *)calloc(max_output, sizeof(uint32_t));
     ctx->h_residue_1 = (uint32_t *)calloc(max_output, sizeof(uint32_t));
     ctx->h_output    = (float *)calloc(max_output, sizeof(float));
@@ -112,8 +178,7 @@ int sp_crt_init(sp_crt_context_t *ctx, int max_M, int max_N, int max_K,
     ctx->stream_0 = stream_0;
     ctx->stream_1 = stream_1;
 
-    // Default quantization (symmetric, conservative range).
-    // The caller should re-calibrate with observed value ranges.
+    // Default calibration (caller should re-calibrate with observed ranges)
     sp_crt_quant_calibrate(&ctx->weight_quant, -1.0f, 1.0f);
     sp_crt_quant_calibrate(&ctx->act_quant, -4.0f, 4.0f);
 
@@ -135,15 +200,23 @@ void sp_crt_free(sp_crt_context_t *ctx) {
     free(ctx->h_residue_0);
     free(ctx->h_residue_1);
     free(ctx->h_output);
+    if (ctx->gpu_ready) {
+        sp_crt_cuda_free(ctx->d_a_m1);
+        sp_crt_cuda_free(ctx->d_b_m1);
+        sp_crt_cuda_free(ctx->d_c_m1);
+        sp_crt_cuda_free(ctx->d_a_m2);
+        sp_crt_cuda_free(ctx->d_b_m2);
+        sp_crt_cuda_free(ctx->d_c_m2);
+        // Only destroy streams we created (stream_0/stream_1 may be caller-owned)
+        // For safety, always destroy — caller should set to NULL before free
+        // if they own the streams.
+    }
     memset(ctx, 0, sizeof(*ctx));
 }
 
 // ============================================================================
 // CPU reference: modular matmul
 // ============================================================================
-//
-// Reference implementation for testing. The GPU kernels in sp_crt_cuda.cu
-// replace this with warp-level tiled implementations.
 
 static void sp_crt_cpu_matmul_mod(const uint32_t *A, const uint32_t *B,
                                    uint32_t *C,
@@ -155,22 +228,17 @@ static void sp_crt_cpu_matmul_mod(const uint32_t *A, const uint32_t *B,
             for (int k = 0; k < K; k++) {
                 uint64_t a = (uint64_t)A[i * K + k];
                 uint64_t b = (uint64_t)B[k * N + j];
-                // Periodic reduction to prevent overflow.
-                // a < M < 2^31, b < M < 2^31 => a*b < 2^62.
-                // acc can grow to at most 2^62 + 2^62 before reduction.
+                // With zero-centered quantization, ring values can be near M
+                // (modular negatives), so a*b can reach ~M^2 ≈ 2^62.
+                // Reduce every iteration to keep acc < 2^62 + M < 2^63.
                 acc += a * b;
-                // Reduce every 4 iterations to stay well within uint64 range.
-                // (4 * 2^62 < 2^64)
-                if ((k & 3) == 3) {
-                    acc %= modulus;
-                }
+                acc %= modulus;
             }
             C[i * N + j] = (uint32_t)(acc % modulus);
         }
     }
 }
 
-// Mersenne-optimised variant: uses bit-shift reduction instead of %.
 static void sp_crt_cpu_matmul_mersenne(const uint32_t *A, const uint32_t *B,
                                         uint32_t *C,
                                         int M, int N, int K) {
@@ -180,48 +248,40 @@ static void sp_crt_cpu_matmul_mersenne(const uint32_t *A, const uint32_t *B,
             for (int k = 0; k < K; k++) {
                 uint64_t a = (uint64_t)A[i * K + k];
                 uint64_t b = (uint64_t)B[k * N + j];
+                // Reduce every iteration: after reduce acc < M1 < 2^31,
+                // then acc + a*b < 2^31 + M1^2 < 2^31 + 2^62 < 2^63.
+                // The improved sp_crt_mersenne_reduce handles up to 2^63.
                 acc += a * b;
-                if ((k & 3) == 3) {
-                    acc = sp_crt_mersenne_reduce(acc);
-                }
+                acc = sp_crt_mersenne_reduce(acc);
             }
-            C[i * N + j] = sp_crt_mersenne_reduce(acc);
+            C[i * N + j] = (uint32_t)acc;  // already reduced
         }
     }
 }
 
 // ============================================================================
-// Quantize float tensor to residue ring (CPU reference)
-// ============================================================================
-
-static void sp_crt_cpu_quantize(const float *input, uint32_t *output,
-                                 int n, const sp_crt_quant_t *q,
-                                 uint64_t modulus) {
-    for (int i = 0; i < n; i++) {
-        int64_t ival = (int64_t)(input[i] * q->scale + 0.5) + q->zero_point;
-        if (ival < 0) ival = 0;
-        output[i] = (uint32_t)((uint64_t)ival % modulus);
-    }
-}
-
-// ============================================================================
-// Main CRT matmul dispatch (CPU reference path)
+// Main CRT matmul dispatch — zero-centered symmetric path
 // ============================================================================
 //
-// This is the portable reference implementation. When CUDA is available,
-// sp_crt_matmul delegates to the GPU kernels instead.
+// With zero-centered quantization, there are no cross-terms to correct.
+// The matmul in the ring computes ∑ q_a × q_b where q_a = round(a × scale).
+// Negative values wrap around M, so the modular product of two negatives
+// gives a positive (correct), and a positive × negative gives M - |result|
+// (modular negative, also correct).
+//
+// After signed Garner reconstruction, we simply divide by scale_a × scale_b.
 
 int sp_crt_matmul(sp_crt_context_t *ctx,
                   const float *d_A, const float *d_B, float *d_C,
                   int M, int N, int K) {
     if (!ctx->initialized) return -1;
-    if (M * N > ctx->M * ctx->N) return -2; // exceeds allocated buffers
+    if (M * N > ctx->M * ctx->N) return -2;
 
     size_t a_size = (size_t)M * K;
     size_t b_size = (size_t)K * N;
     size_t c_size = (size_t)M * N;
 
-    // --- Quantize A and B for both residue rings ---
+    // --- Quantize A and B to both residue rings (zero-centered) ---
     uint32_t *a_m1 = (uint32_t *)malloc(a_size * sizeof(uint32_t));
     uint32_t *b_m1 = (uint32_t *)malloc(b_size * sizeof(uint32_t));
     uint32_t *a_m2 = (uint32_t *)malloc(a_size * sizeof(uint32_t));
@@ -231,35 +291,139 @@ int sp_crt_matmul(sp_crt_context_t *ctx,
         return -3;
     }
 
-    sp_crt_cpu_quantize(d_A, a_m1, (int)a_size, &ctx->act_quant, SP_CRT_M1);
-    sp_crt_cpu_quantize(d_B, b_m1, (int)b_size, &ctx->weight_quant, SP_CRT_M1);
-    sp_crt_cpu_quantize(d_A, a_m2, (int)a_size, &ctx->act_quant, SP_CRT_M2);
-    sp_crt_cpu_quantize(d_B, b_m2, (int)b_size, &ctx->weight_quant, SP_CRT_M2);
+    sp_crt_cpu_quantize_symmetric(d_A, a_m1, (int)a_size, ctx->act_quant.scale, SP_CRT_M1);
+    sp_crt_cpu_quantize_symmetric(d_B, b_m1, (int)b_size, ctx->weight_quant.scale, SP_CRT_M1);
+    sp_crt_cpu_quantize_symmetric(d_A, a_m2, (int)a_size, ctx->act_quant.scale, SP_CRT_M2);
+    sp_crt_cpu_quantize_symmetric(d_B, b_m2, (int)b_size, ctx->weight_quant.scale, SP_CRT_M2);
 
-    // --- Matmul in both residue rings (can be parallelized) ---
-    // In the GPU path, these launch on stream_0 and stream_1 concurrently.
-    // Here we run sequentially as a reference.
+    // --- Matmul in both residue rings ---
     sp_crt_cpu_matmul_mersenne(a_m1, b_m1, ctx->h_residue_0, M, N, K);
     sp_crt_cpu_matmul_mod(a_m2, b_m2, ctx->h_residue_1, M, N, K, SP_CRT_M2);
 
     free(a_m1); free(b_m1); free(a_m2); free(b_m2);
 
-    // --- Garner reconstruction ---
-    // The accumulation quant is the product of weight and activation quants.
-    // For CRT matmul, the output scale = act_scale × weight_scale × K
-    // (each element is a sum of K products).
-    sp_crt_quant_t output_quant;
-    output_quant.scale = ctx->act_quant.scale * ctx->weight_quant.scale;
-    output_quant.inv_scale = 1.0 / output_quant.scale;
-    // Zero point for the accumulation: each output element is the sum of K
-    // products of (q_a - zp_a) × (q_b - zp_b), which expands to a cross-term.
-    // For simplicity, we compute the reconstruction in the scaled integer domain
-    // and then convert, using the known zero-point structure.
-    output_quant.zero_point = ctx->act_quant.zero_point
-                            * ctx->weight_quant.zero_point * K;
+    // --- Signed Garner reconstruction + dequantize ---
+    const double inv_scale = 1.0 / (ctx->act_quant.scale * ctx->weight_quant.scale);
 
-    sp_crt_garner_batch(ctx->h_residue_0, ctx->h_residue_1,
-                        d_C, c_size, &output_quant);
+    for (size_t i = 0; i < c_size; i++) {
+        double signed_val = sp_crt_garner_signed(ctx->h_residue_0[i],
+                                                  ctx->h_residue_1[i]);
+        d_C[i] = (float)(signed_val * inv_scale);
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// GPU-accelerated CRT init + matmul
+// ============================================================================
+//
+// sp_crt_init_gpu: allocate device buffers for both residue rings.
+// sp_crt_matmul_gpu: quantize on host, H2D, dual-ring matmul on two
+//   CUDA streams, D2H, signed Garner on host. When streams are on
+//   different GPUs (Beast Canyon: RTX 2060 + Intel UHD), the two ring
+//   matmuls run in true parallel with zero inter-GPU communication.
+
+int sp_crt_init_gpu(sp_crt_context_t *ctx) {
+    if (!ctx->initialized) return -1;
+
+    size_t max_a = (size_t)ctx->M * ctx->K * sizeof(uint32_t);
+    size_t max_b = (size_t)ctx->K * ctx->N * sizeof(uint32_t);
+    size_t max_c = (size_t)ctx->M * ctx->N * sizeof(uint32_t);
+
+    // Allocate device memory for both rings
+    ctx->d_a_m1 = (uint32_t *)sp_crt_cuda_alloc(max_a);
+    ctx->d_b_m1 = (uint32_t *)sp_crt_cuda_alloc(max_b);
+    ctx->d_c_m1 = (uint32_t *)sp_crt_cuda_alloc(max_c);
+    ctx->d_a_m2 = (uint32_t *)sp_crt_cuda_alloc(max_a);
+    ctx->d_b_m2 = (uint32_t *)sp_crt_cuda_alloc(max_b);
+    ctx->d_c_m2 = (uint32_t *)sp_crt_cuda_alloc(max_c);
+
+    if (!ctx->d_a_m1 || !ctx->d_b_m1 || !ctx->d_c_m1 ||
+        !ctx->d_a_m2 || !ctx->d_b_m2 || !ctx->d_c_m2) {
+        sp_crt_cuda_free(ctx->d_a_m1); sp_crt_cuda_free(ctx->d_b_m1);
+        sp_crt_cuda_free(ctx->d_c_m1); sp_crt_cuda_free(ctx->d_a_m2);
+        sp_crt_cuda_free(ctx->d_b_m2); sp_crt_cuda_free(ctx->d_c_m2);
+        ctx->d_a_m1 = ctx->d_b_m1 = ctx->d_c_m1 = NULL;
+        ctx->d_a_m2 = ctx->d_b_m2 = ctx->d_c_m2 = NULL;
+        return -2;
+    }
+
+    // Create streams if caller didn't provide them
+    if (!ctx->stream_0) ctx->stream_0 = sp_crt_cuda_stream_create();
+    if (!ctx->stream_1) ctx->stream_1 = sp_crt_cuda_stream_create();
+    if (!ctx->stream_0 || !ctx->stream_1) return -3;
+
+    ctx->gpu_ready = 1;
+
+    if (getenv("SHANNON_PRIME_VERBOSE")) {
+        fprintf(stderr, "[Shannon-Prime CRT] GPU dispatch ready: "
+                        "6 device buffers, 2 streams\n");
+    }
+    return 0;
+}
+
+int sp_crt_matmul_gpu(sp_crt_context_t *ctx,
+                      const float *A, const float *B, float *C,
+                      int M, int N, int K) {
+    // Fall back to CPU if GPU not initialized
+    if (!ctx->gpu_ready) return sp_crt_matmul(ctx, A, B, C, M, N, K);
+    if (!ctx->initialized) return -1;
+    if (M * N > ctx->M * ctx->N) return -2;
+
+    size_t a_size = (size_t)M * K;
+    size_t b_size = (size_t)K * N;
+    size_t c_size = (size_t)M * N;
+
+    // --- Step 1: Quantize on CPU (zero-centered symmetric) ---
+    uint32_t *h_a_m1 = (uint32_t *)malloc(a_size * sizeof(uint32_t));
+    uint32_t *h_b_m1 = (uint32_t *)malloc(b_size * sizeof(uint32_t));
+    uint32_t *h_a_m2 = (uint32_t *)malloc(a_size * sizeof(uint32_t));
+    uint32_t *h_b_m2 = (uint32_t *)malloc(b_size * sizeof(uint32_t));
+    if (!h_a_m1 || !h_b_m1 || !h_a_m2 || !h_b_m2) {
+        free(h_a_m1); free(h_b_m1); free(h_a_m2); free(h_b_m2);
+        return -3;
+    }
+
+    sp_crt_cpu_quantize_symmetric(A, h_a_m1, (int)a_size, ctx->act_quant.scale, SP_CRT_M1);
+    sp_crt_cpu_quantize_symmetric(B, h_b_m1, (int)b_size, ctx->weight_quant.scale, SP_CRT_M1);
+    sp_crt_cpu_quantize_symmetric(A, h_a_m2, (int)a_size, ctx->act_quant.scale, SP_CRT_M2);
+    sp_crt_cpu_quantize_symmetric(B, h_b_m2, (int)b_size, ctx->weight_quant.scale, SP_CRT_M2);
+
+    // --- Step 2: H2D transfers (async on respective streams) ---
+    sp_crt_cuda_memcpy_h2d(ctx->d_a_m1, h_a_m1, a_size * sizeof(uint32_t), ctx->stream_0);
+    sp_crt_cuda_memcpy_h2d(ctx->d_b_m1, h_b_m1, b_size * sizeof(uint32_t), ctx->stream_0);
+    sp_crt_cuda_memcpy_h2d(ctx->d_a_m2, h_a_m2, a_size * sizeof(uint32_t), ctx->stream_1);
+    sp_crt_cuda_memcpy_h2d(ctx->d_b_m2, h_b_m2, b_size * sizeof(uint32_t), ctx->stream_1);
+
+    free(h_a_m1); free(h_b_m1); free(h_a_m2); free(h_b_m2);
+
+    // --- Step 3: Dual-ring matmul on both streams (concurrent) ---
+    // Ring M1 (Mersenne) on stream_0
+    sp_crt_cuda_matmul_mersenne(ctx->d_a_m1, ctx->d_b_m1, ctx->d_c_m1,
+                                 M, N, K, ctx->stream_0);
+    // Ring M2 (generic mod) on stream_1
+    sp_crt_cuda_matmul_mod(ctx->d_a_m2, ctx->d_b_m2, ctx->d_c_m2,
+                            M, N, K, SP_CRT_M2, ctx->stream_1);
+
+    // --- Step 4: D2H async on both streams ---
+    sp_crt_cuda_memcpy_d2h(ctx->h_residue_0, ctx->d_c_m1,
+                            c_size * sizeof(uint32_t), ctx->stream_0);
+    sp_crt_cuda_memcpy_d2h(ctx->h_residue_1, ctx->d_c_m2,
+                            c_size * sizeof(uint32_t), ctx->stream_1);
+
+    // --- Step 5: Synchronize both streams ---
+    sp_crt_cuda_stream_sync(ctx->stream_0);
+    sp_crt_cuda_stream_sync(ctx->stream_1);
+
+    // --- Step 6: Signed Garner reconstruction on host (i9 AVX-512) ---
+    const double inv_scale = 1.0 / (ctx->act_quant.scale * ctx->weight_quant.scale);
+
+    for (size_t i = 0; i < c_size; i++) {
+        double signed_val = sp_crt_garner_signed(ctx->h_residue_0[i],
+                                                  ctx->h_residue_1[i]);
+        C[i] = (float)(signed_val * inv_scale);
+    }
 
     return 0;
 }
@@ -268,36 +432,34 @@ int sp_crt_matmul(sp_crt_context_t *ctx,
 // Verification: single-element CRT round-trip test
 // ============================================================================
 //
-// Tests that quantize → split → matmul_mod → Garner → dequantize
-// produces the correct result for a 1×1 "matmul" (i.e., a × b).
+// Tests that quantize → split → modular multiply → Garner → dequantize
+// produces the correct result for a × b (scalar).
 
 int sp_crt_verify_roundtrip(float a, float b, float *error_out) {
     sp_crt_quant_t q;
     sp_crt_quant_calibrate(&q, -4.0f, 4.0f);
 
-    // Quantize to both rings
-    uint32_t qa_m1 = sp_crt_quantize_f32(&q, a, SP_CRT_M1);
-    uint32_t qb_m1 = sp_crt_quantize_f32(&q, b, SP_CRT_M1);
-    uint32_t qa_m2 = sp_crt_quantize_f32(&q, a, SP_CRT_M2);
-    uint32_t qb_m2 = sp_crt_quantize_f32(&q, b, SP_CRT_M2);
+    // Quantize to both rings (zero-centered symmetric)
+    uint32_t qa_m1 = sp_crt_quantize_symmetric(a, q.scale, SP_CRT_M1);
+    uint32_t qb_m1 = sp_crt_quantize_symmetric(b, q.scale, SP_CRT_M1);
+    uint32_t qa_m2 = sp_crt_quantize_symmetric(a, q.scale, SP_CRT_M2);
+    uint32_t qb_m2 = sp_crt_quantize_symmetric(b, q.scale, SP_CRT_M2);
 
     // Multiply in each ring
     uint32_t r1 = sp_crt_mersenne_reduce((uint64_t)qa_m1 * qb_m1);
     uint32_t r2 = sp_crt_m2_reduce((uint64_t)qa_m2 * qb_m2);
 
-    // Reconstruct
-    uint64_t reconstructed = sp_crt_garner_reconstruct(r1, r2);
+    // Signed Garner reconstruction
+    double signed_product = sp_crt_garner_signed(r1, r2);
 
-    // Dequantize (product quant: scale², zero_point interaction)
-    sp_crt_quant_t pq;
-    pq.scale = q.scale * q.scale;
-    pq.inv_scale = 1.0 / pq.scale;
-    pq.zero_point = q.zero_point * q.zero_point;
+    // Dequantize: product_int = round(a*s) * round(b*s) ≈ a*b*s²
+    // So a*b ≈ product_int / s²
+    double inv_s2 = 1.0 / (q.scale * q.scale);
+    float result = (float)(signed_product * inv_s2);
 
-    float result = sp_crt_dequantize_f32(&pq, reconstructed);
     float expected = a * b;
     float err = fabsf(result - expected);
 
     if (error_out) *error_out = err;
-    return (err < 0.01f) ? 0 : -1; // pass if error < 1%
+    return (err < 0.01f) ? 0 : -1;
 }

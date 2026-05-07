@@ -103,6 +103,72 @@ Shannon-Prime ships 9 backend implementations:
 ## Repository Structure
 
 ```
+shannon-prime-repos/                  ← parent dir holding all three
+├── shannon-prime/                    ← THIS REPO (canonical math + tools)
+│   ├── core/
+│   │   ├── shannon_prime.h           VHT2, Möbius, banded quant, sqfree pad,
+│   │   ├── shannon_prime.c           Knight mask CSR, residual, spinor, shadow cache
+│   │   └── shannon_prime_sqfree.c    Sqfree + spinor C implementation
+│   ├── backends/
+│   │   ├── cuda/                     NVIDIA GPU kernels (incl. shannon_prime_hier.cu)
+│   │   ├── vulkan/                   Cross-platform GPU + GLSL shaders
+│   │   ├── torch/                    Pure PyTorch (31 + 69 sqfree tests)
+│   │   ├── adreno/                   Qualcomm: NEON tiers, Hexagon HVX, big.LITTLE
+│   │   └── crt/                      CRT multi-GPU dispatch, MoE curriculum,
+│   │                                  Top-2 speculative prefetch, Shor kernel
+│   ├── tools/
+│   │   ├── shannon_prime_llama.*            in-tree stub for the llama.cpp hook
+│   │   ├── shannon_prime_llama_sqfree.c     in-tree sqfree hook stub
+│   │   ├── shannon_prime_comfyui.py         ComfyUI + Wan 2.1/2.2 (25 tests)
+│   │   ├── shannon_prime_comfyui_sqfree.py  ComfyUI sqfree variant
+│   │   ├── sp_scaling_law.py                K-corr → PPL design rule
+│   │   ├── sp_inject_freqs.py               GGUF frequency injection
+│   │   ├── sp_compress_model.py             Weight spectral analysis
+│   │   └── sp_benchmark.py                  Compression benchmark
+│   ├── tests/                        8 test suites, 187/188 passing
+│   └── docs/                         Full documentation (incl. PRIME-ENGINE.md)
+│
+├── shannon-prime-engine/             ← SIBLING: standalone inference binary
+│   │                                   Owns compressed KV layout. Stage 5b.
+│   ├── lib/shannon-prime/            git submodule → this repo
+│   ├── vendor/ggml/                  git submodule → ggml-org/ggml (MIT)
+│   ├── src/                          ~900 LOC of engine code
+│   │   ├── engine.{h,cpp}            Public API + Config (PeMode, sqfree, mobius)
+│   │   ├── gguf_loader.{h,cpp}       Typed view over gguf_context
+│   │   ├── vocab.{h,cpp}             tokenizer.ggml.* arrays
+│   │   ├── tokenizer.{h,cpp}         GPT-2-style BPE encode/decode
+│   │   ├── llama_weights.{h,cpp}     Llama-family arch binding
+│   │   ├── forward.{h,cpp}           ggml graph: embed, block, full, decode
+│   │   ├── prime_pe.{h,cpp}          PrimePE-RoPE-ALiBi lattice math
+│   │   ├── kv_cache.{h,cpp}          Wrapper around sp_shadow_cache_t / sp_sqfree_cache_t
+│   │   └── cli/main.cpp              Verbs: info, encode, embed, logits, kv_smoke,
+│   │                                  prefill, chat, cache_ppl, perplexity
+│   └── CMakeLists.txt                CMake + Ninja, optional CUDA/Vulkan
+│
+├── shannon-prime-llama/              ← SIBLING: full engine for llama.cpp
+│   │                                    b8733 patch integrates entire SP stack.
+│   │                                    LM Studio runtime builder included.
+│   ├── lib/shannon-prime/            git submodule → this repo
+│   ├── src/
+│   │   ├── backends/{cuda,vulkan,adreno}/  4-backend implementations
+│   │   ├── engine/{kv_cache,gdn_state}.*   KV cache + System 1/2 state
+│   │   └── tools/shannon_prime_llama.*     Bridge to llama.cpp
+│   ├── patches/llama-cpp-b8733-full-engine.patch
+│   └── lmstudio/build.bat           Drop-in LM Studio DLL builder
+│
+└── shannon-prime-comfyui/            ← SIBLING: 16 ComfyUI nodes for
+    │                                    video, image, audio, and TTS.
+    │                                    See docs/INTEGRATION-COMFYUI.md.
+    ├── nodes/
+    │   ├── shannon_prime_nodes.py     8 Wan video nodes (block-skip + cache)
+    │   ├── shannon_prime_flux_nodes.py  3 Flux image nodes
+    │   └── shannon_prime_audio_nodes.py 3 Audio DiT nodes
+    └── lib/shannon-prime/            git submodule → this repo
+    
+   
+---   
+    
+    
 shannon-prime/                  ← You are here (core math library)
 ├── core/
 │   ├── shannon_prime.h         # Complete public API (1133 lines)
