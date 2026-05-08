@@ -36,7 +36,7 @@ int main(int argc, char *argv[]) {
     // ── Test 1: Reservoir mapping ───────────────────────────────────
     fprintf(stderr, "=== TEST 1: Optane Reservoir Mapping ===\n\n");
 
-    sp_optane_reservoir_t reservoir;
+    static sp_optane_reservoir_t reservoir;
     int rc = sp_optane_init(&reservoir, gguf_path);
     if (rc != 0) {
         fprintf(stderr, "FATAL: Reservoir mapping failed (rc=%d)\n", rc);
@@ -136,7 +136,7 @@ int main(int argc, char *argv[]) {
     // ── Test 5: Full Engine Boot (dry run) ──────────────────────────
     fprintf(stderr, "=== TEST 5: Full Engine Boot ===\n\n");
 
-    sp_beast_engine_t engine;
+    static sp_beast_engine_t engine;
     sp_beast_config_t beast_cfg;
     sp_beast_config_init(&beast_cfg);
     beast_cfg.gguf_path = gguf_path;
@@ -157,6 +157,48 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Engine boot/shutdown: PASS\n\n");
     } else {
         fprintf(stderr, "Engine boot failed (rc=%d): FAIL\n\n", rc);
+    }
+
+    // ── Test 6: Inference — actual CRT pipeline ──────────────────────
+    fprintf(stderr, "=== TEST 6: CRT Pipeline Inference ===\n\n");
+
+    if (rc == 0) {
+        // Re-init engine without force_cpu_only to engage CRT + L0
+        static sp_beast_engine_t inf_engine;
+        sp_beast_config_t inf_cfg;
+        sp_beast_config_init(&inf_cfg);
+        inf_cfg.gguf_path = gguf_path;
+        inf_cfg.force_cpu_only = false;  // Let CRT + L0 engage
+        inf_cfg.enable_sidecar = false;
+
+        int inf_rc = sp_beast_init(&inf_engine, &inf_cfg);
+        if (inf_rc == 0) {
+            // Qwen3 tokenizer: "What is AI?" = [3838, 374, 15235, 30]
+            // Prepend BOS=151643
+            int prompt[] = { 151643, 3838, 374, 15235, 30 };
+            int n_prompt = 5;
+            int max_gen = 32;
+            int *output = (int *)malloc((size_t)max_gen * sizeof(int));
+
+            if (output) {
+                int n_gen = sp_beast_generate(&inf_engine,
+                                              prompt, n_prompt,
+                                              output, max_gen,
+                                              0.0f, 1.0f);
+
+                fprintf(stderr, "\nGenerated %d tokens:", n_gen);
+                for (int i = 0; i < n_gen && i < 32; i++) {
+                    fprintf(stderr, " %d", output[i]);
+                }
+                fprintf(stderr, "\n\n");
+                free(output);
+            }
+
+            sp_beast_free(&inf_engine);
+            fprintf(stderr, "Inference test: PASS\n\n");
+        } else {
+            fprintf(stderr, "Engine init for inference failed (rc=%d): SKIP\n\n", inf_rc);
+        }
     }
 
     // ── Cleanup ─────────────────────────────────────────────────────

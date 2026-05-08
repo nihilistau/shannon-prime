@@ -138,6 +138,17 @@ static uint32_t read_gguf_value_u32(const uint8_t *base, uint64_t *cursor, uint3
     }
 }
 
+// Read a GGUF KV value as float (coercing from float32/float64).
+static float read_gguf_value_f32(const uint8_t *base, uint64_t *cursor, uint32_t type) {
+    switch (type) {
+    case SP_GGUF_TYPE_FLOAT32: return read_f32(base, cursor);
+    case SP_GGUF_TYPE_FLOAT64: return (float)read_f64(base, cursor);
+    default:
+        skip_gguf_value(base, cursor, type);
+        return 0.0f;
+    }
+}
+
 // ============================================================================
 // ggml type → bytes-per-element helpers
 // ============================================================================
@@ -369,6 +380,21 @@ static int sp_optane_parse_header(sp_optane_reservoir_t *res) {
 
     // Parse KV metadata — extract model hparams we need.
     memset(res->architecture, 0, sizeof(res->architecture));
+    // Set defaults before parsing
+    res->rope_freq_base = 10000.0f;  // Standard default, Qwen3 overrides to 1M
+    res->rms_norm_eps   = 1e-6f;     // Qwen3 default
+    res->n_expert_shared = 0;
+    res->n_ff = 0;
+    res->rope_dim = 0;               // 0 = use head_dim (standard RoPE), >0 = mRoPE partial
+    res->key_length = 0;
+    res->value_length = 0;
+    res->full_attn_interval = 0;
+    res->ssm_state_size = 0;
+    res->ssm_conv_kernel = 0;
+    res->ssm_inner_size = 0;
+    res->ssm_n_groups = 0;
+    res->ssm_dt_rank = 0;
+    res->is_hybrid = false;
 
     for (uint64_t i = 0; i < res->n_kv; i++) {
         // Key: string
@@ -385,8 +411,7 @@ static int sp_optane_parse_header(sp_optane_reservoir_t *res) {
         else if (strstr(key, ".block_count") && vtype <= SP_GGUF_TYPE_UINT64) {
             res->n_layer = read_gguf_value_u32(base, &cursor, vtype);
         }
-        else if (strstr(key, ".attention.head_count\"") == NULL &&
-                 strstr(key, ".attention.head_count_kv") && vtype <= SP_GGUF_TYPE_UINT64) {
+        else if (strstr(key, ".attention.head_count_kv") && vtype <= SP_GGUF_TYPE_UINT64) {
             res->n_head_kv = read_gguf_value_u32(base, &cursor, vtype);
         }
         else if (strstr(key, ".attention.head_count") &&
@@ -396,14 +421,56 @@ static int sp_optane_parse_header(sp_optane_reservoir_t *res) {
         else if (strstr(key, ".embedding_length") && vtype <= SP_GGUF_TYPE_UINT64) {
             res->n_embd = read_gguf_value_u32(base, &cursor, vtype);
         }
+        else if (strstr(key, ".feed_forward_length") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->n_ff = read_gguf_value_u32(base, &cursor, vtype);
+        }
         else if (strstr(key, ".vocab_size") && vtype <= SP_GGUF_TYPE_UINT64) {
             res->vocab_size = read_gguf_value_u32(base, &cursor, vtype);
         }
-        else if (strstr(key, ".expert_count") && vtype <= SP_GGUF_TYPE_UINT64) {
+        else if (strstr(key, ".expert_count") &&
+                 !strstr(key, "shared") && vtype <= SP_GGUF_TYPE_UINT64) {
             res->n_experts = (int)read_gguf_value_u32(base, &cursor, vtype);
         }
         else if (strstr(key, ".expert_used_count") && vtype <= SP_GGUF_TYPE_UINT64) {
             res->n_experts_per_token = (int)read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, "expert_shared_count") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->n_expert_shared = (int)read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".rope.freq_base") &&
+                 (vtype == SP_GGUF_TYPE_FLOAT32 || vtype == SP_GGUF_TYPE_FLOAT64)) {
+            res->rope_freq_base = read_gguf_value_f32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".attention.layer_norm_rms_epsilon") &&
+                 (vtype == SP_GGUF_TYPE_FLOAT32 || vtype == SP_GGUF_TYPE_FLOAT64)) {
+            res->rms_norm_eps = read_gguf_value_f32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".rope.dimension_count") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->rope_dim = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".attention.key_length") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->key_length = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".attention.value_length") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->value_length = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".full_attention_interval") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->full_attn_interval = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".ssm.state_size") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->ssm_state_size = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".ssm.conv_kernel") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->ssm_conv_kernel = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".ssm.inner_size") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->ssm_inner_size = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".ssm.group_count") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->ssm_n_groups = read_gguf_value_u32(base, &cursor, vtype);
+        }
+        else if (strstr(key, ".ssm.time_step_rank") && vtype <= SP_GGUF_TYPE_UINT64) {
+            res->ssm_dt_rank = read_gguf_value_u32(base, &cursor, vtype);
         }
         else {
             // Skip value we don't need
@@ -417,6 +484,7 @@ static int sp_optane_parse_header(sp_optane_reservoir_t *res) {
     }
 
     res->is_moe = (res->n_experts > 0);
+    res->is_hybrid = (res->ssm_state_size > 0 && res->full_attn_interval > 0);
 
     // ================================================================
     // Parse tensor descriptors
@@ -472,6 +540,16 @@ static int sp_optane_parse_header(sp_optane_reservoir_t *res) {
         t->ptr = (uint8_t *)res->data_ptr + t->offset;
     }
 
+    // Fallback: infer vocab_size from token_embd.weight if not in KV metadata
+    if (res->vocab_size == 0) {
+        const sp_optane_tensor_t *embd = sp_optane_find_tensor(res, "token_embd.weight");
+        if (embd && embd->n_dims >= 2) {
+            res->vocab_size = (uint32_t)embd->ne[1];  // [n_embd, vocab_size]
+            fprintf(stderr, "[sp-optane] vocab_size inferred from token_embd.weight: %u\n",
+                    res->vocab_size);
+        }
+    }
+
     return 0;
 }
 
@@ -504,30 +582,112 @@ static void sp_optane_build_expert_table(sp_optane_reservoir_t *res) {
         res->experts[e].total_bytes = 0;
     }
 
-    // Scan for per-expert tensors
+    // Scan for per-expert tensors (Mixtral-style naming)
     for (uint32_t i = 0; i < res->tensor_count; i++) {
         sp_optane_tensor_t *t = &res->tensors[i];
         int layer, expert;
 
-        // Try per-expert pattern: blk.{L}.ffn_{gate|up|down}.{E}.weight
         if (sscanf(t->name, "blk.%d.ffn_gate.%d.", &layer, &expert) == 2) {
-            if (expert >= 0 && expert < res->n_experts && expert < SP_OPTANE_MAX_EXPERTS) {
-                res->experts[expert].gate_proj = t;
-                res->experts[expert].layer = layer;
-                res->experts[expert].total_bytes += t->n_bytes;
+            int fi = layer * res->n_experts + expert;
+            if (expert >= 0 && expert < res->n_experts && fi < SP_OPTANE_MAX_EXPERTS) {
+                res->experts[fi].gate_proj = t;
+                res->experts[fi].layer = layer;
+                res->experts[fi].expert_id = expert;
+                res->experts[fi].total_bytes += t->n_bytes;
             }
         }
         else if (sscanf(t->name, "blk.%d.ffn_up.%d.", &layer, &expert) == 2) {
-            if (expert >= 0 && expert < res->n_experts && expert < SP_OPTANE_MAX_EXPERTS) {
-                res->experts[expert].up_proj = t;
-                res->experts[expert].total_bytes += t->n_bytes;
+            int fi = layer * res->n_experts + expert;
+            if (expert >= 0 && expert < res->n_experts && fi < SP_OPTANE_MAX_EXPERTS) {
+                res->experts[fi].up_proj = t;
+                res->experts[fi].total_bytes += t->n_bytes;
             }
         }
         else if (sscanf(t->name, "blk.%d.ffn_down.%d.", &layer, &expert) == 2) {
-            if (expert >= 0 && expert < res->n_experts && expert < SP_OPTANE_MAX_EXPERTS) {
-                res->experts[expert].down_proj = t;
-                res->experts[expert].total_bytes += t->n_bytes;
+            int fi = layer * res->n_experts + expert;
+            if (expert >= 0 && expert < res->n_experts && fi < SP_OPTANE_MAX_EXPERTS) {
+                res->experts[fi].down_proj = t;
+                res->experts[fi].total_bytes += t->n_bytes;
             }
+        }
+    }
+
+    // ── Fused expert tensors (Qwen3.6-style) ─────────────────────────
+    // Pattern: blk.{L}.ffn_{gate|up|down}_exps.weight
+    // Shape: [n_embd, n_ff, n_experts] (3D) or [n_embd, n_experts*n_ff] (2D)
+    // We create synthetic per-expert tensor descriptors by slicing.
+    for (uint32_t i = 0; i < res->tensor_count; i++) {
+        sp_optane_tensor_t *t = &res->tensors[i];
+        int layer;
+        int is_gate = 0, is_up = 0, is_down = 0;
+
+        if (strstr(t->name, ".ffn_gate_exps.")) {
+            is_gate = 1;
+            sscanf(t->name, "blk.%d.", &layer);
+        } else if (strstr(t->name, ".ffn_up_exps.")) {
+            is_up = 1;
+            sscanf(t->name, "blk.%d.", &layer);
+        } else if (strstr(t->name, ".ffn_down_exps.")) {
+            is_down = 1;
+            sscanf(t->name, "blk.%d.", &layer);
+        } else {
+            continue;
+        }
+
+        // Determine per-expert slice dimensions
+        int n_exp = (t->n_dims >= 3) ? (int)t->ne[2] : res->n_experts;
+        if (n_exp <= 0) continue;
+        int slice_rows = (t->n_dims >= 3) ? (int)t->ne[1] : (int)(t->ne[1] / n_exp);
+        int slice_cols = (int)t->ne[0];
+
+        // Byte size of one expert's slice
+        uint64_t blck = sp_ggml_blck_size(t->type);
+        uint64_t tsize = sp_ggml_type_size(t->type);
+        if (blck == 0 || tsize == 0) continue;
+        uint64_t row_bytes = ((uint64_t)slice_cols / blck) * tsize;
+        uint64_t expert_bytes = row_bytes * (uint64_t)slice_rows;
+
+        fprintf(stderr, "[sp-optane] Fused %s layer=%d: %d experts, %dx%d per expert (%.2f MB each)\n",
+                is_gate ? "gate" : is_up ? "up" : "down",
+                layer, n_exp, slice_cols, slice_rows,
+                (double)expert_bytes / (1024.0 * 1024.0));
+
+        for (int e = 0; e < n_exp && e < SP_OPTANE_MAX_EXPERTS_PER_LAYER; e++) {
+            // Per-layer expert index: experts[layer * n_experts + expert_id]
+            int flat_idx = layer * res->n_experts + e;
+            if (flat_idx >= SP_OPTANE_MAX_EXPERTS) break;
+
+            // Skip if already populated by per-expert scan
+            if (is_gate && res->experts[flat_idx].gate_proj) continue;
+            if (is_up   && res->experts[flat_idx].up_proj)   continue;
+            if (is_down && res->experts[flat_idx].down_proj)  continue;
+            if (res->tensor_count >= SP_OPTANE_MAX_TENSORS) break;
+
+            // Create synthetic tensor descriptor in the tensor table
+            uint32_t si = res->tensor_count++;
+            sp_optane_tensor_t *st = &res->tensors[si];
+            snprintf(st->name, sizeof(st->name), "blk.%d.ffn_%s.%d.synth",
+                     layer, is_gate ? "gate" : is_up ? "up" : "down", e);
+            st->type   = t->type;
+            st->n_dims = 2;
+            st->ne[0]  = (uint64_t)slice_cols;
+            st->ne[1]  = (uint64_t)slice_rows;
+            st->ne[2]  = 1;
+            st->ne[3]  = 1;
+            st->offset = t->offset + (uint64_t)e * expert_bytes;
+            st->n_bytes = expert_bytes;
+            st->ptr    = (uint8_t*)t->ptr + (uint64_t)e * expert_bytes;
+
+            if (is_gate) {
+                res->experts[flat_idx].gate_proj = st;
+                res->experts[flat_idx].layer = layer;
+                res->experts[flat_idx].expert_id = e;
+            } else if (is_up) {
+                res->experts[flat_idx].up_proj = st;
+            } else {
+                res->experts[flat_idx].down_proj = st;
+            }
+            res->experts[flat_idx].total_bytes += expert_bytes;
         }
     }
 }
@@ -678,20 +838,39 @@ void sp_optane_print_status(const sp_optane_reservoir_t *res) {
     fprintf(stderr, "Model:          %u layers, %u heads (%u KV), embd=%u\n",
             res->n_layer, res->n_head, res->n_head_kv, res->n_embd);
     fprintf(stderr, "Head dim:       %u\n", res->head_dim);
+    fprintf(stderr, "n_ff:           %u\n", res->n_ff);
+    fprintf(stderr, "RoPE freq_base: %.1f\n", res->rope_freq_base);
+    fprintf(stderr, "RoPE dim:       %u (mRoPE partial=%s)\n", res->rope_dim,
+            (res->rope_dim > 0 && res->rope_dim < res->head_dim) ? "YES" : "no");
+    fprintf(stderr, "RMS norm eps:   %.1e\n", res->rms_norm_eps);
+    if (res->is_hybrid) {
+        fprintf(stderr, "Hybrid SSM:     YES (full_attn every %u layers)\n", res->full_attn_interval);
+        fprintf(stderr, "SSM:            state=%u conv=%u inner=%u groups=%u dt_rank=%u\n",
+                res->ssm_state_size, res->ssm_conv_kernel,
+                res->ssm_inner_size, res->ssm_n_groups, res->ssm_dt_rank);
+        fprintf(stderr, "Attn key/val:   %u / %u per head\n", res->key_length, res->value_length);
+    }
     fprintf(stderr, "DAX enabled:    %s\n", res->dax_enabled ? "YES" : "no (page cache)");
 
     if (res->is_moe) {
-        fprintf(stderr, "MoE experts:    %d (top-%d)\n",
-                res->n_experts, res->n_experts_per_token);
-        for (int e = 0; e < res->n_experts; e++) {
-            const sp_optane_expert_t *exp = &res->experts[e];
-            fprintf(stderr, "  Expert %2d: gate=%s up=%s down=%s (%.2f MB)\n",
-                    e,
-                    exp->gate_proj ? "OK" : "--",
-                    exp->up_proj   ? "OK" : "--",
-                    exp->down_proj ? "OK" : "--",
-                    (double)exp->total_bytes / (1024.0*1024.0));
+        fprintf(stderr, "MoE experts:    %d (top-%d), %d shared\n",
+                res->n_experts, res->n_experts_per_token, res->n_expert_shared);
+        // Verify per-layer expert table population
+        int total_complete = 0;
+        for (int l = 0; l < (int)res->n_layer; l++) {
+            int layer_ok = 0;
+            for (int e = 0; e < res->n_experts; e++) {
+                int fi = l * res->n_experts + e;
+                if (fi >= SP_OPTANE_MAX_EXPERTS) break;
+                const sp_optane_expert_t *exp = &res->experts[fi];
+                if (exp->gate_proj && exp->up_proj && exp->down_proj) layer_ok++;
+            }
+            if (l == 0 || l == (int)res->n_layer - 1 || layer_ok != res->n_experts)
+                fprintf(stderr, "  Layer %2d: %d/%d experts complete\n", l, layer_ok, res->n_experts);
+            total_complete += layer_ok;
         }
+        fprintf(stderr, "  Total: %d/%d expert slots populated\n",
+                total_complete, res->n_experts * (int)res->n_layer);
     }
 
     fprintf(stderr, "Boot timing:    map=%.2f ms, parse=%.2f ms, index=%.2f ms\n",

@@ -30,8 +30,10 @@ extern "C" {
 // ============================================================================
 
 #define SP_OPTANE_PAGE_SIZE      4096        // Optane 4KB page granularity
-#define SP_OPTANE_MAX_EXPERTS    512         // Max MoE experts (Qwen3.6 has 256)
-#define SP_OPTANE_MAX_TENSORS    4096        // Max tensors in a GGUF file
+#define SP_OPTANE_MAX_EXPERTS_PER_LAYER 256  // Max experts per layer (Qwen3.6 has 256)
+#define SP_OPTANE_MAX_LAYERS    64          // Max layers for MoE expert table
+#define SP_OPTANE_MAX_EXPERTS   (SP_OPTANE_MAX_EXPERTS_PER_LAYER * SP_OPTANE_MAX_LAYERS)  // 16384 total
+#define SP_OPTANE_MAX_TENSORS    32768       // Max tensors (incl. synthetic per-expert slices)
 #define SP_OPTANE_PREFETCH_DIST  8           // Pages to prefetch ahead
 
 // GGUF magic and constants (from gguf spec)
@@ -143,6 +145,22 @@ typedef struct {
     uint32_t     n_embd;
     uint32_t     vocab_size;
     uint32_t     head_dim;            // n_embd / n_head
+    float        rope_freq_base;     // RoPE theta (10000 default, 1000000 for Qwen3)
+    float        rms_norm_eps;       // RMSNorm epsilon (1e-6 for Qwen3)
+    int          n_expert_shared;    // Shared experts (Qwen3-MoE has 4)
+    uint32_t     n_ff;               // Feed-forward intermediate size
+    uint32_t     rope_dim;           // RoPE dimension count (mRoPE: only first rope_dim dims rotated)
+
+    // --- Hybrid SSM+Attention (Qwen3.6 / Qwen3-Next) ---
+    uint32_t     key_length;         // Per-head K dim (256 for Qwen3.6, 0 = use head_dim)
+    uint32_t     value_length;       // Per-head V dim (256 for Qwen3.6, 0 = use head_dim)
+    uint32_t     full_attn_interval; // Full attention every N layers (4 for Qwen3.6, 0 = all attention)
+    uint32_t     ssm_state_size;     // Mamba state size (128 for Qwen3.6)
+    uint32_t     ssm_conv_kernel;    // Mamba conv1d kernel (4 for Qwen3.6)
+    uint32_t     ssm_inner_size;     // Mamba inner dim (4096 for Qwen3.6)
+    uint32_t     ssm_n_groups;       // Mamba group count (16 for Qwen3.6)
+    uint32_t     ssm_dt_rank;        // Mamba time step rank (32 for Qwen3.6)
+    bool         is_hybrid;          // True if model has SSM layers
 
     // --- Diagnostics ---
     uint64_t     boot_map_us;         // Time to mmap the file (microseconds)
@@ -179,11 +197,24 @@ const sp_optane_tensor_t *sp_optane_find_tensor(
 
 // --- Expert access (O(1)) ---
 
-// Get expert descriptor for MoE routing. Returns NULL if not MoE.
+// Get expert descriptor for MoE routing by (layer, expert_id).
+// Returns NULL if out of range. O(1) via flat index = layer * n_experts + expert_id.
+static inline const sp_optane_expert_t *sp_optane_layer_expert(
+    const sp_optane_reservoir_t *res, int layer, int expert_id)
+{
+    if (res->n_experts <= 0 || expert_id < 0 || expert_id >= res->n_experts ||
+        layer < 0 || layer >= (int)res->n_layer)
+        return NULL;
+    int idx = layer * res->n_experts + expert_id;
+    if (idx >= SP_OPTANE_MAX_EXPERTS) return NULL;
+    return &res->experts[idx];
+}
+
+// Legacy flat lookup (deprecated — use sp_optane_layer_expert for MoE).
 static inline const sp_optane_expert_t *sp_optane_expert(
     const sp_optane_reservoir_t *res, int expert_id)
 {
-    return (expert_id >= 0 && expert_id < res->n_experts)
+    return (expert_id >= 0 && expert_id < SP_OPTANE_MAX_EXPERTS)
         ? &res->experts[expert_id] : NULL;
 }
 

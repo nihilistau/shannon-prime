@@ -178,6 +178,21 @@ typedef struct {
     uint64_t    total_barrier_us;
     uint64_t    total_sidecar_us;
     uint64_t    boot_time_us;
+
+    // Forward pass runtime state (allocated by sp_beast_generate)
+    float       *beast_k_cache;     // [n_attn_layers * n_kv_dim * max_ctx]
+    float       *beast_v_cache;     // same shape
+    float       *beast_scratch;     // dequant row scratch [max(n_embd, vocab_size)]
+    float       *beast_x;           // residual stream [n_embd]
+    float       *beast_xn;          // normed residual [n_embd]
+    float       *beast_logits;      // [vocab_size]
+    int          beast_max_ctx;
+    int          beast_n_pos;
+
+    // SSM (Mamba2) recurrent state — persists across tokens
+    float       *beast_conv_state;  // [n_ssm_layers * ssm_inner * (conv_kernel-1)]
+    float       *beast_ssm_state;   // [n_ssm_layers * dt_rank * ssm_state_size]
+    int          beast_n_ssm_layers;
 } sp_beast_engine_t;
 
 // ============================================================================
