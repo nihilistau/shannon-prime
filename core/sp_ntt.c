@@ -205,3 +205,46 @@ int sp_poly_mul_ntt(sp_poly* c, const sp_poly* a, const sp_poly* b,
     sp_ntt_coeffs_to_int64(c->coeffs, C_buf, SP_NTT_N);
     return 0;
 }
+
+// ----- NTT-backed CKKS dot product -----------------------------------------
+
+float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
+                              int d, double delta,
+                              int64_t* int_scratch,
+                              uint64_t* u64_scratch,
+                              int* ok) {
+    if (d > SP_NTT_N) {
+        if (ok) *ok = 0;
+        return 0.0f;
+    }
+    int64_t* Q_int = int_scratch;
+    int64_t* K_int = int_scratch + SP_NTT_N;
+    uint64_t* A_buf = u64_scratch;
+    uint64_t* B_buf = u64_scratch + SP_NTT_N;
+    uint64_t* C_buf = u64_scratch + 2 * SP_NTT_N;
+
+    // Encode Q forward, K reversed (so coeff[d-1] of product = Σ q_i k_i).
+    sp_poly Qp = { Q_int, SP_NTT_N };
+    sp_poly Kp = { K_int, SP_NTT_N };
+    sp_poly_zero(&Qp);
+    sp_poly_zero(&Kp);
+    sp_poly_encode_fp32(&Qp, q_vec, d, delta, /*reversed=*/false);
+    sp_poly_encode_fp32(&Kp, k_vec, d, delta, /*reversed=*/true);
+
+    // NTT multiply.
+    sp_ntt_coeffs_from_int64(A_buf, Q_int, SP_NTT_N);
+    sp_ntt_coeffs_from_int64(B_buf, K_int, SP_NTT_N);
+    sp_ntt_forward(A_buf);
+    sp_ntt_forward(B_buf);
+    sp_ntt_pointwise_mul(C_buf, A_buf, B_buf);
+    sp_ntt_inverse(C_buf);
+    // Read coefficient (d-1) into signed int64, then decode.
+    int64_t coeff;
+    {
+        const uint64_t u = C_buf[d - 1];
+        const uint64_t HALF = SP_NTT_Q >> 1;
+        coeff = (u > HALF) ? -(int64_t)(SP_NTT_Q - u) : (int64_t)u;
+    }
+    if (ok) *ok = 1;
+    return (float)((double)coeff / (delta * delta));
+}

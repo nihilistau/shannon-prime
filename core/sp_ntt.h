@@ -80,6 +80,19 @@ void sp_ntt_coeffs_to_int64(int64_t* out,
 int sp_poly_mul_ntt(sp_poly* c, const sp_poly* a, const sp_poly* b,
                     uint64_t* A_buf, uint64_t* B_buf, uint64_t* C_buf);
 
+// NTT-backed CKKS dot product: same semantics as sp_poly_dot_product
+// (declared in sp_poly_ring.h), but uses the NTT path. Requires the ring
+// degree N to equal SP_NTT_N; returns 0.0f and sets *ok=0 otherwise.
+//
+// Scratch layout: caller supplies
+//   - int_scratch of length 2*SP_NTT_N (Q_int, K_int polynomials)
+//   - u64_scratch of length 3*SP_NTT_N (A_buf, B_buf, C_buf NTT domain)
+float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
+                              int d, double delta,
+                              int64_t* int_scratch,
+                              uint64_t* u64_scratch,
+                              int* ok);
+
 // Inline implementations of add/sub for tight inner loops.
 #include "sp_ntt_consts.h"
 
