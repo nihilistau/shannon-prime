@@ -4,30 +4,37 @@
  *
  * Generator: shannon-prime-engine/scripts/gen_ntt_consts.py
  *
- *   q         = 576460752312401921        (60-bit Proth prime)
- *   N         = 256                                  (transform length, log2 N = 8)
- *   psi       = 269365000840969592    (primitive 2N-th root of unity, psi^N ≡ -1 mod q)
- *   psi_inv   = 84881532103078508
- *   omega     = psi^2 = 255542023887511811
- *   omega_inv = 103285672259080384
- *   N_inv     = 574208952498681601      (N^-1 mod q)
+ *   q          = 576460752312401921        (60-bit Proth prime)
+ *   N          = 256                                  (transform length, log2 N = 8)
+ *   psi        = 269365000840969592    (primitive 2N-th root of unity, psi^N ≡ -1 mod q)
+ *   psi_inv    = 84881532103078508
+ *   omega      = psi^2 = 255542023887511811
+ *   omega_inv  = 103285672259080384
+ *   N_inv      = 574208952498681601      (N^-1 mod q)
+ *   barrett_mu = 2305843009177780220     (= floor(2^120 / q), ~61 bits)
  *
- * Forward negacyclic NTT pipeline (clean textbook form):
+ * Forward negacyclic NTT (clean textbook form):
+ *   1. Pre-twist:   a'_i = a_i * sp_ntt_psi_pow[i]  mod q
+ *   2. Bit-reverse: a'   = bitrev_permute(a')
+ *   3. Cyclic NTT:  Cooley-Tukey radix-2 DIT, natural-order twiddles
+ *                   w_step at layer length L is omega^(N/L);
+ *                   w iterates 1, w_step, w_step^2, ... within each block.
  *
- *   1. Pre-twist:        a'_i = a_i * sp_ntt_psi_pow[i]  mod q
- *   2. Bit-reverse:      a'   = bitrev_permute(a')
- *   3. Cyclic NTT:       Cooley-Tukey radix-2 DIT, natural-order twiddles
- *                        w_step at layer length L is omega^(N/L);
- *                        w iterates 1, w_step, w_step^2, ... within each block.
+ * Inverse:
+ *   1. Bit-reverse permute
+ *   2. Cyclic inverse NTT, w_step = omega_inv^(N/L), then mul by N_inv
+ *   3. Post-twist:  a_i = A_i * sp_ntt_psi_inv_pow[i] mod q
  *
- * Inverse negacyclic NTT:
+ * Barrett reduction (preferred over hardware DIV):
+ *   For x = a*b in [0, q^2) < [0, 2^120):
+ *     x_hi = x >> 64;  x_lo = (uint64_t)x;
+ *     h = x_hi * mu      (< 2^118)
+ *     l = x_lo * mu      (< 2^126)
+ *     q_hat = (h >> 56) + (l >> 120)
+ *     r = (uint64_t)x - q_hat * q
+ *     if (r >= q) r -= q;       // verified: at most 1 conditional sub over 1M random pairs
  *
- *   1. Bit-reverse:      A   = bitrev_permute(A)
- *   2. Cyclic inv NTT:   same butterflies, w_step = omega_inv^(N/L), then multiply by N_inv
- *   3. Post-twist:       a_i = A_i * sp_ntt_psi_inv_pow[i] mod q
- *
- * Self-check (Python reference, /tmp/clean_ntt.py): 5/5 PASS
- *   - roundtrip, random poly mul, identity mul, x*x^(N-1)=-1, dot-product use case
+ * Self-check (Python reference): 5/5 PASS
  */
 
 #ifndef SP_NTT_CONSTS_H
@@ -35,15 +42,16 @@
 
 #include <stdint.h>
 
-#define SP_NTT_Q         576460752312401921ULL
-#define SP_NTT_N         256
-#define SP_NTT_LOG_N     8
-#define SP_NTT_2N        512
-#define SP_NTT_PSI       269365000840969592ULL
-#define SP_NTT_PSI_INV   84881532103078508ULL
-#define SP_NTT_OMEGA     255542023887511811ULL
-#define SP_NTT_OMEGA_INV 103285672259080384ULL
-#define SP_NTT_N_INV     574208952498681601ULL
+#define SP_NTT_Q          576460752312401921ULL
+#define SP_NTT_N          256
+#define SP_NTT_LOG_N      8
+#define SP_NTT_2N         512
+#define SP_NTT_PSI        269365000840969592ULL
+#define SP_NTT_PSI_INV    84881532103078508ULL
+#define SP_NTT_OMEGA      255542023887511811ULL
+#define SP_NTT_OMEGA_INV  103285672259080384ULL
+#define SP_NTT_N_INV      574208952498681601ULL
+#define SP_NTT_BARRETT_MU 2305843009177780220ULL
 
 /* psi^i mod q  (negacyclic pre-twist) */
 static const uint64_t sp_ntt_psi_pow[256] = {

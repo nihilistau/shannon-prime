@@ -16,21 +16,35 @@
 // q < 2^60, so a*b < 2^120. We need 128-bit intermediate arithmetic, then
 // reduce mod q.
 
+// Barrett: mu = floor(2^120 / q) ~ 2^61. For x = a*b in [0, q^2):
+//   q_hat = ((x_hi * mu) >> 56) + ((x_lo * mu) >> 120)
+//   r     = x_lo - q_hat * q   (in [0, 2q) under 64-bit wrap)
+//   one conditional subtract brings r into [0, q).
+// Replaces ~20-cycle DIV with ~5-cycle MUL+SHIFT+SUB.
 uint64_t sp_ntt_mulmod(uint64_t a, uint64_t b) {
 #if defined(__SIZEOF_INT128__)
-    // GCC / clang: native 128-bit type.
-    unsigned __int128 prod = (unsigned __int128)a * (unsigned __int128)b;
-    return (uint64_t)(prod % SP_NTT_Q);
+    const unsigned __int128 x   = (unsigned __int128)a * (unsigned __int128)b;
+    const uint64_t          x_lo = (uint64_t)x;
+    const uint64_t          x_hi = (uint64_t)(x >> 64);
+    const unsigned __int128 h   = (unsigned __int128)x_hi * SP_NTT_BARRETT_MU;
+    const unsigned __int128 l   = (unsigned __int128)x_lo * SP_NTT_BARRETT_MU;
+    const uint64_t          q_hat = (uint64_t)(h >> 56) + (uint64_t)(l >> 120);
+    uint64_t                r   = x_lo - q_hat * SP_NTT_Q;
+    if (r >= SP_NTT_Q) r -= SP_NTT_Q;
+    return r;
 #elif defined(_MSC_VER) && defined(_M_X64)
-    // MSVC x64: _umul128 gives the 128-bit product as (hi, lo); _udiv128
-    // does signed 128/64 → 64 quotient + 64 remainder. Requires hi < q
-    // (which holds here since a, b < q < 2^60 implies hi < 2^56 < q).
-    uint64_t hi;
-    uint64_t lo = _umul128(a, b, &hi);
-    uint64_t rem;
-    // _udiv128: ((hi:lo) / divisor), remainder stored at *rem.
-    (void)_udiv128(hi, lo, SP_NTT_Q, &rem);
-    return rem;
+    uint64_t x_hi;
+    const uint64_t x_lo = _umul128(a, b, &x_hi);
+    uint64_t h_hi;
+    const uint64_t h_lo = _umul128(x_hi, SP_NTT_BARRETT_MU, &h_hi);
+    const uint64_t h_top = (h_hi << 8) | (h_lo >> 56);
+    uint64_t l_hi;
+    (void)_umul128(x_lo, SP_NTT_BARRETT_MU, &l_hi);
+    const uint64_t l_top = l_hi >> 56;
+    const uint64_t q_hat = h_top + l_top;
+    uint64_t r = x_lo - q_hat * SP_NTT_Q;
+    if (r >= SP_NTT_Q) r -= SP_NTT_Q;
+    return r;
 #else
     // Portable fallback: schoolbook split. Splits a into two 30-bit halves
     // so all intermediates fit in 64 bits.
@@ -189,7 +203,7 @@ void sp_ntt_coeffs_to_int64(int64_t* out, const uint64_t* in, int len) {
     }
 }
 
-// ----- sp_poly-compatible NTT multiply -------------------------------------
+/* ----- sp_poly-compatible NTT multiply ----------------------------------- */
 
 int sp_poly_mul_ntt(sp_poly* c, const sp_poly* a, const sp_poly* b,
                     uint64_t* A_buf, uint64_t* B_buf, uint64_t* C_buf) {
@@ -206,7 +220,7 @@ int sp_poly_mul_ntt(sp_poly* c, const sp_poly* a, const sp_poly* b,
     return 0;
 }
 
-// ----- NTT-backed CKKS dot product -----------------------------------------
+/* ----- NTT-backed CKKS dot product --------------------------------------- */
 
 float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
                               int d, double delta,
@@ -223,7 +237,6 @@ float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
     uint64_t* B_buf = u64_scratch + SP_NTT_N;
     uint64_t* C_buf = u64_scratch + 2 * SP_NTT_N;
 
-    // Encode Q forward, K reversed (so coeff[d-1] of product = Σ q_i k_i).
     sp_poly Qp = { Q_int, SP_NTT_N };
     sp_poly Kp = { K_int, SP_NTT_N };
     sp_poly_zero(&Qp);
@@ -231,14 +244,13 @@ float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
     sp_poly_encode_fp32(&Qp, q_vec, d, delta, /*reversed=*/false);
     sp_poly_encode_fp32(&Kp, k_vec, d, delta, /*reversed=*/true);
 
-    // NTT multiply.
     sp_ntt_coeffs_from_int64(A_buf, Q_int, SP_NTT_N);
     sp_ntt_coeffs_from_int64(B_buf, K_int, SP_NTT_N);
     sp_ntt_forward(A_buf);
     sp_ntt_forward(B_buf);
     sp_ntt_pointwise_mul(C_buf, A_buf, B_buf);
     sp_ntt_inverse(C_buf);
-    // Read coefficient (d-1) into signed int64, then decode.
+
     int64_t coeff;
     {
         const uint64_t u = C_buf[d - 1];
