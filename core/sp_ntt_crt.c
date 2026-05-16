@@ -194,3 +194,72 @@ int sp_ntt_crt_poly_mul(int64_t* c,
     }
     return 0;
 }
+
+/* ---- Phase 9b: engine integration helpers --------------------------- */
+
+void sp_poly_encode_ntt_q_crt(uint64_t* Q_ntt_q1,
+                              uint64_t* Q_ntt_q2,
+                              const float* q_vec, int d, double delta,
+                              int64_t* int_scratch) {
+    /* Encode Q forward (not reversed) into an int64 polynomial of
+     * length SP_NTT_CRT_N. Slots [0, d) hold round(q_vec[i] * delta);
+     * slots [d, N) are zero. */
+    sp_poly Qp = { int_scratch, SP_NTT_CRT_N };
+    sp_poly_zero(&Qp);
+    sp_poly_encode_fp32(&Qp, q_vec, d, delta, /*reversed=*/false);
+    /* Lift into each prime universe and forward NTT. */
+    sp_ntt_crt_coeffs_from_int64(Q_ntt_q1, int_scratch, SP_NTT_CRT_N,
+                                 SP_NTT_CRT_Q1);
+    sp_ntt_crt_coeffs_from_int64(Q_ntt_q2, int_scratch, SP_NTT_CRT_N,
+                                 SP_NTT_CRT_Q2);
+    sp_ntt_crt_forward(Q_ntt_q1, &SP_NTT_CRT_CTX_Q1);
+    sp_ntt_crt_forward(Q_ntt_q2, &SP_NTT_CRT_CTX_Q2);
+}
+
+void sp_poly_encode_ntt_k_reversed_crt(uint64_t* K_ntt_q1,
+                                       uint64_t* K_ntt_q2,
+                                       const float* k_vec, int d, double delta,
+                                       int64_t* int_scratch) {
+    /* Reversed K-encode: slot[d-1-i] = round(k_vec[i] * delta), zero elsewhere.
+     * The reversal is what makes Σ q_i*k_i land at coefficient x^(d-1)
+     * of Q(x)*K_rev(x). */
+    sp_poly Kp = { int_scratch, SP_NTT_CRT_N };
+    sp_poly_zero(&Kp);
+    sp_poly_encode_fp32(&Kp, k_vec, d, delta, /*reversed=*/true);
+    sp_ntt_crt_coeffs_from_int64(K_ntt_q1, int_scratch, SP_NTT_CRT_N,
+                                 SP_NTT_CRT_Q1);
+    sp_ntt_crt_coeffs_from_int64(K_ntt_q2, int_scratch, SP_NTT_CRT_N,
+                                 SP_NTT_CRT_Q2);
+    sp_ntt_crt_forward(K_ntt_q1, &SP_NTT_CRT_CTX_Q1);
+    sp_ntt_crt_forward(K_ntt_q2, &SP_NTT_CRT_CTX_Q2);
+}
+
+float sp_poly_dot_product_ntt_crt_qk_cached(const uint64_t* Q_ntt_q1,
+                                            const uint64_t* Q_ntt_q2,
+                                            const uint64_t* K_ntt_q1,
+                                            const uint64_t* K_ntt_q2,
+                                            int d, double delta,
+                                            uint64_t* c_q1_scratch,
+                                            uint64_t* c_q2_scratch,
+                                            int* ok) {
+    if (d > SP_NTT_CRT_N) {
+        if (ok) *ok = 0;
+        return 0.0f;
+    }
+    /* Pointwise multiply + inverse NTT in each prime universe. */
+    sp_ntt_crt_pointwise_mul(c_q1_scratch, Q_ntt_q1, K_ntt_q1,
+                             &SP_NTT_CRT_CTX_Q1);
+    sp_ntt_crt_pointwise_mul(c_q2_scratch, Q_ntt_q2, K_ntt_q2,
+                             &SP_NTT_CRT_CTX_Q2);
+    sp_ntt_crt_inverse(c_q1_scratch, &SP_NTT_CRT_CTX_Q1);
+    sp_ntt_crt_inverse(c_q2_scratch, &SP_NTT_CRT_CTX_Q2);
+    /* Extract coefficient (d-1), CRT-stitch, map to signed. */
+    const uint64_t u1 = c_q1_scratch[d - 1];
+    const uint64_t u2 = c_q2_scratch[d - 1];
+    const uint64_t x  = sp_ntt_crt_combine(u1, u2);
+    const uint64_t M    = SP_NTT_CRT_Q1 * SP_NTT_CRT_Q2;
+    const uint64_t HALF = M >> 1;
+    const int64_t  coeff = (x > HALF) ? -(int64_t)(M - x) : (int64_t)x;
+    if (ok) *ok = 1;
+    return (float)((double)coeff / (delta * delta));
+}

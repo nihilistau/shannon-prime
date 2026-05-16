@@ -99,6 +99,45 @@ int sp_ntt_crt_poly_mul(int64_t* c,
                         int N,
                         uint64_t* workspace);
 
+
+/* Phase 9b engine integration helpers — match the Phase 5b/6 60-bit
+ * helpers (sp_poly_encode_ntt_q, sp_poly_encode_ntt_k_reversed,
+ * sp_poly_dot_product_ntt_qk_cached) but produce dual-universe output.
+ *
+ * Both Q_ntt_q1/Q_ntt_q2 buffers are uint64[SP_NTT_CRT_N]. The Q-encoder
+ * writes both in one pass over the same fp32 input. The K-encoder
+ * mirrors the reversed encoding used by sp_poly_dot_product (so the
+ * dot product Σ q_i k_i lands at coefficient x^(d-1) of Q(x)*K_rev(x)).
+ *
+ * int_scratch is a single int64[SP_NTT_CRT_N] workspace shared across
+ * the encode steps (encoder writes once; both NTT pipelines consume it).
+ */
+void sp_poly_encode_ntt_q_crt(uint64_t* Q_ntt_q1,
+                              uint64_t* Q_ntt_q2,
+                              const float* q_vec, int d, double delta,
+                              int64_t* int_scratch);
+
+void sp_poly_encode_ntt_k_reversed_crt(uint64_t* K_ntt_q1,
+                                       uint64_t* K_ntt_q2,
+                                       const float* k_vec, int d, double delta,
+                                       int64_t* int_scratch);
+
+/* CRT-stitched dot product: both Q and K are pre-transformed under
+ * each prime context. This call is pure pointwise + inverse + extract +
+ * CRT stitch + fp32 decode — the hot inner loop of CRT attention.
+ *
+ * Scratch: c_q1_scratch and c_q2_scratch each uint64[SP_NTT_CRT_N].
+ * Returns 0 on success (always, given valid d). Sets *ok=1.
+ */
+float sp_poly_dot_product_ntt_crt_qk_cached(const uint64_t* Q_ntt_q1,
+                                            const uint64_t* Q_ntt_q2,
+                                            const uint64_t* K_ntt_q1,
+                                            const uint64_t* K_ntt_q2,
+                                            int d, double delta,
+                                            uint64_t* c_q1_scratch,
+                                            uint64_t* c_q2_scratch,
+                                            int* ok);
+
 /* Inline implementations. */
 #include "sp_ntt_crt_consts.h"
 
