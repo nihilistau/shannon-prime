@@ -93,7 +93,11 @@ bool sp_find_element_of_norm(int64_t n, sp_ok_t *out) {
         if (disc < 0) continue;
         int64_t s = sp_isqrt_i64(disc);
         if (s * s != disc) continue;
-        for (int sign = -1; sign <= 1; sign += 2) {
+        // Iterate sign +1 first then -1 to match the Python oracle's
+        // canonical representative (test-suite/src/sp_algebra.py).
+        // Bit-exact contract requires the same choice of pi vs pi_bar.
+        for (int sign_step = 0; sign_step < 2; sign_step++) {
+            int sign = (sign_step == 0) ? +1 : -1;
             int64_t num = -b + sign * s;
             if (num & 1) continue;       // odd numerator -> a not integer
             int64_t a = num / 2;

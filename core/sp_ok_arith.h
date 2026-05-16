@@ -35,10 +35,17 @@ typedef struct {
     int64_t b;  // coefficient of omega
 } sp_ok_t;
 
-// Constants (header-defined so they can be used as compile-time initializers).
+// Constants. Use compound literals in C, brace-init in C++ (since C++
+// rejects C99 compound-literal syntax).
+#ifdef __cplusplus
+#define SP_OK_ZERO    (sp_ok_t{0, 0})
+#define SP_OK_ONE     (sp_ok_t{1, 0})
+#define SP_OK_OMEGA   (sp_ok_t{0, 1})
+#else
 #define SP_OK_ZERO    ((sp_ok_t){0, 0})
 #define SP_OK_ONE     ((sp_ok_t){1, 0})
 #define SP_OK_OMEGA   ((sp_ok_t){0, 1})
+#endif
 
 // The relation omega^2 = omega - 41 is encoded in the multiplication formula.
 #define SP_OK_OMEGA_NORM  41
