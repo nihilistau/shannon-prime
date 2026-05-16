@@ -93,6 +93,25 @@ float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
                               uint64_t* u64_scratch,
                               int* ok);
 
+/* Q-hoisted variant for repeated dot products with a fixed Q (Phase 5b).
+ * Caller transforms Q once via sp_poly_encode_ntt_q (writes Q_ntt buffer of
+ * length SP_NTT_N in the NTT domain) and reuses it for every key:
+ *   sp_poly_encode_ntt_q(Q_ntt, q_vec, d, delta, int_scratch_qi);
+ *   for (t in keys)
+ *     score[t] = sp_poly_dot_product_ntt_q_cached(Q_ntt, k_vec_t, ...);
+ */
+void sp_poly_encode_ntt_q(uint64_t* Q_ntt,
+                          const float* q_vec, int d, double delta,
+                          int64_t* int_scratch);
+
+float sp_poly_dot_product_ntt_q_cached(const uint64_t* Q_ntt,
+                                       const float* k_vec, int d, double delta,
+                                       int64_t* k_int_scratch,
+                                       uint64_t* k_ntt_scratch,
+                                       uint64_t* c_ntt_scratch,
+                                       int* ok);
+
+
 // Inline implementations of add/sub for tight inner loops.
 #include "sp_ntt_consts.h"
 
@@ -111,3 +130,4 @@ static inline uint64_t sp_ntt_submod(uint64_t a, uint64_t b) {
 #endif
 
 #endif  // SP_NTT_H
+

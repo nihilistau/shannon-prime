@@ -260,3 +260,39 @@ float sp_poly_dot_product_ntt(const float* q_vec, const float* k_vec,
     if (ok) *ok = 1;
     return (float)((double)coeff / (delta * delta));
 }
+
+/* ----- Q-hoisted helpers (Phase 5b) -------------------------------------- */
+
+void sp_poly_encode_ntt_q(uint64_t* Q_ntt,
+                          const float* q_vec, int d, double delta,
+                          int64_t* int_scratch) {
+    sp_poly Qp = { int_scratch, SP_NTT_N };
+    sp_poly_zero(&Qp);
+    sp_poly_encode_fp32(&Qp, q_vec, d, delta, /*reversed=*/false);
+    sp_ntt_coeffs_from_int64(Q_ntt, int_scratch, SP_NTT_N);
+    sp_ntt_forward(Q_ntt);
+}
+
+float sp_poly_dot_product_ntt_q_cached(const uint64_t* Q_ntt,
+                                       const float* k_vec, int d, double delta,
+                                       int64_t* k_int_scratch,
+                                       uint64_t* k_ntt_scratch,
+                                       uint64_t* c_ntt_scratch,
+                                       int* ok) {
+    if (d > SP_NTT_N) {
+        if (ok) *ok = 0;
+        return 0.0f;
+    }
+    sp_poly Kp = { k_int_scratch, SP_NTT_N };
+    sp_poly_zero(&Kp);
+    sp_poly_encode_fp32(&Kp, k_vec, d, delta, /*reversed=*/true);
+    sp_ntt_coeffs_from_int64(k_ntt_scratch, k_int_scratch, SP_NTT_N);
+    sp_ntt_forward(k_ntt_scratch);
+    sp_ntt_pointwise_mul(c_ntt_scratch, Q_ntt, k_ntt_scratch);
+    sp_ntt_inverse(c_ntt_scratch);
+    const uint64_t u = c_ntt_scratch[d - 1];
+    const uint64_t HALF = SP_NTT_Q >> 1;
+    const int64_t coeff = (u > HALF) ? -(int64_t)(SP_NTT_Q - u) : (int64_t)u;
+    if (ok) *ok = 1;
+    return (float)((double)coeff / (delta * delta));
+}
