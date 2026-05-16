@@ -296,3 +296,28 @@ float sp_poly_dot_product_ntt_q_cached(const uint64_t* Q_ntt,
     if (ok) *ok = 1;
     return (float)((double)coeff / (delta * delta));
 }
+
+/* ----- Phase 6 helpers (K-NTT cache, pointwise-only inner loop) ---------- */
+
+void sp_poly_encode_ntt_k_reversed(uint64_t* K_ntt,
+                                   const float* k_vec, int d, double delta,
+                                   int64_t* int_scratch) {
+    sp_poly Kp = { int_scratch, SP_NTT_N };
+    sp_poly_zero(&Kp);
+    sp_poly_encode_fp32(&Kp, k_vec, d, delta, /*reversed=*/true);
+    sp_ntt_coeffs_from_int64(K_ntt, int_scratch, SP_NTT_N);
+    sp_ntt_forward(K_ntt);
+}
+
+float sp_poly_dot_product_ntt_qk_cached(const uint64_t* Q_ntt,
+                                        const uint64_t* K_ntt,
+                                        int d, double delta,
+                                        uint64_t* c_ntt_scratch) {
+    if (d > SP_NTT_N) return 0.0f;
+    sp_ntt_pointwise_mul(c_ntt_scratch, Q_ntt, K_ntt);
+    sp_ntt_inverse(c_ntt_scratch);
+    const uint64_t u = c_ntt_scratch[d - 1];
+    const uint64_t HALF = SP_NTT_Q >> 1;
+    const int64_t coeff = (u > HALF) ? -(int64_t)(SP_NTT_Q - u) : (int64_t)u;
+    return (float)((double)coeff / (delta * delta));
+}

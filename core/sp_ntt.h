@@ -112,6 +112,21 @@ float sp_poly_dot_product_ntt_q_cached(const uint64_t* Q_ntt,
                                        int* ok);
 
 
+/* Phase 6: both Q and K pre-NTT'd. Just pointwise multiply + inverse NTT
+ * + extract coefficient (d-1). Caller manages a persistent K_ntt cache
+ * (one buffer of length SP_NTT_N per (kv_h, t)) and the Q_ntt buffer (one
+ * per (h, qi) via sp_poly_encode_ntt_q). c_ntt_scratch is per-call. */
+float sp_poly_dot_product_ntt_qk_cached(const uint64_t* Q_ntt,
+                                        const uint64_t* K_ntt,
+                                        int d, double delta,
+                                        uint64_t* c_ntt_scratch);
+
+/* Encode reversed K + forward NTT into the supplied K_ntt buffer of length
+ * SP_NTT_N. Used to populate the Phase 6 K-cache once per (kv_h, t). */
+void sp_poly_encode_ntt_k_reversed(uint64_t* K_ntt,
+                                   const float* k_vec, int d, double delta,
+                                   int64_t* int_scratch);
+
 // Inline implementations of add/sub for tight inner loops.
 #include "sp_ntt_consts.h"
 
