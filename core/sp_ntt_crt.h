@@ -49,6 +49,10 @@ typedef struct sp_ntt_ctx {
     const uint64_t* psi_inv_pow;   /* psi^-i mod q,   length N */
     uint64_t        psi;           /* primitive 2N-th root of unity */
     uint64_t        psi_inv;       /* psi^-1 mod q */
+    /* Phase 10 SIMD additions */
+    uint64_t        barrett_mu;    /* floor(2^61 / q), used for Barrett reduction */
+    const uint64_t* omega_pow;     /* omega^bitrev(i) mod q, length N (CT-DIT twiddles) */
+    const uint64_t* omega_inv_pow; /* omega^-bitrev(i) mod q, length N */
 } sp_ntt_ctx;
 
 /* Pre-built contexts for the two production primes. */
@@ -150,7 +154,7 @@ static inline uint64_t sp_ntt_crt_combine(uint64_t a1, uint64_t a2) {
      * inverse constant < q2 (30 bits), product < 2^60 fits uint64. */
     uint64_t u = (diff * SP_NTT_CRT_Q1_INV_Q2) % SP_NTT_CRT_Q2;
     /* x = a1 + u * q1.  u < q2 (30 bits), q1 < 2^30, product < 2^60,
-     * plus a1 (30 bits) → fits uint64. */
+     * plus a1 (30 bits) -> fits uint64. */
     return a1 + u * SP_NTT_CRT_Q1;
 }
 
