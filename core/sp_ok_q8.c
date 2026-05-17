@@ -36,11 +36,45 @@ int8_t sp_ok_q8_encode_array(sp_ok_q8_t* dst,
     return s;
 }
 
+/* AVX-512 vectorized decoder: sign-extends 16 int8 pairs at a time, then
+ * left-shifts each int64 lane by `shift`. The packed input is 16-byte
+ * (8 sp_ok_q8_t = 16 int8s); the unpacked output is 256 bytes (8 sp_ok_t
+ * pairs = 16 int64s). When `shift` is 0, we degenerate to a sign-extend
+ * only -- still 8x scalar throughput. */
+#if defined(__AVX512F__)
+#include <immintrin.h>
+#define SP_OK_Q8_DECODE_AVX512 1
+#endif
+
 void sp_ok_q8_decode_array(sp_ok_t* dst,
                            const sp_ok_q8_t* src,
                            size_t numel,
                            int8_t shift) {
-    for (size_t i = 0; i < numel; ++i) {
+    size_t i = 0;
+#if SP_OK_Q8_DECODE_AVX512
+    /* Process 8 sp_ok_q8_t (= 8 packed pairs = 16 int8s = 16 bytes) per
+     * iteration, producing 8 sp_ok_t (= 16 int64s = 128 bytes) of output. */
+    const int s = (int)shift;
+    for (; i + 8 <= numel; i += 8) {
+        /* Load 16 int8s. The 16 bytes interleave a0,b0,a1,b1,...,a7,b7. */
+        __m128i v8 = _mm_loadu_si128((const __m128i*)(src + i));
+        /* Sign-extend 16 x int8 -> 16 x int64 across two 512-bit regs. */
+        __m512i lo = _mm512_cvtepi8_epi64(v8);
+        __m512i hi = _mm512_cvtepi8_epi64(_mm_srli_si128(v8, 8));
+        /* Apply shared left shift (zero-shift is a no-op). */
+        if (s > 0) {
+            lo = _mm512_slli_epi64(lo, s);
+            hi = _mm512_slli_epi64(hi, s);
+        }
+        /* sp_ok_t is { int64 a; int64 b } in memory; the cvtepi8_epi64
+         * spread already produced the right interleaving: a0,b0,a1,b1...
+         * Stream the 1024 bits straight out. */
+        _mm512_storeu_si512((__m512i*)(dst + i),     lo);
+        _mm512_storeu_si512((__m512i*)(dst + i + 4), hi);
+    }
+#endif
+    /* Scalar tail (also the entire loop on non-AVX-512 builds). */
+    for (; i < numel; ++i) {
         dst[i] = sp_ok_q8_decode_one(src[i], shift);
     }
 }
