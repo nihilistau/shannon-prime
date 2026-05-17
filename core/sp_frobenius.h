@@ -20,6 +20,7 @@
 
 #include "sp_ok_arith.h"
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
