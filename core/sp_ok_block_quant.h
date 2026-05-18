@@ -152,6 +152,22 @@ typedef struct {
     uint8_t  qs[SP_OK_BLOCK_SIZE / 2];           /* 16 bytes, unsigned 4-bit nybbles */
 } sp_gguf_block_q4_1;  /* 20 bytes per block */
 
+/* Q4_K super-block: 256 elements = 8 sub-blocks of 32 elements each.
+ * Each sub-block carries a 6-bit scale and 6-bit min, encoded in the
+ * 12-byte `scales` field via the get_scale_min_k4 helper layout. The
+ * super-block-level d and dmin are fp16. Dequant per element:
+ *   W[k] = d·sc[sub_idx]·q_int[k] − dmin·m[sub_idx]
+ * where q_int[k] is the unsigned 4-bit codepoint. */
+#define SP_OK_Q4_K_SUPER         256
+#define SP_OK_Q4_K_SCALES_BYTES  12
+#define SP_OK_Q4_K_SUBBLOCKS     (SP_OK_Q4_K_SUPER / SP_OK_BLOCK_SIZE)  /* 8 */
+typedef struct {
+    uint16_t d;                                       /* fp16 super-block scale */
+    uint16_t dmin;                                    /* fp16 super-block min scale */
+    uint8_t  scales[SP_OK_Q4_K_SCALES_BYTES];         /* 6-bit packed (sc, m) per sub-block */
+    uint8_t  qs[SP_OK_Q4_K_SUPER / 2];                /* 128 bytes, 4-bit packed quants */
+} sp_gguf_block_q4_K;  /* 144 bytes per 256 elements = 4.5 bits/elem */
+
 /* ---------- Importers --------------------------------------------------- */
 
 /* Convert N GGUF Q8_0 blocks (continuous in src) into N fused
@@ -184,6 +200,23 @@ int sp_ok_block_q4_1_from_gguf_q4_1(
     sp_ok_block_q4_1_tensor* dst,
     const sp_gguf_block_q4_1* src,
     size_t n_blocks,
+    int64_t scale_recip,
+    int64_t p,
+    int64_t k);
+
+/* Phase 15c: GGUF Q4_K importer. Fans each 256-element super-block out
+ * to 8 sp_ok_q4_1_block_t sub-blocks (32 elements each). Per-sub-block
+ *   B_sub = d · sc · π^k         (positive contribution)
+ *   M_sub = − dmin · m · π^k     (note the sign — Q4_K dequant is
+ *                                  W = d·sc·q − dmin·m, so to match the
+ *                                  Q4_1 kernel's convention q·B + M we
+ *                                  store M = −dmin·m·π^k)
+ * The nybble layout is repacked into our standard Q4_1 byte-i-low /
+ * byte-i-high-+16 ordering. */
+int sp_ok_block_q4_K_from_gguf_q4_K(
+    sp_ok_block_q4_1_tensor* dst,
+    const sp_gguf_block_q4_K* src,
+    size_t n_super_blocks,             /* numel / 256 */
     int64_t scale_recip,
     int64_t p,
     int64_t k);
