@@ -1162,6 +1162,7 @@ int sp_hex_compress_f32_full_batch(remote_handle64 h,
 
 #include "../../sp_hex_w_matrix_hd154.h"  // baked Q15 W matrix (int32 padded)
 #include "../../sp_hex_hier_predict.h"   // HVX kernel declarations
+#include "../../sp_hex_residual_spinor.h" // Strike 12 residual packer
 
 int sp_hex_hier_predict_f32(remote_handle64 h,
                              const float *skeleton, int skeleton_len,
@@ -1187,4 +1188,50 @@ int sp_hex_hier_predict_f32(remote_handle64 h,
          "(supported: (14, 140) for head_dim=154)",
          skeleton_len, predicted_len);
     return -2;
+}
+
+// ============================================================================
+// Strike 12: residual quantize + SU(2) spinor phase (dispatch stub).
+// ============================================================================
+//
+// Wraps sp_hex_residual_spinor_hvx behind the FastRPC boundary.  The IDL
+// passes raw fp32 buffers (actual, predicted) without the lane-count
+// information; we derive n_lanes from the sequence length.  Only the
+// canonical 140-lane / 160-padded configuration is supported today.
+// ============================================================================
+
+int sp_hex_residual_quantize_spinor(remote_handle64 h,
+                                     const float *actual, int actual_len,
+                                     const float *predicted, int predicted_len,
+                                     unsigned char *packed, int packed_capacity,
+                                     float *amax) {
+    (void)h;
+    if (!actual || !predicted || !packed || !amax) {
+        FARF(ERROR, "[sp_hex] residual_spinor: null pointer");
+        return -1;
+    }
+    if (actual_len != predicted_len) {
+        FARF(ERROR, "[sp_hex] residual_spinor: actual_len=%d != predicted_len=%d",
+             actual_len, predicted_len);
+        return -1;
+    }
+    /* Only head_dim=154 supported — 140 valid lanes padded to 160. */
+    if (actual_len != SP_HEX_RESIDUAL_PAD) {
+        FARF(ERROR,
+             "[sp_hex] residual_spinor: length %d not supported "
+             "(expected %d = 160 padded for 140-lane block)",
+             actual_len, SP_HEX_RESIDUAL_PAD);
+        return -2;
+    }
+    if (packed_capacity < SP_HEX_RESIDUAL_TOTAL_BYTES) {
+        FARF(ERROR,
+             "[sp_hex] residual_spinor: capacity %d < required %d",
+             packed_capacity, SP_HEX_RESIDUAL_TOTAL_BYTES);
+        return -1;
+    }
+    return sp_hex_residual_spinor_hvx(actual, predicted,
+                                       SP_HEX_RESIDUAL_LANES_MAX,
+                                       SP_HEX_RESIDUAL_PAD,
+                                       packed, packed_capacity,
+                                       amax);
 }

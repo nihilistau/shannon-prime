@@ -163,6 +163,12 @@ int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors);
 // in the W rodata bank. Returns 0 if all three pass both checks.
 int sp_hex_hier_predict_parity(void);
 
+// Strike 12: FastRPC parity test for sp_hex_residual_quantize_spinor.
+// Drives 3 deterministic (actual, predicted) patterns through the DSP
+// residual packer; asserts byte-equal 71-byte output + bit-equal fp32
+// amax vs the host scalar reference. Returns 0 if all three patterns pass.
+int sp_hex_residual_spinor_parity(void);
+
 #ifdef __cplusplus
 }
 #endif

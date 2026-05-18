@@ -1560,6 +1560,7 @@ int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors) {
 
 #include "../../sp_hex_w_matrix_hd154.h"   // same rodata the DSP sees
 #include "../../sp_hex_hier_predict.h"    // host-side ref impls
+#include "../../sp_hex_residual_spinor.h" // Strike 12 host ref
 
 #define SP_HEX_HIER_HD154_SKEL  14
 #define SP_HEX_HIER_HD154_PRED  140
@@ -1730,6 +1731,169 @@ int sp_hex_hier_predict_parity(void) {
     free(host_q15);
     free(host_f32);
     free(w_i16);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return total_fail;
+}
+
+// ============================================================================
+// Strike 12: FastRPC parity test for sp_hex_residual_quantize_spinor.
+// ============================================================================
+//
+// Drives the residual packer with three deterministic (actual, predicted)
+// pairs and asserts the DSP-produced 71-byte packed output is BIT-EQUAL to
+// the host scalar reference (sp_hex_residual_spinor_ref).  Also checks
+// amax matches within fp32 epsilon.
+//
+// Patterns:
+//   0 "predict_good"  — actual = sin-wave, predicted = actual + small noise.
+//                        Residual amplitude small (~0.01); exercises the
+//                        dense Q3 packing under low-amplitude conditions.
+//   1 "predict_bad"   — actual = sin-wave, predicted = zeros.
+//                        Residual amplitude full; exercises the saturated
+//                        mag=7 lane and wide phase distribution.
+//   2 "zero_block"    — actual == predicted everywhere; residuals all 0;
+//                        exercises the amax=0 short-circuit + zeroed packed.
+// ============================================================================
+
+static void hier_fill_residual_pattern(float *actual,
+                                        float *predicted,
+                                        int n_lanes,
+                                        int n_padded,
+                                        int pattern) {
+    /* Always zero the pad lanes so vsub on them is 0 and they don't poison
+     * amax.  Real prefill must follow this same invariant. */
+    for (int i = 0; i < n_padded; ++i) {
+        actual[i] = 0.0f;
+        predicted[i] = 0.0f;
+    }
+    for (int i = 0; i < n_lanes; ++i) {
+        float t = (float)i / (float)(n_lanes - 1);   /* 0..1 */
+        float sinwave = 0.5f * sinf(6.2831853f * t * 3.0f);  /* 3 cycles */
+        switch (pattern) {
+            case 0: /* good prediction: small residual */
+                actual[i]    = sinwave;
+                /* deterministic "small noise" — 1% of sinwave + 1e-3 const */
+                predicted[i] = sinwave - 0.01f * sinwave - 0.001f;
+                break;
+            case 1: /* bad prediction: residual == actual */
+                actual[i]    = sinwave;
+                predicted[i] = 0.0f;
+                break;
+            case 2: /* zero block: residual all zero */
+                actual[i]    = sinwave;
+                predicted[i] = sinwave;
+                break;
+            default: break;
+        }
+    }
+}
+
+int sp_hex_residual_spinor_parity(void) {
+    rpcmem_init();
+    remote_handle64 h = -1;
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[spinor] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[spinor] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    const int N_LANES  = SP_HEX_RESIDUAL_LANES_MAX;   /* 140 */
+    const int N_PAD    = SP_HEX_RESIDUAL_PAD;         /* 160 */
+    const int N_PACKED = SP_HEX_RESIDUAL_TOTAL_BYTES; /* 71  */
+
+    /* rpcmem-backed input buffers (zero-copy across FastRPC). */
+    float   *actual    = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                  RPCMEM_DEFAULT_FLAGS,
+                                                  (int)(N_PAD * sizeof(float)));
+    float   *predicted = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                  RPCMEM_DEFAULT_FLAGS,
+                                                  (int)(N_PAD * sizeof(float)));
+    uint8_t *dsp_pkt   = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                  RPCMEM_DEFAULT_FLAGS,
+                                                  N_PACKED);
+    uint8_t *host_pkt  = (uint8_t *)malloc((size_t)N_PACKED);
+
+    if (!actual || !predicted || !dsp_pkt || !host_pkt) {
+        printf("[spinor] alloc failed\n");
+        if (actual)    rpcmem_free(actual);
+        if (predicted) rpcmem_free(predicted);
+        if (dsp_pkt)   rpcmem_free(dsp_pkt);
+        if (host_pkt)  free(host_pkt);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    int total_fail = 0;
+    const char *names[3] = {"predict_good", "predict_bad ", "zero_block  "};
+    for (int pat = 0; pat < 3; ++pat) {
+        hier_fill_residual_pattern(actual, predicted, N_LANES, N_PAD, pat);
+
+        float host_amax = 0.0f;
+        sp_hex_residual_spinor_ref(actual, predicted, N_LANES, N_PAD,
+                                    host_pkt, N_PACKED, &host_amax);
+
+        memset(dsp_pkt, 0, N_PACKED);
+        float dsp_amax = 0.0f;
+        int dsp_rc = sp_hex_residual_quantize_spinor(h,
+                                                      actual, N_PAD,
+                                                      predicted, N_PAD,
+                                                      dsp_pkt, N_PACKED,
+                                                      &dsp_amax);
+        if (dsp_rc != 0) {
+            printf("[spinor][%s] DSP rc=%d\n", names[pat], dsp_rc);
+            total_fail = 1;
+            continue;
+        }
+
+        /* amax bit-equal (or both zero) */
+        uint32_t a_h, a_d;
+        memcpy(&a_h, &host_amax, 4);
+        memcpy(&a_d, &dsp_amax, 4);
+        int amax_match = (a_h == a_d);
+
+        /* packed bytes bit-equal */
+        int diffs = 0, first = -1;
+        for (int i = 0; i < N_PACKED; ++i) {
+            if (dsp_pkt[i] != host_pkt[i]) {
+                if (diffs == 0) first = i;
+                ++diffs;
+            }
+        }
+        if (!amax_match) {
+            printf("[spinor][%s] AMAX FAIL: DSP=%.6e (0x%08x) host=%.6e (0x%08x)\n",
+                   names[pat], dsp_amax, (unsigned int)a_d,
+                   host_amax, (unsigned int)a_h);
+            total_fail = 1;
+        } else if (diffs > 0) {
+            printf("[spinor][%s] BYTES FAIL: %d/%d bytes differ; "
+                   "first @ %d DSP=0x%02X host=0x%02X (amax=%.6e)\n",
+                   names[pat], diffs, N_PACKED, first,
+                   dsp_pkt[first], host_pkt[first], dsp_amax);
+            total_fail = 1;
+        } else {
+            printf("[spinor][%s] 71 bytes byte-equal | amax=%.6e ✓\n",
+                   names[pat], dsp_amax);
+        }
+    }
+
+    rpcmem_free(actual);
+    rpcmem_free(predicted);
+    rpcmem_free(dsp_pkt);
+    free(host_pkt);
     sp_hex_close(h);
     rpcmem_deinit();
     return total_fail;

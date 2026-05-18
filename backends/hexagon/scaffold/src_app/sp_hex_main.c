@@ -208,6 +208,18 @@ int main(int argc, char *argv[]) {
                "Hierarchical Spinor entry green\n");
     }
 
+    // Strike 12: residual quantize + SU(2) spinor phase.  Takes the predicted
+    // residuals + actual coefficients, packs (actual - predicted) into
+    // 71 bytes (140 × 3-bit magnitude + 140 × 1-bit sign) plus one fp32 amax.
+    printf("\n[spinor] === Strike 12: residual_quantize_spinor FastRPC parity ===\n");
+    int spinor_fail = sp_hex_residual_spinor_parity();
+    if (spinor_fail) {
+        printf("[spinor] FAIL — DSP packer diverged from host reference\n");
+    } else {
+        printf("[spinor] all 3 patterns 71 bytes byte-equal + amax bit-equal — "
+               "Hierarchical Spinor encode closed\n");
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

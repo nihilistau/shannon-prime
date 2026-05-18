@@ -430,4 +430,24 @@ interface sp_hex : remote_handle64 {
    // -------------------------------------------------------------------
    long hier_predict_f32(in sequence<float> skeleton,
                          rout sequence<float> predicted);
+
+   // -------------------------------------------------------------------
+   // residual_quantize_spinor — Strike 12: Hierarchical Spinor residual
+   // packer.  Takes (actual, predicted) fp32 vectors and packs the
+   // residual into 71 bytes (140 × 3-bit magnitude + 140 × 1-bit SU(2)
+   // spinor phase) plus a per-block fp32 amax.
+   //
+   //   actual    : fp32, length 160 (140 valid lanes + 20 zero pad)
+   //   predicted : fp32, length 160 (e.g. output of hier_predict_f32
+   //                       extended with the 14 skeleton coords zero'd)
+   //   packed    : 71 bytes — [53 bytes mag-3b-packed][18 bytes phase-1b]
+   //   amax      : fp32 scalar — needed by the decoder
+   //
+   // Total downstream encoder cost: 71 + 4 bytes per residual block
+   // (~6× compression vs raw fp32 at the 154-coord level).
+   // -------------------------------------------------------------------
+   long residual_quantize_spinor(in sequence<float> actual,
+                                  in sequence<float> predicted,
+                                  rout sequence<octet> packed,
+                                  rout float amax);
 };
