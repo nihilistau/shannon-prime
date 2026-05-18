@@ -196,6 +196,18 @@ int main(int argc, char *argv[]) {
         printf("[fused_batch] all 4 head_dims × 4 batch sizes byte-equal — prefill collapsed\n");
     }
 
+    // Strike 11b: HVX W-matrix predictor (Hierarchical Spinor entry).
+    // Validates the Q15 MAC kernel against (a) a host scalar Q15 simulator
+    // (bit-equal) and (b) a pure-fp32 reference (within ~5e-4 quant budget).
+    printf("\n[hier] === Strike 11b: hier_predict_f32 FastRPC parity test ===\n");
+    int hier_fail = sp_hex_hier_predict_parity();
+    if (hier_fail) {
+        printf("[hier] FAIL — DSP predictor diverged from host references\n");
+    } else {
+        printf("[hier] all 3 patterns kernel bit-equal + within Q15 budget — "
+               "Hierarchical Spinor entry green\n");
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

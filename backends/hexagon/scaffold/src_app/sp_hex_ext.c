@@ -1534,6 +1534,208 @@ int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors) {
 }
 
 // ============================================================================
+// Strike 11b: FastRPC parity test for sp_hex_hier_predict_f32.
+// ============================================================================
+//
+// Validates the HVX W-matrix predictor (Hierarchical Spinor entry point) on
+// real V69 silicon.  Two checks per skeleton input:
+//
+//   1. KERNEL CORRECTNESS — DSP result must match the host scalar reference
+//      that runs the IDENTICAL Q15 math (sp_hex_hier_predict_ref_q15).  Bit-
+//      equal on the fp32 dequant output is the contract.  This isolates
+//      "did the HVX MAC implement the math correctly" from "is Q15 a tight
+//      enough quantization."
+//
+//   2. QUANT BUDGET — DSP result must be within a tolerance of the pure-fp32
+//      reference (sp_hex_hier_predict_ref_f32).  The tolerance comes from
+//      the bake-time max_abs_quant_err reported by gen_w_matrix.py; we use
+//      a conservative 14 * skel_norm * quant_err bound (the worst-case sum
+//      of per-element errors across 14 skeleton coordinates).
+//
+// Three deterministic skeleton patterns:
+//   - "uniform"  : all skeleton coordinates set to 0.1
+//   - "alternate": sin-like wave -1..+1 across the 14 coords
+//   - "spike"    : single non-zero at index 7
+// ============================================================================
+
+#include "../../sp_hex_w_matrix_hd154.h"   // same rodata the DSP sees
+#include "../../sp_hex_hier_predict.h"    // host-side ref impls
+
+#define SP_HEX_HIER_HD154_SKEL  14
+#define SP_HEX_HIER_HD154_PRED  140
+#define SP_HEX_HIER_HD154_PAD   160
+
+static void hier_fill_skeleton(float *skel, int n, int pattern) {
+    switch (pattern) {
+        case 0: /* uniform */
+            for (int i = 0; i < n; ++i) skel[i] = 0.1f;
+            break;
+        case 1: /* alternating wave */
+            for (int i = 0; i < n; ++i) {
+                float t = (float)i / (float)(n - 1);   /* 0..1 */
+                skel[i] = (i & 1) ? -t : t;
+            }
+            break;
+        case 2: /* spike */
+            for (int i = 0; i < n; ++i) skel[i] = 0.0f;
+            skel[n / 2] = 0.75f;
+            break;
+        default:
+            for (int i = 0; i < n; ++i) skel[i] = 0.0f;
+            break;
+    }
+}
+
+/* Derive the i16 (unpadded, predicted_size-wide) W matrix from the int32
+ * padded rodata.  Caller frees with free(). */
+static int16_t *hier_unpack_w_i16(void) {
+    int16_t *w = (int16_t *)malloc(
+        (size_t)SP_HEX_HIER_HD154_SKEL * SP_HEX_HIER_HD154_PRED * sizeof(int16_t));
+    if (!w) return NULL;
+    for (int j = 0; j < SP_HEX_HIER_HD154_SKEL; ++j) {
+        for (int i = 0; i < SP_HEX_HIER_HD154_PRED; ++i) {
+            int32_t v32 = sp_hex_w_matrix_hd154[
+                (size_t)j * SP_HEX_HIER_HD154_PAD + (size_t)i];
+            w[(size_t)j * SP_HEX_HIER_HD154_PRED + (size_t)i] =
+                (int16_t)(v32 & 0xFFFF);
+        }
+    }
+    return w;
+}
+
+int sp_hex_hier_predict_parity(void) {
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[hier] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[hier] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    float   *skel       = (float *)rpcmem_alloc(
+        RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS,
+        (int)(SP_HEX_HIER_HD154_SKEL * sizeof(float)));
+    float   *dsp_pred   = (float *)rpcmem_alloc(
+        RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS,
+        (int)(SP_HEX_HIER_HD154_PRED * sizeof(float)));
+    float   *host_q15   = (float *)malloc(
+        SP_HEX_HIER_HD154_PRED * sizeof(float));
+    float   *host_f32   = (float *)malloc(
+        SP_HEX_HIER_HD154_PRED * sizeof(float));
+    int16_t *w_i16      = hier_unpack_w_i16();
+
+    if (!skel || !dsp_pred || !host_q15 || !host_f32 || !w_i16) {
+        printf("[hier] alloc failed\n");
+        if (skel)     rpcmem_free(skel);
+        if (dsp_pred) rpcmem_free(dsp_pred);
+        if (host_q15) free(host_q15);
+        if (host_f32) free(host_f32);
+        if (w_i16)    free(w_i16);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    int total_fail = 0;
+    const char *names[3] = {"uniform", "alternate", "spike"};
+    for (int pat = 0; pat < 3; ++pat) {
+        hier_fill_skeleton(skel, SP_HEX_HIER_HD154_SKEL, pat);
+
+        /* Host references. */
+        sp_hex_hier_predict_ref_q15(skel, SP_HEX_HIER_HD154_SKEL,
+                                    sp_hex_w_matrix_hd154,
+                                    SP_HEX_HIER_HD154_PRED,
+                                    SP_HEX_HIER_HD154_PAD,
+                                    host_q15);
+        sp_hex_hier_predict_ref_f32(skel, SP_HEX_HIER_HD154_SKEL,
+                                    w_i16,
+                                    SP_HEX_HIER_HD154_PRED,
+                                    host_f32);
+
+        /* DSP dispatch. */
+        memset(dsp_pred, 0, SP_HEX_HIER_HD154_PRED * sizeof(float));
+        int dsp_rc = sp_hex_hier_predict_f32(h,
+                                              skel, SP_HEX_HIER_HD154_SKEL,
+                                              dsp_pred, SP_HEX_HIER_HD154_PRED);
+        if (dsp_rc != 0) {
+            printf("[hier][%s] DSP rc=%d\n", names[pat], dsp_rc);
+            total_fail = 1;
+            continue;
+        }
+
+        /* Check 1: bit-equal vs Q15 reference. */
+        int kernel_diffs = 0;
+        int kernel_first = -1;
+        for (int i = 0; i < SP_HEX_HIER_HD154_PRED; ++i) {
+            uint32_t a, b;
+            memcpy(&a, &dsp_pred[i], 4);
+            memcpy(&b, &host_q15[i], 4);
+            if (a != b) {
+                if (kernel_diffs == 0) kernel_first = i;
+                ++kernel_diffs;
+            }
+        }
+
+        /* Check 2: tolerance vs fp32 reference (Q15 budget). */
+        /* W max-abs in fp32 is bounded by ~3*sigma=0.15 (sigma=0.05 calib).
+         * Q15 step is 1/32767 ~ 3.05e-5 → per-element quant error ~1.5e-5.
+         * Sum of 14 terms: 14 * |s_j_max| * |W_j_quant_err| ≤
+         *   14 * 1.0 * 1.5e-5 ≈ 2.1e-4.  Use 5e-4 as the tolerance to
+         * absorb compounding fp rounding in the dequant step. */
+        const float TOL_FP32 = 5.0e-4f;
+        float max_abs_err_fp32 = 0.0f;
+        int   fp32_first = -1;
+        for (int i = 0; i < SP_HEX_HIER_HD154_PRED; ++i) {
+            float e = fabsf(dsp_pred[i] - host_f32[i]);
+            if (e > max_abs_err_fp32) {
+                max_abs_err_fp32 = e;
+                fp32_first = i;
+            }
+        }
+
+        if (kernel_diffs > 0) {
+            printf("[hier][%s] KERNEL FAIL: %d/%d lanes differ from Q15 ref; "
+                   "first @ %d DSP=%.6e ref=%.6e\n",
+                   names[pat], kernel_diffs, SP_HEX_HIER_HD154_PRED,
+                   kernel_first, dsp_pred[kernel_first], host_q15[kernel_first]);
+            total_fail = 1;
+        } else if (max_abs_err_fp32 > TOL_FP32) {
+            printf("[hier][%s] BUDGET FAIL: max_abs vs fp32 = %.3e > tol %.3e "
+                   "@ idx %d (DSP=%.6e fp32_ref=%.6e)\n",
+                   names[pat], max_abs_err_fp32, TOL_FP32,
+                   fp32_first, dsp_pred[fp32_first], host_f32[fp32_first]);
+            total_fail = 1;
+        } else {
+            printf("[hier][%-9s] kernel bit-equal (140 lanes) | "
+                   "fp32 max_abs_err = %.3e (tol %.3e) ✓\n",
+                   names[pat], max_abs_err_fp32, TOL_FP32);
+        }
+    }
+
+    rpcmem_free(skel);
+    rpcmem_free(dsp_pred);
+    free(host_q15);
+    free(host_f32);
+    free(w_i16);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return total_fail;
+}
+
+// ============================================================================
 // Strike 8a: FastRPC parity test for sp_hex_logit_argmax_u16.
 // ============================================================================
 

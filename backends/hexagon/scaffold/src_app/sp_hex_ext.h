@@ -151,6 +151,18 @@ int sp_hex_compress_f32_full_parity(int head_dim);
 // n_vectors in [1, 256] (allocation budget; production chunks are typically 32).
 int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors);
 
+// Strike 11b: FastRPC parity test for sp_hex_hier_predict_f32 (the W-matrix
+// predictor — Hierarchical Spinor entry point). Two checks per skeleton input:
+//   1. KERNEL CORRECTNESS — DSP fp32 output must be bit-equal to the host
+//      Q15 scalar reference (which runs the IDENTICAL Q15 math).
+//   2. QUANT BUDGET — DSP output must be within ~5e-4 of the host pure-fp32
+//      reference (sum-of-14-Q15-quant-errors bound).
+//
+// Sweeps three deterministic skeleton patterns: uniform / alternating / spike.
+// Currently tests head_dim=154 (skeleton=14, predicted=140) — the only config
+// in the W rodata bank. Returns 0 if all three pass both checks.
+int sp_hex_hier_predict_parity(void);
+
 #ifdef __cplusplus
 }
 #endif

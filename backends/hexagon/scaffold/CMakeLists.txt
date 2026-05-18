@@ -51,6 +51,7 @@ if(${OS_TYPE} MATCHES "HLOS")
         ${CMAKE_CURRENT_SOURCE_DIR}/src_app/sp_hex_main
         ${CMAKE_CURRENT_SOURCE_DIR}/src_app/sp_hex_ext
         ${CMAKE_CURRENT_SOURCE_DIR}/../shannon_prime_hexagon
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_hier_predict
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree
@@ -106,6 +107,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_matmul_block_q8
         ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_mobius_scatter
         ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_mobius_tables
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_hier_predict
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree
@@ -149,6 +151,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_matmul_block_q8
         ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_mobius_scatter
         ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_mobius_tables
+        ${CMAKE_CURRENT_SOURCE_DIR}/../sp_hex_hier_predict
         ${SP_CORE}/shannon_prime
         ${SP_CORE}/shannon_prime_pe
         ${SP_CORE}/shannon_prime_sqfree

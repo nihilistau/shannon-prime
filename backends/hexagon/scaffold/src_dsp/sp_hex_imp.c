@@ -1160,16 +1160,8 @@ int sp_hex_compress_f32_full_batch(remote_handle64 h,
 // interface. Quant error budget reported by gen_w_matrix.py at bake time.
 // ============================================================================
 
-#include "../../sp_hex_w_matrix_hd154.h"  // baked Q15 W matrix, column-major
-
-// Forward declaration — HVX kernel lives in a separate TU so the IDL stub
-// can compile cleanly even before the kernel ships (parity test stays red
-// in that interim window, which is the right diagnostic signal).
-extern int sp_hex_hier_predict_hvx_q15(const float *skeleton,
-                                        int skeleton_size,
-                                        const int16_t *w_matrix_q15_colmajor,
-                                        int predicted_size,
-                                        float *predicted);
+#include "../../sp_hex_w_matrix_hd154.h"  // baked Q15 W matrix (int32 padded)
+#include "../../sp_hex_hier_predict.h"   // HVX kernel declarations
 
 int sp_hex_hier_predict_f32(remote_handle64 h,
                              const float *skeleton, int skeleton_len,
