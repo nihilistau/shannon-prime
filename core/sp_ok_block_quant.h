@@ -152,6 +152,12 @@ typedef struct {
     uint8_t  qs[SP_OK_BLOCK_SIZE / 2];           /* 16 bytes, unsigned 4-bit nybbles */
 } sp_gguf_block_q4_1;  /* 20 bytes per block */
 
+typedef struct {
+    uint16_t d;                                  /* fp16 block scale */
+    uint8_t  qh[4];                              /* 32 high bits (one per element) */
+    uint8_t  qs[SP_OK_BLOCK_SIZE / 2];           /* 16 bytes, low-4-bits */
+} sp_gguf_block_q5_0;  /* 22 bytes per block */
+
 /* Q4_K super-block: 256 elements = 8 sub-blocks of 32 elements each.
  * Each sub-block carries a 6-bit scale and 6-bit min, encoded in the
  * 12-byte `scales` field via the get_scale_min_k4 helper layout. The
@@ -176,6 +182,19 @@ typedef struct {
 int sp_ok_block_q8_from_gguf_q8_0(
     sp_ok_block_q8_tensor* dst,
     const sp_gguf_block_q8_0* src,
+    size_t n_blocks,
+    int64_t scale_recip,
+    int64_t p,
+    int64_t k);
+
+/* Phase 15e: Q5_0 -> block_q8 native ingest. Decodes Q5_0's 5-bit
+ * signed codepoints (range [-16, 15]) to int8 at load time and reuses
+ * the existing sp_ok_q8_block_t storage. The block_scale × π^k fusion
+ * is identical to Q8_0. No new kernel needed — block_q8 matmul handles
+ * the int8 codepoints transparently. */
+int sp_ok_block_q5_0_to_block_q8(
+    sp_ok_block_q8_tensor* dst,
+    const sp_gguf_block_q5_0* src,
     size_t n_blocks,
     int64_t scale_recip,
     int64_t p,

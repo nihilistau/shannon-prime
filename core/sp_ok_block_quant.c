@@ -132,6 +132,77 @@ int sp_ok_block_q8_from_gguf_q8_0(
  * Q4_0 importer
  * ============================================================================ */
 
+/* ============================================================================
+ * Q5_0 -> block_q8 importer (Phase 15e)
+ * ============================================================================
+ *
+ * GGUF Q5_0 stores 32 signed-5-bit codepoints per block as:
+ *   - 16 bytes qs: low 4 bits of each (qs[j] low nyb = elem j, high nyb = elem j+16)
+ *   - 4 bytes qh: high bit of each (32 bits = 32 elements)
+ *   - 2 bytes d:  fp16 block scale
+ *
+ * Decode formula (mirrors ggml's dequantize_row_q5_0):
+ *   xh_lo = ((qh >> j) << 4) & 0x10
+ *   xh_hi = ((qh >> (j+12))) & 0x10
+ *   x_lo  = ((qs[j] & 0xF) | xh_lo) - 16     // signed int5 in [-16, 15]
+ *   x_hi  = ((qs[j] >> 4)  | xh_hi) - 16
+ *
+ * We pre-decode at load time, write the int5 values as int8 codepoints
+ * into sp_ok_q8_block_t.packed, and fuse the per-block scale with π^k
+ * exactly the same way as Q8_0. The block_q8 matmul kernel then runs
+ * unchanged. Lose some compression vs native-Q5 (2 B/elem instead of
+ * 0.69 B/elem) but gain per-block precision over the fp16-dequant
+ * fallback. */
+
+int sp_ok_block_q5_0_to_block_q8(
+    sp_ok_block_q8_tensor* dst,
+    const sp_gguf_block_q5_0* src,
+    size_t n_blocks,
+    int64_t scale_recip,
+    int64_t p,
+    int64_t k)
+{
+    if (!dst || !src || !dst->blocks) return 0;
+    if (dst->n_blocks != n_blocks) return 0;
+    if (dst->numel != n_blocks * SP_OK_BLOCK_SIZE) return 0;
+
+    sp_ok_t pi_pow;
+    if (!sp_blkq_compute_pi_pow_k(p, k, &pi_pow)) return 0;
+
+    const double pi_a_d = (double)pi_pow.a;
+    const double pi_b_d = (double)pi_pow.b;
+    const double S      = (double)scale_recip;
+
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const sp_gguf_block_q5_0* gsrc = src + b;
+        sp_ok_q8_block_t*         gdst = dst->blocks + b;
+
+        const float bs_f = sp_blkq_fp16_to_fp32(gsrc->d);
+        const double bs  = (double)bs_f;
+        gdst->B_a = sp_blkq_rint_i64(S * bs * pi_a_d);
+        gdst->B_b = sp_blkq_rint_i64(S * bs * pi_b_d);
+        gdst->reserved_block_min_a = 0;
+        gdst->reserved_block_min_b = 0;
+
+        /* Decode 32 int5 signed codepoints to int8. */
+        uint32_t qh;
+        memcpy(&qh, gsrc->qh, sizeof(qh));
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t xh_lo = (uint8_t)(((qh >> (j +  0)) << 4) & 0x10);
+            const uint8_t xh_hi = (uint8_t)(((qh >> (j + 12))     ) & 0x10);
+            const int32_t x_lo  = ((gsrc->qs[j] & 0x0F) | xh_lo) - 16;
+            const int32_t x_hi  = ((gsrc->qs[j] >>   4) | xh_hi) - 16;
+            gdst->packed[j     ] = (int8_t)x_lo;
+            gdst->packed[j + 16] = (int8_t)x_hi;
+        }
+    }
+
+    dst->frobenius_p = (int16_t)p;
+    dst->frobenius_k = (int16_t)k;
+    dst->reserved    = 0;
+    return 1;
+}
+
 int sp_ok_block_q4_from_gguf_q4_0(
     sp_ok_block_q4_tensor* dst,
     const sp_gguf_block_q4_0* src,
