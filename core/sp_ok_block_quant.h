@@ -75,6 +75,32 @@ typedef struct SP_OK_BLK_Q4_ALIGN sp_ok_q4_block_s {
     uint8_t packed[SP_OK_BLOCK_SIZE / 2];   /* 16 B: two int4 nybbles per byte */
 } sp_ok_q4_block_t;
 
+/* Phase 15b: Q4_1 block. GGUF Q4_1 stores per-block (d, m) where
+ *   W[k] = d * x_int_unbiased[k] + m
+ * After Frobenius lift:
+ *   W_ring[k] = x_int_unbiased[k] * (d·π^k) + (m·π^k)
+ *             = x_int_unbiased[k] * (B_a, B_b) + (M_a, M_b)
+ *
+ * 48 bytes total per 32 elements = 1.5 B/elem. Half-cache-line on
+ * 64-B-line systems, fits perfectly. Q4_1 nybbles are UNSIGNED [0, 15]
+ * — the +8 bias is absorbed in m, no decode-side subtraction needed. */
+
+#if defined(__GNUC__) || defined(__clang__)
+#  define SP_OK_BLK_Q4_1_ALIGN __attribute__((aligned(64)))
+#elif defined(_MSC_VER)
+#  define SP_OK_BLK_Q4_1_ALIGN __declspec(align(64))
+#else
+#  define SP_OK_BLK_Q4_1_ALIGN
+#endif
+
+typedef struct SP_OK_BLK_Q4_1_ALIGN sp_ok_q4_1_block_s {
+    int64_t B_a;                            /* 8 B: d·π_a · scale_recip */
+    int64_t B_b;                            /* 8 B */
+    int64_t M_a;                            /* 8 B: m·π_a · scale_recip */
+    int64_t M_b;                            /* 8 B */
+    uint8_t packed[SP_OK_BLOCK_SIZE / 2];   /* 16 B: unsigned 4-bit nybbles */
+} sp_ok_q4_1_block_t;
+
 /* ---------- Tensor descriptors ----------------------------------------- */
 
 typedef struct {
@@ -95,6 +121,15 @@ typedef struct {
     int32_t           reserved;
 } sp_ok_block_q4_tensor;
 
+typedef struct {
+    sp_ok_q4_1_block_t* blocks;
+    size_t              numel;
+    size_t              n_blocks;
+    int16_t             frobenius_p;
+    int16_t             frobenius_k;
+    int32_t             reserved;
+} sp_ok_block_q4_1_tensor;
+
 /* ---------- GGUF block layouts (mirror of ggml-common.h) --------------- */
 /* Note: we don't include ggml-common.h here to keep the math submodule
  * standalone. The caller passes pointers to these structs; we redeclare
@@ -110,6 +145,12 @@ typedef struct {
     uint16_t d;                                  /* fp16 block scale */
     uint8_t  qs[SP_OK_BLOCK_SIZE / 2];           /* 16 bytes, two int4 nybbles per byte */
 } sp_gguf_block_q4_0;  /* 18 bytes per block */
+
+typedef struct {
+    uint16_t d;                                  /* fp16 block scale */
+    uint16_t m;                                  /* fp16 block min */
+    uint8_t  qs[SP_OK_BLOCK_SIZE / 2];           /* 16 bytes, unsigned 4-bit nybbles */
+} sp_gguf_block_q4_1;  /* 20 bytes per block */
 
 /* ---------- Importers --------------------------------------------------- */
 
@@ -136,6 +177,17 @@ int sp_ok_block_q4_from_gguf_q4_0(
     int64_t p,
     int64_t k);
 
+/* Phase 15b: GGUF Q4_1 importer. Q4_1 nybbles are UNSIGNED (no -8 bias
+ * subtraction at decode); the asymmetric offset lives in the per-block
+ * `m` term which gets fused into M_a / M_b at load time. */
+int sp_ok_block_q4_1_from_gguf_q4_1(
+    sp_ok_block_q4_1_tensor* dst,
+    const sp_gguf_block_q4_1* src,
+    size_t n_blocks,
+    int64_t scale_recip,
+    int64_t p,
+    int64_t k);
+
 /* ---------- Inline decoders for kernels -------------------------------- */
 
 /* GGUF Q4_0 stores 32 int4 codepoints as 16 bytes:
@@ -155,8 +207,17 @@ static inline int8_t sp_ok_block_q4_decode_codepoint(const uint8_t* packed,
     } else {
         byte = (packed[idx - 16] >> 4) & 0x0F;
     }
-    /* GGUF stores int4 with +8 bias; subtract to recover [-8, 7]. */
+    /* Q4_0: GGUF stores int4 with +8 bias; subtract to recover [-8, 7]. */
     return (int8_t)((int)byte - 8);
+}
+
+/* Q4_1 decoder: same interleaved layout as Q4_0 but the bias is absorbed
+ * in the per-block `m` term, not in the codepoint. Returns the UNSIGNED
+ * nybble in [0, 15]. */
+static inline uint8_t sp_ok_block_q4_1_decode_codepoint(const uint8_t* packed,
+                                                         int idx) {
+    if (idx < 16) return (uint8_t)(packed[idx] & 0x0F);
+    return (uint8_t)((packed[idx - 16] >> 4) & 0x0F);
 }
 
 #ifdef __cplusplus

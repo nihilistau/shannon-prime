@@ -172,3 +172,54 @@ int sp_ok_block_q4_from_gguf_q4_0(
     dst->reserved    = 0;
     return 1;
 }
+
+/* ============================================================================
+ * Q4_1 importer
+ * ============================================================================
+ *
+ * GGUF Q4_1: W[k] = d * x_int[k] + m, where x_int[k] is UNSIGNED in
+ * [0, 15] (no +8 bias). Fuses (d, m) with Frobenius π^k:
+ *   B_a = round(S · d · π_a),  B_b = round(S · d · π_b)
+ *   M_a = round(S · m · π_a),  M_b = round(S · m · π_b) */
+
+int sp_ok_block_q4_1_from_gguf_q4_1(
+    sp_ok_block_q4_1_tensor* dst,
+    const sp_gguf_block_q4_1* src,
+    size_t n_blocks,
+    int64_t scale_recip,
+    int64_t p,
+    int64_t k)
+{
+    if (!dst || !src || !dst->blocks) return 0;
+    if (dst->n_blocks != n_blocks) return 0;
+    if (dst->numel != n_blocks * SP_OK_BLOCK_SIZE) return 0;
+
+    sp_ok_t pi_pow;
+    if (!sp_blkq_compute_pi_pow_k(p, k, &pi_pow)) return 0;
+
+    const double pi_a_d = (double)pi_pow.a;
+    const double pi_b_d = (double)pi_pow.b;
+    const double S      = (double)scale_recip;
+
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const sp_gguf_block_q4_1* gsrc = src + b;
+        sp_ok_q4_1_block_t*       gdst = dst->blocks + b;
+
+        const float bd_f = sp_blkq_fp16_to_fp32(gsrc->d);
+        const float bm_f = sp_blkq_fp16_to_fp32(gsrc->m);
+        const double bd  = (double)bd_f;
+        const double bm  = (double)bm_f;
+
+        gdst->B_a = sp_blkq_rint_i64(S * bd * pi_a_d);
+        gdst->B_b = sp_blkq_rint_i64(S * bd * pi_b_d);
+        gdst->M_a = sp_blkq_rint_i64(S * bm * pi_a_d);
+        gdst->M_b = sp_blkq_rint_i64(S * bm * pi_b_d);
+
+        memcpy(gdst->packed, gsrc->qs, SP_OK_BLOCK_SIZE / 2);
+    }
+
+    dst->frobenius_p = (int16_t)p;
+    dst->frobenius_k = (int16_t)k;
+    dst->reserved    = 0;
+    return 1;
+}
