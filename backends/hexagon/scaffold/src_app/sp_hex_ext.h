@@ -178,6 +178,16 @@ int sp_hex_residual_spinor_parity(void);
 // Returns 0 if all 3 patterns pass both checks.
 int sp_hex_hier_decode_parity(void);
 
+// Strike 16: FastRPC parity test for sp_hex_hier_decode_batch_f32.
+// Drives n single-vec decode dispatches and one batched dispatch, asserts
+// byte-equal output across the full n*60 fp32 lane budget.  This catches
+// cross-iteration aliasing / pointer-arithmetic bugs (cf. Strike 10b
+// regression at n=32) before the batch path enters production.
+//
+// n_vectors in [1, 256]; production-typical chunk sizes are {8, 32, 64}.
+// Returns 0 if all lanes match.
+int sp_hex_hier_decode_batch_parity(int n_vectors);
+
 #ifdef __cplusplus
 }
 #endif

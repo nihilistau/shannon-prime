@@ -475,4 +475,33 @@ interface sp_hex : remote_handle64 {
                         in sequence<octet> packed,
                         in float amax,
                         rout sequence<float> reconstructed);
+
+   // -------------------------------------------------------------------
+   // hier_decode_batch_f32 — Strike 16: batched Hierarchical Spinor decode.
+   //
+   // Loops the Strike-14 decode chain (predict + unpack + vadd) inside the
+   // DSP over `n_vectors` per dispatch.  Collapses the autoregressive read
+   // scan from O(N_ctx * N_layers * N_heads) FastRPC dispatches down to
+   // ceil(N_ctx / chunk) — the IPC amortization that makes V69 HVX viable
+   // in the attention hot path.
+   //
+   // Contiguous batch buffers:
+   //   skel_batch[n*14]    : fp32, n skeletons packed end-to-end
+   //   packed_batch[n*31]  : 31-byte packed residual blocks (Strike 12 fmt)
+   //   amax_batch[n]       : fp32 per-block amax
+   //   reconstructed[n*60] : fp32 60-lane decoded residuals (Strike 11c shape)
+   //
+   // No padding between blocks in the input streams — the DSP loop indexes
+   // by element count, not byte stride.  Output is the live 60 lanes per
+   // vector (no 64-lane HVX padding bleeds into the output stream).
+   //
+   // n_vectors in [1, 256] — bound by FastRPC payload budget at the upper
+   // end (n=256 * (14+31+1)*4 ~ 47 KB in + 256*60*4 ~ 60 KB out, fits
+   // comfortably inside the ~1 MB per-call FastRPC limit).
+   // -------------------------------------------------------------------
+   long hier_decode_batch_f32(in sequence<float> skel_batch,
+                               in sequence<octet> packed_batch,
+                               in sequence<float> amax_batch,
+                               in long n_vectors,
+                               rout sequence<float> reconstructed_batch);
 };

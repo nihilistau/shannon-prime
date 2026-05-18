@@ -2096,6 +2096,209 @@ int sp_hex_hier_decode_parity(void) {
 }
 
 // ============================================================================
+// Strike 16: FastRPC parity test for sp_hex_hier_decode_batch_f32.
+// ============================================================================
+//
+// Validates that the batched decode dispatches produce output bit-equal to
+// N single-vector hier_decode_f32 dispatches.  This is the test that catches
+// cross-iteration aliasing / pointer-arithmetic bugs BEFORE we trust the
+// batch path in production (cf. Strike 10b regression at n=32).
+//
+// For each n ∈ {1, 8, 32, 64}:
+//   1. Generate n deterministic (skeleton, packed, amax) triples by encoding
+//      synthetic actual = predicted + perturbation through the host scalar
+//      reference encoder (Strike 12 ref).
+//   2. Drive n single-vec hier_decode_f32 dispatches → ref_recon[n*60].
+//   3. Drive ONE hier_decode_batch_f32 dispatch → batch_recon[n*60].
+//   4. Assert byte-equal between ref_recon and batch_recon.
+//
+// Bit-equal is the right contract here — both paths invoke the IDENTICAL
+// DSP kernels (predict + unpack + combine).  Any divergence is a pointer
+// arithmetic bug or a cross-iteration scratch corruption.
+// ============================================================================
+
+int sp_hex_hier_decode_batch_parity(int n_vectors) {
+    if (n_vectors <= 0 || n_vectors > 256) {
+        printf("[decode_batch] invalid n_vectors=%d\n", n_vectors);
+        return 1;
+    }
+
+    rpcmem_init();
+    remote_handle64 h = -1;
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[decode_batch] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[decode_batch] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    const int SKEL_LEN  = SP_HEX_W_MATRIX_HD154_SKELETON;        /* 14 */
+    const int PRED_LEN  = SP_HEX_W_MATRIX_HD154_PREDICTED;       /* 60 */
+    const int PRED_PAD  = SP_HEX_W_MATRIX_HD154_PREDICTED_PAD;   /* 64 */
+    const int PACK_LEN  = SP_HEX_RESIDUAL_TOTAL_BYTES;           /* 31 */
+
+    /* rpcmem-backed batch buffers. */
+    float   *skel_batch       = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         RPCMEM_DEFAULT_FLAGS,
+                                                         (int)(n_vectors * SKEL_LEN * sizeof(float)));
+    uint8_t *packed_batch     = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         RPCMEM_DEFAULT_FLAGS,
+                                                         (int)(n_vectors * PACK_LEN));
+    float   *amax_batch       = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         RPCMEM_DEFAULT_FLAGS,
+                                                         (int)(n_vectors * sizeof(float)));
+    float   *batch_recon      = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         RPCMEM_DEFAULT_FLAGS,
+                                                         (int)(n_vectors * PRED_LEN * sizeof(float)));
+
+    /* Host scratch for synthesizing one packed block at a time + single-vec
+     * reference dispatch buffers. */
+    float   *actual_pad       = (float   *)malloc((size_t)PRED_PAD * sizeof(float));
+    float   *predicted_pad    = (float   *)malloc((size_t)PRED_PAD * sizeof(float));
+    float   *ref_recon        = (float   *)malloc((size_t)n_vectors * PRED_LEN * sizeof(float));
+    float   *single_recon     = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                         RPCMEM_DEFAULT_FLAGS,
+                                                         (int)(PRED_LEN * sizeof(float)));
+
+    if (!skel_batch || !packed_batch || !amax_batch || !batch_recon ||
+        !actual_pad || !predicted_pad || !ref_recon || !single_recon) {
+        printf("[decode_batch] alloc failed (n=%d)\n", n_vectors);
+        if (skel_batch)    rpcmem_free(skel_batch);
+        if (packed_batch)  rpcmem_free(packed_batch);
+        if (amax_batch)    rpcmem_free(amax_batch);
+        if (batch_recon)   rpcmem_free(batch_recon);
+        if (actual_pad)    free(actual_pad);
+        if (predicted_pad) free(predicted_pad);
+        if (ref_recon)     free(ref_recon);
+        if (single_recon)  rpcmem_free(single_recon);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    /* Build n deterministic encoded blocks via host ref encoder.  Each
+     * block uses a distinct skeleton + residual amplitude so identical
+     * outputs across the batch would be suspicious. */
+    for (int v = 0; v < n_vectors; ++v) {
+        float *skel_v = skel_batch + (size_t)v * SKEL_LEN;
+        for (int j = 0; j < SKEL_LEN; ++j) {
+            float t = (float)j / (float)(SKEL_LEN - 1);
+            /* Per-vector skeleton variation. */
+            skel_v[j] = 0.1f * sinf(6.2831853f * t * (1.0f + 0.05f * (float)v));
+        }
+
+        /* Synthesize predicted via host Q15 reference (matches DSP bit-exact). */
+        sp_hex_hier_predict_ref_q15(skel_v, SKEL_LEN,
+                                    sp_hex_w_matrix_hd154,
+                                    PRED_LEN, PRED_PAD,
+                                    predicted_pad);
+
+        /* Synthesize actual = predicted + perturbation that scales with v. */
+        for (int i = 0; i < PRED_PAD; ++i) actual_pad[i] = 0.0f;
+        for (int i = 0; i < PRED_LEN; ++i) {
+            float t = (float)i / (float)(PRED_LEN - 1);
+            float perturbation = 0.01f * sinf(6.2831853f * t * 3.0f);
+            /* Scale perturbation by v so amax distribution is non-trivial. */
+            float scale = 1.0f + 0.02f * (float)v;
+            actual_pad[i] = predicted_pad[i] + scale * perturbation;
+        }
+
+        /* Encode via host ref → packed[v] + amax[v]. */
+        uint8_t *pkt_v = packed_batch + (size_t)v * PACK_LEN;
+        sp_hex_residual_spinor_ref(actual_pad, predicted_pad,
+                                    PRED_LEN, PRED_PAD,
+                                    pkt_v, PACK_LEN,
+                                    &amax_batch[v]);
+    }
+
+    /* Reference: n single-vec hier_decode_f32 dispatches. */
+    for (int v = 0; v < n_vectors; ++v) {
+        const float *skel_v = skel_batch + (size_t)v * SKEL_LEN;
+        const uint8_t *pkt_v = packed_batch + (size_t)v * PACK_LEN;
+        memset(single_recon, 0, PRED_LEN * sizeof(float));
+        int rc_v = sp_hex_hier_decode_f32(h,
+                                            skel_v, SKEL_LEN,
+                                            pkt_v, PACK_LEN,
+                                            amax_batch[v],
+                                            single_recon, PRED_LEN);
+        if (rc_v != 0) {
+            printf("[decode_batch] single-vec rc=%d at v=%d\n", rc_v, v);
+            rpcmem_free(skel_batch); rpcmem_free(packed_batch);
+            rpcmem_free(amax_batch); rpcmem_free(batch_recon);
+            free(actual_pad); free(predicted_pad); free(ref_recon);
+            rpcmem_free(single_recon);
+            sp_hex_close(h); rpcmem_deinit();
+            return 1;
+        }
+        memcpy(ref_recon + (size_t)v * PRED_LEN, single_recon,
+               PRED_LEN * sizeof(float));
+    }
+
+    /* Batched: one hier_decode_batch_f32 dispatch over n vectors. */
+    memset(batch_recon, 0, n_vectors * PRED_LEN * sizeof(float));
+    int dsp_rc = sp_hex_hier_decode_batch_f32(h,
+                                                skel_batch, n_vectors * SKEL_LEN,
+                                                packed_batch, n_vectors * PACK_LEN,
+                                                amax_batch, n_vectors,
+                                                n_vectors,
+                                                batch_recon, n_vectors * PRED_LEN);
+    int total_fail = 0;
+    if (dsp_rc != 0) {
+        printf("[decode_batch] BATCH DSP rc=%d at n=%d\n", dsp_rc, n_vectors);
+        total_fail = 1;
+    } else {
+        /* Byte-equal compare across the full n*60 fp32 lane budget. */
+        int diffs = 0, first_v = -1, first_i = -1;
+        for (int v = 0; v < n_vectors && diffs < 8; ++v) {
+            for (int i = 0; i < PRED_LEN; ++i) {
+                uint32_t a, b;
+                memcpy(&a, &ref_recon  [v * PRED_LEN + i], 4);
+                memcpy(&b, &batch_recon[v * PRED_LEN + i], 4);
+                if (a != b) {
+                    if (diffs == 0) { first_v = v; first_i = i; }
+                    ++diffs;
+                }
+            }
+        }
+        if (diffs > 0) {
+            printf("[decode_batch][n=%-3d] DIVERGENCE: %d+ lanes differ; "
+                   "first @ v=%d lane=%d ref=%.6e batch=%.6e\n",
+                   n_vectors, diffs, first_v, first_i,
+                   ref_recon  [first_v * PRED_LEN + first_i],
+                   batch_recon[first_v * PRED_LEN + first_i]);
+            total_fail = 1;
+        } else {
+            printf("[decode_batch][n=%-3d] %d lanes byte-equal — "
+                   "1 dispatch vs %d ✓\n",
+                   n_vectors, n_vectors * PRED_LEN, n_vectors);
+        }
+    }
+
+    rpcmem_free(skel_batch);
+    rpcmem_free(packed_batch);
+    rpcmem_free(amax_batch);
+    rpcmem_free(batch_recon);
+    free(actual_pad);
+    free(predicted_pad);
+    free(ref_recon);
+    rpcmem_free(single_recon);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return total_fail;
+}
+
+// ============================================================================
 // Strike 8a: FastRPC parity test for sp_hex_logit_argmax_u16.
 // ============================================================================
 

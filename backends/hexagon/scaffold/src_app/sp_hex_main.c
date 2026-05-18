@@ -233,6 +233,24 @@ int main(int argc, char *argv[]) {
                "budget — Hierarchical Spinor decode closed\n");
     }
 
+    // Strike 16: batched Hierarchical Spinor decode (single FastRPC per chunk).
+    // Sweep production-typical chunk sizes: 1 (degenerate, matches single-vec),
+    // 8 (small chunk), 32 (caught the Strike 10b regression at this n),
+    // 64 (max chunk on long contexts).  Byte-equal vs n single-vec dispatches.
+    printf("\n[decode_batch] === Strike 16: hier_decode_batch_f32 FastRPC parity ===\n");
+    int decode_batch_fail = 0;
+    int decode_batch_ns[] = {1, 8, 32, 64};
+    for (int j = 0; j < 4 && !decode_batch_fail; ++j) {
+        int rc = sp_hex_hier_decode_batch_parity(decode_batch_ns[j]);
+        if (rc) decode_batch_fail = 1;
+    }
+    if (decode_batch_fail) {
+        printf("[decode_batch] FAIL — batched decode diverged from single-vec ref\n");
+    } else {
+        printf("[decode_batch] all 4 batch sizes byte-equal — read scan "
+               "amortization unlocked\n");
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

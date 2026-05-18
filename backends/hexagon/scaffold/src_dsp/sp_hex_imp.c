@@ -1321,3 +1321,104 @@ int sp_hex_hier_decode_f32(remote_handle64 h,
            sizeof(float) * (size_t)SP_HEX_W_MATRIX_HD154_PREDICTED);
     return 0;
 }
+
+// ============================================================================
+// Strike 16: batched Hierarchical Spinor decode (single FastRPC per chunk).
+// ============================================================================
+//
+// Loops the Strike-14 decode chain over n_vectors per dispatch.  The inner
+// kernels (sp_hex_hier_predict_hvx_q15, sp_hex_residual_spinor_unpack_hvx,
+// sp_hex_residual_combine_hvx) all write their full output buffers — there
+// is no cross-iteration aliasing risk (unlike Strike 10b's Möbius-scatter
+// path which had per-iteration VTCM staleness).
+//
+// Stack scratches reused across iterations: 3 x 64 fp32 = 768 B + 64 i32
+// from the predict accumulator.  Trivial vs the ~1 KB QuRT stack budget.
+// ============================================================================
+
+int sp_hex_hier_decode_batch_f32(remote_handle64 h,
+                                  const float *skel_batch, int skel_batch_len,
+                                  const unsigned char *packed_batch,
+                                  int packed_batch_len,
+                                  const float *amax_batch, int amax_batch_len,
+                                  int n_vectors,
+                                  float *reconstructed_batch,
+                                  int reconstructed_batch_len) {
+    (void)h;
+    if (!skel_batch || !packed_batch || !amax_batch || !reconstructed_batch) {
+        FARF(ERROR, "[sp_hex] hier_decode_batch: null pointer");
+        return -1;
+    }
+    if (n_vectors <= 0) {
+        FARF(ERROR, "[sp_hex] hier_decode_batch: n_vectors=%d <= 0", n_vectors);
+        return -1;
+    }
+
+    const int skel_per   = SP_HEX_W_MATRIX_HD154_SKELETON;        /* 14 */
+    const int pred_per   = SP_HEX_W_MATRIX_HD154_PREDICTED;       /* 60 */
+    const int packed_per = SP_HEX_RESIDUAL_TOTAL_BYTES;           /* 31 */
+
+    if (skel_batch_len != n_vectors * skel_per) {
+        FARF(ERROR, "[sp_hex] hier_decode_batch: skel_len=%d != %d*%d",
+             skel_batch_len, n_vectors, skel_per);
+        return -1;
+    }
+    if (packed_batch_len != n_vectors * packed_per) {
+        FARF(ERROR, "[sp_hex] hier_decode_batch: packed_len=%d != %d*%d",
+             packed_batch_len, n_vectors, packed_per);
+        return -1;
+    }
+    if (amax_batch_len != n_vectors) {
+        FARF(ERROR, "[sp_hex] hier_decode_batch: amax_len=%d != %d",
+             amax_batch_len, n_vectors);
+        return -1;
+    }
+    if (reconstructed_batch_len != n_vectors * pred_per) {
+        FARF(ERROR, "[sp_hex] hier_decode_batch: recon_len=%d != %d*%d",
+             reconstructed_batch_len, n_vectors, pred_per);
+        return -1;
+    }
+
+    /* Stack scratches reused across iterations. */
+    float predicted_pad[SP_HEX_RESIDUAL_PAD] __attribute__((aligned(128)));
+    float residual_pad [SP_HEX_RESIDUAL_PAD] __attribute__((aligned(128)));
+    float combined_pad [SP_HEX_RESIDUAL_PAD] __attribute__((aligned(128)));
+
+    for (int i = 0; i < n_vectors; ++i) {
+        const float *skel_i   = skel_batch   + (size_t)i * skel_per;
+        const uint8_t *pkt_i  = packed_batch + (size_t)i * packed_per;
+        const float amax_i    = amax_batch[i];
+        float *recon_i        = reconstructed_batch + (size_t)i * pred_per;
+
+        memset(predicted_pad, 0, sizeof(predicted_pad));
+        memset(residual_pad,  0, sizeof(residual_pad));
+
+        int rc = sp_hex_hier_predict_hvx_q15(skel_i, skel_per,
+                                              sp_hex_w_matrix_hd154,
+                                              pred_per, predicted_pad);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] hier_decode_batch: vec[%d] predict rc=%d",
+                 i, rc);
+            return rc;
+        }
+        rc = sp_hex_residual_spinor_unpack_hvx(pkt_i, packed_per,
+                                                pred_per, SP_HEX_RESIDUAL_PAD,
+                                                amax_i, residual_pad);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] hier_decode_batch: vec[%d] unpack rc=%d",
+                 i, rc);
+            return rc;
+        }
+        rc = sp_hex_residual_combine_hvx(predicted_pad, residual_pad,
+                                          SP_HEX_RESIDUAL_PAD, combined_pad);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] hier_decode_batch: vec[%d] combine rc=%d",
+                 i, rc);
+            return rc;
+        }
+        /* Write the live 60 lanes only — pad lanes [60..64) are dropped. */
+        memcpy(recon_i, combined_pad, sizeof(float) * (size_t)pred_per);
+    }
+
+    return 0;
+}
