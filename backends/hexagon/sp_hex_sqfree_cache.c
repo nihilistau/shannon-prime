@@ -25,10 +25,11 @@
 #  endif
 #endif
 
-// Predicted residual lane count (140) and padded lane count (160) used by
-// the FastRPC IDL.  Matches SP_HEX_W_MATRIX_HD154_PREDICTED / _PREDICTED_PAD.
-#define SP_HEX_HIER_LANES   140
-#define SP_HEX_HIER_PAD     160
+// Strike 11c: predicted residual lane count = 60 (non-squarefree indices the
+// engine's knight_mask classifies as residual), padded to 64 lanes for the
+// HVX MAC kernel.  Matches SP_HEX_W_MATRIX_HD154_PREDICTED / _PREDICTED_PAD.
+#define SP_HEX_HIER_LANES   60
+#define SP_HEX_HIER_PAD     64
 #define SP_HEX_HIER_SKEL    14
 
 // Stub-mode fallback when SP_HEXAGON_FASTRPC is not defined — every entry

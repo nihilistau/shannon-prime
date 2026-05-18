@@ -28,9 +28,12 @@
 // (skeleton=14, predicted=140, padded=160 = 5*32).  Other configs are guarded
 // by the dispatch stub in sp_hex_imp.c — the kernel asserts and returns -1.
 // ----------------------------------------------------------------------------
+// Strike 11c: aligned to the engine's knight_mask scheme — 14 skeleton +
+// 60 non-squarefree residual at pad_dim=154.  Pad to 64 lanes (2 HVX
+// vectors of 32 i32 each) for the MAC kernel.
 #define SP_HEX_HIER_SKELETON_MAX   14
-#define SP_HEX_HIER_PREDICTED_MAX  140
-#define SP_HEX_HIER_PREDICTED_PAD  160   // ceil(140 / 32) * 32
+#define SP_HEX_HIER_PREDICTED_MAX  60
+#define SP_HEX_HIER_PREDICTED_PAD  64    // ceil(60 / 32) * 32
 
 // ----------------------------------------------------------------------------
 // Q15 conversion helpers — fp32 -> int16, saturating round half-up.

@@ -1562,9 +1562,11 @@ int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors) {
 #include "../../sp_hex_hier_predict.h"    // host-side ref impls
 #include "../../sp_hex_residual_spinor.h" // Strike 12 host ref
 
+// Strike 11c: aligned to the engine's (14 skeleton, 60 non-squarefree residual)
+// knight_mask scheme.  Pad 60 -> 64 (2 HVX vectors).
 #define SP_HEX_HIER_HD154_SKEL  14
-#define SP_HEX_HIER_HD154_PRED  140
-#define SP_HEX_HIER_HD154_PAD   160
+#define SP_HEX_HIER_HD154_PRED  60
+#define SP_HEX_HIER_HD154_PAD   64
 
 static void hier_fill_skeleton(float *skel, int n, int pattern) {
     switch (pattern) {
@@ -1720,7 +1722,7 @@ int sp_hex_hier_predict_parity(void) {
                    fp32_first, dsp_pred[fp32_first], host_f32[fp32_first]);
             total_fail = 1;
         } else {
-            printf("[hier][%-9s] kernel bit-equal (140 lanes) | "
+            printf("[hier][%-9s] kernel bit-equal (60 lanes) | "
                    "fp32 max_abs_err = %.3e (tol %.3e) ✓\n",
                    names[pat], max_abs_err_fp32, TOL_FP32);
         }
@@ -1885,7 +1887,7 @@ int sp_hex_residual_spinor_parity(void) {
                    dsp_pkt[first], host_pkt[first], dsp_amax);
             total_fail = 1;
         } else {
-            printf("[spinor][%s] 71 bytes byte-equal | amax=%.6e ✓\n",
+            printf("[spinor][%s] 31 bytes byte-equal | amax=%.6e ✓\n",
                    names[pat], dsp_amax);
         }
     }

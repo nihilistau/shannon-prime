@@ -31,11 +31,23 @@
 extern "C" {
 #endif
 
-#define SP_HEX_RESIDUAL_LANES_MAX  140
-#define SP_HEX_RESIDUAL_PAD        160   // ceil(140/32)*32 for HVX
-#define SP_HEX_RESIDUAL_MAG_BYTES   53   // ceil(140*3/8)
-#define SP_HEX_RESIDUAL_PHASE_BYTES 18   // ceil(140/8)
-#define SP_HEX_RESIDUAL_TOTAL_BYTES 71   // mag + phase
+// Strike 11c: shape realignment to the engine's actual knight_mask geometry.
+// At pad_dim=154 (head_dim=128 sqfree-padded to 2*7*11), the engine's
+// sp_knight_mask produces sk_k=14 skeleton + n_res=60 non-squarefree residual.
+// The remaining ~80 squarefree-but-not-skeleton indices are dropped (assumed
+// zero / reconstructed implicitly by Kronecker structure) — that's the
+// VHT2 design that hits the validated PPL 7.32 @ 3.3x on Qwen3-8B Q8.
+//
+// Lane / padding / pack-byte counts redo:
+//   60 lanes -> pad 64 (2 HVX vectors of 32 i32) for the W-matrix MAC kernel
+//   60 * 3 bits packed magnitudes = 180 bits = 23 bytes (ceil)
+//   60 * 1 bit  packed phases     =  60 bits =  8 bytes (ceil)
+//   total packed residual block   = 31 bytes (was 71 at the 140-lane design)
+#define SP_HEX_RESIDUAL_LANES_MAX   60
+#define SP_HEX_RESIDUAL_PAD         64   // ceil(60/32)*32
+#define SP_HEX_RESIDUAL_MAG_BYTES   23   // ceil(60*3/8)
+#define SP_HEX_RESIDUAL_PHASE_BYTES  8   // ceil(60/8)
+#define SP_HEX_RESIDUAL_TOTAL_BYTES 31   // mag + phase
 
 // ----------------------------------------------------------------------------
 // HVX kernel (DSP side).  Inputs and `packed` must be 128-B aligned.

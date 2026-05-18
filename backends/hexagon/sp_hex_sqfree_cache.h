@@ -42,10 +42,18 @@ extern "C" {
 //   bytes [28..98]  — 71 packed residual (140 × 3-bit mag + 140 × 1-bit phase)
 //   bytes [99..102] — fp32 amax used by the decoder to recover magnitudes
 // ----------------------------------------------------------------------------
+// Strike 11c slot layout — aligned to the engine's (14 skeleton, 60 residual)
+// knight_mask geometry.  Total per (layer, head, pos) = 63 B (was 103 B at
+// the 140-residual design that didn't match the engine).
+//
+//   bytes [ 0..27] : 14 fp16 skeleton coefficients
+//   bytes [28..50] : 23 B packed magnitudes (60 * 3 bits)
+//   bytes [51..58] :  8 B packed phases     (60 * 1 bit)
+//   bytes [59..62] :  4 B fp32 amax
 #define SP_HEX_SQFREE_SKEL_BYTES   28   // 14 * sizeof(fp16)
-#define SP_HEX_SQFREE_PACK_BYTES   71   // matches SP_HEX_RESIDUAL_TOTAL_BYTES
+#define SP_HEX_SQFREE_PACK_BYTES   31   // matches SP_HEX_RESIDUAL_TOTAL_BYTES (23 + 8)
 #define SP_HEX_SQFREE_AMAX_BYTES    4   // fp32
-#define SP_HEX_SQFREE_SLOT_BYTES  103   // total per (layer, head, pos)
+#define SP_HEX_SQFREE_SLOT_BYTES   63   // 28 + 31 + 4
 
 typedef struct {
     sp_config_t          config;
