@@ -72,6 +72,48 @@ int sp_hex_residual_spinor_ref(const float *actual,
                                 int packed_capacity,
                                 float *amax_out);
 
+// ----------------------------------------------------------------------------
+// Strike 14 — INVERSE pack: take the 71-byte packed blob and amax, expand
+// back to `n_lanes` fp32 residual values.  The remaining `n_padded - n_lanes`
+// tail lanes are zeroed so a downstream HVX vadd doesn't touch garbage.
+//
+//   residual[i] = (phase[i] ? -1 : +1) * (mag[i] / 7.0f) * amax
+//
+// Bit-equal expected between HVX and ref variants — the math is pure scalar
+// arithmetic and one scalar fp multiply per lane.  HVX variant is kept as a
+// separate entry only so callers can pin it on the DSP TU without pulling
+// the host reference's calloc into the freestanding skel build.
+//
+// Returns 0 on success, -1 on shape mismatch.
+// ----------------------------------------------------------------------------
+int sp_hex_residual_spinor_unpack_hvx(const uint8_t *packed,
+                                       int packed_len,
+                                       int n_lanes,
+                                       int n_padded,
+                                       float amax,
+                                       float *residual_out);
+
+int sp_hex_residual_spinor_unpack_ref(const uint8_t *packed,
+                                       int packed_len,
+                                       int n_lanes,
+                                       int n_padded,
+                                       float amax,
+                                       float *residual_out);
+
+// ----------------------------------------------------------------------------
+// Strike 14 combine — `out[i] = a[i] + b[i]` over `n_padded` fp32 lanes.
+//
+// HVX variant uses Q6_Vqf32_vadd_VsfVsf + Q6_Vsf_equals_Vqf32 over
+// `n_padded/32` HVX vectors.  Buffers must be 128-byte aligned.  Off-target
+// builds fall through to a scalar add for unit-test parity.
+//
+// Returns 0 on success, -1 on shape mismatch.
+// ----------------------------------------------------------------------------
+int sp_hex_residual_combine_hvx(const float *a,
+                                 const float *b,
+                                 int n_padded,
+                                 float *out);
+
 #ifdef __cplusplus
 }
 #endif

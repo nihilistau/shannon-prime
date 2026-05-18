@@ -450,4 +450,29 @@ interface sp_hex : remote_handle64 {
                                   in sequence<float> predicted,
                                   rout sequence<octet> packed,
                                   rout float amax);
+
+   // -------------------------------------------------------------------
+   // hier_decode_f32 — Strike 14: Hierarchical Spinor decode (read path).
+   //
+   // Single dispatch reconstructs the 140 fp32 residual coordinates from
+   // the encoded block:
+   //   reconstructed[i] = hier_predict(skeleton)[i] + unpack(packed)[i]
+   //
+   // Pipeline on the DSP (all VTCM-resident, no extra FastRPC hops):
+   //   1. hier_predict_hvx_q15(skeleton, predicted_scratch)   [Strike 11b]
+   //   2. unpack(packed, amax, residual_scratch)               [Strike 14]
+   //   3. HVX vadd: reconstructed = predicted + residual       [5 vectors]
+   //
+   // skeleton      : fp32, length 14
+   // packed        : 71 bytes — produced by residual_quantize_spinor
+   // amax          : fp32 — produced alongside packed by the encoder
+   // reconstructed : fp32, length 140 (no padding on output)
+   //
+   // This is the hot path for generation — invoked once per attention
+   // K/V slot read per layer per head per token, so latency dominates.
+   // -------------------------------------------------------------------
+   long hier_decode_f32(in sequence<float> skeleton,
+                        in sequence<octet> packed,
+                        in float amax,
+                        rout sequence<float> reconstructed);
 };

@@ -1235,3 +1235,89 @@ int sp_hex_residual_quantize_spinor(remote_handle64 h,
                                        packed, packed_capacity,
                                        amax);
 }
+
+// ============================================================================
+// Strike 14: Hierarchical Spinor decode (predict + unpack + add).
+// ============================================================================
+//
+// Single FastRPC dispatch performs the full read-path reconstruction:
+//   reconstructed[i] = predicted[i] + residual[i]
+// where predicted = Q15 W-matrix forward of skeleton (Strike 11b) and
+// residual = scaled unpack of the 71-byte packed blob (Strike 14 helper).
+//
+// All three stages run on the DSP — no intermediate FastRPC marshalling.
+// ============================================================================
+
+#if defined(__HVX__) || defined(__hexagon__)
+#  include "HAP_farf.h"  // for FARF_ERROR; already included earlier, harmless
+#endif
+
+int sp_hex_hier_decode_f32(remote_handle64 h,
+                            const float *skeleton, int skeleton_len,
+                            const unsigned char *packed, int packed_len,
+                            float amax,
+                            float *reconstructed, int reconstructed_len) {
+    (void)h;
+    if (!skeleton || !packed || !reconstructed) {
+        FARF(ERROR, "[sp_hex] hier_decode: null pointer");
+        return -1;
+    }
+    if (skeleton_len != SP_HEX_W_MATRIX_HD154_SKELETON) {
+        FARF(ERROR, "[sp_hex] hier_decode: skeleton_len=%d != %d",
+             skeleton_len, SP_HEX_W_MATRIX_HD154_SKELETON);
+        return -2;
+    }
+    if (reconstructed_len != SP_HEX_W_MATRIX_HD154_PREDICTED) {
+        FARF(ERROR, "[sp_hex] hier_decode: reconstructed_len=%d != %d",
+             reconstructed_len, SP_HEX_W_MATRIX_HD154_PREDICTED);
+        return -2;
+    }
+    if (packed_len < SP_HEX_RESIDUAL_TOTAL_BYTES) {
+        FARF(ERROR, "[sp_hex] hier_decode: packed_len=%d < %d",
+             packed_len, SP_HEX_RESIDUAL_TOTAL_BYTES);
+        return -1;
+    }
+
+    /* Step 1: Q15 W-matrix forward predict — 140 fp32 outputs in padded
+     * buffer (Strike 11b's contract returns the first PREDICTED lanes only;
+     * we still want a 160-wide buffer for the HVX vadd, so we manage the
+     * pad ourselves). */
+    float predicted_pad[SP_HEX_RESIDUAL_PAD] __attribute__((aligned(128)));
+    float residual_pad[SP_HEX_RESIDUAL_PAD]  __attribute__((aligned(128)));
+    memset(predicted_pad, 0, sizeof(predicted_pad));
+    memset(residual_pad,  0, sizeof(residual_pad));
+
+    int rc = sp_hex_hier_predict_hvx_q15(skeleton, skeleton_len,
+                                          sp_hex_w_matrix_hd154,
+                                          SP_HEX_W_MATRIX_HD154_PREDICTED,
+                                          predicted_pad);
+    if (rc != 0) {
+        FARF(ERROR, "[sp_hex] hier_decode: predict rc=%d", rc);
+        return rc;
+    }
+
+    /* Step 2: unpack 71 bytes -> 140 fp32 residuals (+ 20 pad zeros). */
+    rc = sp_hex_residual_spinor_unpack_hvx(packed, packed_len,
+                                            SP_HEX_RESIDUAL_LANES_MAX,
+                                            SP_HEX_RESIDUAL_PAD,
+                                            amax,
+                                            residual_pad);
+    if (rc != 0) {
+        FARF(ERROR, "[sp_hex] hier_decode: unpack rc=%d", rc);
+        return rc;
+    }
+
+    /* Step 3: HVX vadd combine (lives in sp_hex_residual_spinor.c where the
+     * HVX intrinsic headers are pulled in).  Operates on the 160-padded
+     * buffer; we memcpy the first 140 lanes out as the caller's contract. */
+    float combined[SP_HEX_RESIDUAL_PAD] __attribute__((aligned(128)));
+    rc = sp_hex_residual_combine_hvx(predicted_pad, residual_pad,
+                                      SP_HEX_RESIDUAL_PAD, combined);
+    if (rc != 0) {
+        FARF(ERROR, "[sp_hex] hier_decode: combine rc=%d", rc);
+        return rc;
+    }
+    memcpy(reconstructed, combined,
+           sizeof(float) * (size_t)SP_HEX_W_MATRIX_HD154_PREDICTED);
+    return 0;
+}

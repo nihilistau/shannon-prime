@@ -160,3 +160,109 @@ int sp_hex_residual_spinor_ref(const float *actual,
     free(residual);
     return 0;
 }
+
+// ============================================================================
+// Strike 14 — inverse pack helper (shared between HVX + host paths).
+// ============================================================================
+//
+// Reads the 71-byte packed blob and produces `n_lanes` fp32 residual values
+// followed by `n_padded - n_lanes` zero-pad lanes (so downstream HVX adds
+// don't have to mask the tail).  Decompresses lane-by-lane:
+//   bit_idx  = i * 3
+//   byte_idx = bit_idx / 8
+//   shift    = bit_idx mod 8
+//   mag      = (packed[byte_idx] | packed[byte_idx+1] << 8) >> shift & 0x7
+//   phase    = packed[53 + i/8] >> (i mod 8) & 0x1
+//   residual = (phase ? -1 : +1) * (mag / 7) * amax
+// ============================================================================
+static void sp_hex_unpack_residual(const uint8_t *packed,
+                                    int n_lanes,
+                                    int n_padded,
+                                    float amax,
+                                    float *residual_out) {
+    /* Zero pad lanes first so the HVX vadd in the caller sees clean tail. */
+    for (int i = 0; i < n_padded; ++i) residual_out[i] = 0.0f;
+    if (amax == 0.0f) return;
+
+    const float step = amax / 7.0f;
+    for (int i = 0; i < n_lanes; ++i) {
+        /* 3-bit magnitude — may straddle two bytes. */
+        const int bit_idx  = i * 3;
+        const int byte_idx = bit_idx >> 3;
+        const int shift    = bit_idx & 7;
+        uint32_t cell = (uint32_t)packed[byte_idx];
+        /* shift+3 > 8 means the 3 bits cross into byte_idx+1. */
+        if (shift > 5 && byte_idx + 1 < SP_HEX_RESIDUAL_MAG_BYTES) {
+            cell |= ((uint32_t)packed[byte_idx + 1]) << 8;
+        }
+        const int mag = (int)((cell >> shift) & 0x7);
+
+        /* 1-bit phase. */
+        const int p_byte = SP_HEX_RESIDUAL_MAG_BYTES + (i >> 3);
+        const int p_bit  = i & 7;
+        const int phase  = (packed[p_byte] >> p_bit) & 0x1;
+
+        float v = (float)mag * step;
+        residual_out[i] = phase ? -v : v;
+    }
+}
+
+int sp_hex_residual_spinor_unpack_hvx(const uint8_t *packed,
+                                       int packed_len,
+                                       int n_lanes,
+                                       int n_padded,
+                                       float amax,
+                                       float *residual_out) {
+    if (!packed || !residual_out) return -1;
+    if (n_lanes != SP_HEX_RESIDUAL_LANES_MAX ||
+        n_padded != SP_HEX_RESIDUAL_PAD) return -1;
+    if (packed_len < SP_HEX_RESIDUAL_TOTAL_BYTES) return -1;
+    sp_hex_unpack_residual(packed, n_lanes, n_padded, amax, residual_out);
+    return 0;
+}
+
+int sp_hex_residual_spinor_unpack_ref(const uint8_t *packed,
+                                       int packed_len,
+                                       int n_lanes,
+                                       int n_padded,
+                                       float amax,
+                                       float *residual_out) {
+    if (!packed || !residual_out) return -1;
+    if (n_lanes <= 0 || n_padded < n_lanes) return -1;
+    if (packed_len < SP_HEX_RESIDUAL_TOTAL_BYTES) return -1;
+    sp_hex_unpack_residual(packed, n_lanes, n_padded, amax, residual_out);
+    return 0;
+}
+
+// ============================================================================
+// Strike 14 — vadd combine for the decode chain.
+// ============================================================================
+//
+// Computes `out[i] = a[i] + b[i]` over n_padded fp32 lanes.  Uses HVX
+// qfloat add on-target, scalar add off-target.  Same qf32 round-trip as
+// Strike 12's vsub but in the additive direction.
+// ============================================================================
+
+int sp_hex_residual_combine_hvx(const float *a,
+                                 const float *b,
+                                 int n_padded,
+                                 float *out) {
+    if (!a || !b || !out) return -1;
+    if (n_padded <= 0 || (n_padded % 32) != 0) return -1;
+
+#if SP_HEX_HVX_AVAILABLE
+    const HVX_Vector *a_v = (const HVX_Vector *)a;
+    const HVX_Vector *b_v = (const HVX_Vector *)b;
+    HVX_Vector *o_v       = (HVX_Vector *)out;
+    const int n_vec = n_padded / 32;
+    for (int c = 0; c < n_vec; ++c) {
+        HVX_Vector v_qf32 = Q6_Vqf32_vadd_VsfVsf(a_v[c], b_v[c]);
+        o_v[c] = Q6_Vsf_equals_Vqf32(v_qf32);
+    }
+#else
+    for (int i = 0; i < n_padded; ++i) {
+        out[i] = a[i] + b[i];
+    }
+#endif
+    return 0;
+}

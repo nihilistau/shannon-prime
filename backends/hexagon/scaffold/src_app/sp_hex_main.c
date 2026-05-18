@@ -220,6 +220,19 @@ int main(int argc, char *argv[]) {
                "Hierarchical Spinor encode closed\n");
     }
 
+    // Strike 14: Hierarchical Spinor decode — predict + unpack + add.
+    // Reconstructs the 140 fp32 residual coordinates from a 71-byte packed
+    // block + skeleton + amax via a single DSP dispatch.  This is the
+    // generation hot path (one decode per K/V slot read per layer per head).
+    printf("\n[decode] === Strike 14: hier_decode_f32 FastRPC parity test ===\n");
+    int decode_fail = sp_hex_hier_decode_parity();
+    if (decode_fail) {
+        printf("[decode] FAIL — DSP decode diverged from host reference\n");
+    } else {
+        printf("[decode] all 3 patterns within qf32 ULP + Q3 round-trip "
+               "budget — Hierarchical Spinor decode closed\n");
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

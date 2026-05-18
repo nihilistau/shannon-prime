@@ -169,6 +169,15 @@ int sp_hex_hier_predict_parity(void);
 // amax vs the host scalar reference. Returns 0 if all three patterns pass.
 int sp_hex_residual_spinor_parity(void);
 
+// Strike 14: FastRPC parity test for sp_hex_hier_decode_f32.
+// Closes the Hierarchical Spinor read path — chains hier_predict (Strike 11b)
+// + residual unpack (Strike 14) + HVX vadd in a single DSP dispatch.  Checks:
+//   (a) DSP reconstructed vs host reference within 1e-5 (qf32 ULP budget)
+//   (b) DSP reconstructed vs original `actual` within amax/14 + 1e-5
+//       (round-trip quality dominated by Q3 quant step)
+// Returns 0 if all 3 patterns pass both checks.
+int sp_hex_hier_decode_parity(void);
+
 #ifdef __cplusplus
 }
 #endif
