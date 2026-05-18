@@ -835,3 +835,810 @@ int sp_hex_kq_matmul_bench(int n_kv, int hd, int n_q) {
     return 0;
 }
 
+// ============================================================================
+// Strike 5.5: FastRPC parity test for sp_hex_matmul_block_q8
+// ============================================================================
+
+#define SP_PARITY_BLK_SIZE  32              // sp_ok_q8_block_t.packed length
+#define SP_PARITY_BLK_BYTES 64              // sizeof(sp_ok_q8_block_t)
+
+// Inline scalar reference matching sp_hex_matmul_ok_block_q8_inner exactly.
+// Bit-equal contract: this MUST produce the same (acc_a, acc_b) as the DSP
+// kernel for any (w_blocks, x_row) input where the bounded-activation
+// invariant holds. We inline it here so this TU has no link-time dependency
+// on the math library — it's a self-contained correctness anchor.
+static void parity_reference_inner(
+    const unsigned char *w_blocks_bytes,   // blocks_per_row * 64 bytes
+    const long long     *x_row,            // 2 * blocks_per_row * 32 int64 (a,b pairs)
+    int                  blocks_per_row,
+    long long           *out_acc_a,
+    long long           *out_acc_b)
+{
+    long long acc_a = 0, acc_b = 0;
+    const long long W41 = 41;
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const long long *hdr = (const long long *)(w_blocks_bytes + b * SP_PARITY_BLK_BYTES);
+        const long long B_a = hdr[0];
+        const long long B_b = hdr[1];
+        // hdr[2], hdr[3] are reserved_block_min_{a,b}, packed[] starts at +32 bytes.
+        const signed char *packed = (const signed char *)
+                                    (w_blocks_bytes + b * SP_PARITY_BLK_BYTES + 32);
+        const long long *x_tile = x_row + b * SP_PARITY_BLK_SIZE * 2;
+        long long D_a = 0, D_b = 0;
+        for (int k = 0; k < SP_PARITY_BLK_SIZE; ++k) {
+            const long long w = (long long)packed[k];
+            D_a += w * x_tile[2*k + 0];     // x[k].a
+            D_b += w * x_tile[2*k + 1];     // x[k].b
+        }
+        acc_a += B_a * D_a - W41 * B_b * D_b;
+        acc_b += B_a * D_b + B_b * (D_a + D_b);
+    }
+    *out_acc_a = acc_a;
+    *out_acc_b = acc_b;
+}
+
+// Synthesize one test case: blocks_per_row blocks of weights + matching
+// activation row. Uses a deterministic seed so the test is reproducible.
+// Magnitudes are chosen to honor the engine's bounded-activation invariant
+// (|x.{a,b}| ≤ 2^17, |B_{a,b}| ≤ 2^14, |packed[k]| ≤ 127).
+static void build_parity_inputs(int blocks_per_row, unsigned int seed,
+                                 unsigned char *w_bytes, long long *x_row) {
+    unsigned int s = seed;
+    // Lehmer LCG — simple deterministic stream, no rand() lib dependency.
+    #define NEXT_S() (s = s * 1103515245u + 12345u)
+    for (int b = 0; b < blocks_per_row; ++b) {
+        long long *hdr = (long long *)(w_bytes + b * SP_PARITY_BLK_BYTES);
+        // B_a, B_b in [-20000, 20000].
+        hdr[0] = (long long)((int)(NEXT_S() % 40001u) - 20000);
+        hdr[1] = (long long)((int)(NEXT_S() % 40001u) - 20000);
+        hdr[2] = 0;
+        hdr[3] = 0;
+        signed char *packed = (signed char *)(w_bytes + b * SP_PARITY_BLK_BYTES + 32);
+        for (int k = 0; k < SP_PARITY_BLK_SIZE; ++k) {
+            packed[k] = (signed char)((int)(NEXT_S() % 255u) - 127);
+        }
+        long long *x_tile = x_row + b * SP_PARITY_BLK_SIZE * 2;
+        for (int k = 0; k < SP_PARITY_BLK_SIZE; ++k) {
+            // |x.{a,b}| ≤ 2^17 keeps per-block D ≤ 2^29 (int32-safe).
+            x_tile[2*k + 0] = (long long)((int)(NEXT_S() & 0x3FFFFu) - 0x1FFFF);
+            x_tile[2*k + 1] = (long long)((int)(NEXT_S() & 0x3FFFFu) - 0x1FFFF);
+        }
+    }
+    #undef NEXT_S
+}
+
+int sp_hex_matmul_block_q8_parity(int blocks_per_row) {
+    if (blocks_per_row <= 0 || blocks_per_row > 256) {
+        printf("[parity] invalid blocks_per_row=%d\n", blocks_per_row);
+        return 1;
+    }
+
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[parity] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[parity] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    const int w_bytes_len  = blocks_per_row * SP_PARITY_BLK_BYTES;
+    const int x_row_len    = 2 * blocks_per_row * SP_PARITY_BLK_SIZE;  // ints, not bytes
+
+    // Allocate rpcmem (so the buffers are SMMU-mappable — this proves the
+    // ION-page handoff to the cDSP works when we later wire the real
+    // sp_oracle_prefetch slots).
+    unsigned char *w_bytes = (unsigned char *)rpcmem_alloc(
+        RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, w_bytes_len);
+    long long *x_row = (long long *)rpcmem_alloc(
+        RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS,
+        x_row_len * (int)sizeof(long long));
+    if (!w_bytes || !x_row) {
+        printf("[parity] rpcmem_alloc failed\n");
+        if (w_bytes) rpcmem_free(w_bytes);
+        if (x_row)   rpcmem_free(x_row);
+        sp_hex_close(h);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    int fail = 0;
+    const unsigned int seeds[] = { 0xA1B2C3D4u, 0xDEADBEEFu, 0xCAFEBABEu };
+    for (int trial = 0; trial < 3; ++trial) {
+        build_parity_inputs(blocks_per_row, seeds[trial], w_bytes, x_row);
+
+        long long acc_a_dsp = 0, acc_b_dsp = 0;
+        int dsp_rc = sp_hex_matmul_block_q8(h,
+                                             w_bytes, w_bytes_len,
+                                             x_row,   x_row_len,
+                                             blocks_per_row,
+                                             &acc_a_dsp, &acc_b_dsp);
+        if (dsp_rc != 0) {
+            printf("[parity] DSP returned %d for trial %d\n", dsp_rc, trial);
+            fail = 1;
+            break;
+        }
+
+        long long acc_a_ref = 0, acc_b_ref = 0;
+        parity_reference_inner(w_bytes, x_row, blocks_per_row,
+                                &acc_a_ref, &acc_b_ref);
+
+        if (acc_a_dsp != acc_a_ref || acc_b_dsp != acc_b_ref) {
+            printf("[parity] MISMATCH blocks=%d trial=%d:\n", blocks_per_row, trial);
+            printf("[parity]   DSP: acc_a=%lld acc_b=%lld\n", acc_a_dsp, acc_b_dsp);
+            printf("[parity]   REF: acc_a=%lld acc_b=%lld\n", acc_a_ref, acc_b_ref);
+            printf("[parity]   diff_a=%lld diff_b=%lld\n",
+                   acc_a_dsp - acc_a_ref, acc_b_dsp - acc_b_ref);
+            fail = 1;
+            break;
+        }
+    }
+
+    if (!fail) {
+        printf("[parity] blocks_per_row=%d: all 3 trials bit-equal — HVX vmpyieacc ✓\n",
+               blocks_per_row);
+    }
+
+    rpcmem_free(w_bytes);
+    rpcmem_free(x_row);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return fail;
+}
+
+// ============================================================================
+// Strike 6: FastRPC parity test for sp_hex_mobius_scatter_f32.
+// ============================================================================
+
+// Compute the Möbius squarefree-first inverse permutation for `n` indices
+// — same algorithm as scripts/gen_mobius_tables.py and the math core's
+// sp_mobius_mask_init. inv[j] = output position of source index j.
+static void parity_compute_mobius_inv(int n, int* inv_out) {
+    // mu[i]: 1 if squarefree (mu != 0), 0 if non-squarefree.
+    // Index 0 is treated as non-squarefree (mu(0) undefined).
+    int *prime_count = (int *)calloc((size_t)n, sizeof(int));
+    int *has_square  = (int *)calloc((size_t)n, sizeof(int));
+    int *mu          = (int *)calloc((size_t)n, sizeof(int));
+    if (n > 1) mu[1] = 1;
+    for (int i = 2; i < n; ++i) mu[i] = 1;
+
+    for (int p = 2; p < n; ++p) {
+        if (prime_count[p] != 0) continue;
+        for (int m = p; m < n; m += p) prime_count[m] += 1;
+        long long p2 = (long long)p * p;
+        for (long long m = p2; m < n; m += p2) has_square[m] = 1;
+    }
+    for (int i = 2; i < n; ++i) {
+        if (has_square[i]) mu[i] = 0;
+        else mu[i] = (prime_count[i] % 2 == 0) ? 1 : -1;
+    }
+    mu[0] = 0;
+
+    // Build the squarefree-first order, then invert.
+    int *order = (int *)malloc((size_t)n * sizeof(int));
+    int pos = 0;
+    for (int i = 0; i < n; ++i) if (mu[i] != 0) order[pos++] = i;
+    for (int i = 0; i < n; ++i) if (mu[i] == 0) order[pos++] = i;
+    for (int i = 0; i < n; ++i) inv_out[order[i]] = i;
+
+    free(order); free(mu); free(has_square); free(prime_count);
+}
+
+int sp_hex_mobius_scatter_parity(int head_dim) {
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        printf("[mobius] invalid head_dim=%d (must be 64/128/256/512)\n", head_dim);
+        return 1;
+    }
+
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[mobius] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[mobius] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    // Build a deterministic input and the expected output via host scalar reorder.
+    float *in_vec   = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                             RPCMEM_DEFAULT_FLAGS,
+                                             (int)(head_dim * sizeof(float)));
+    float *out_vec  = (float *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                             RPCMEM_DEFAULT_FLAGS,
+                                             (int)(head_dim * sizeof(float)));
+    int   *inv      = (int *)  malloc((size_t)head_dim * sizeof(int));
+    float *expected = (float *)malloc((size_t)head_dim * sizeof(float));
+    if (!in_vec || !out_vec || !inv || !expected) {
+        printf("[mobius] allocation failed\n");
+        if (in_vec)   rpcmem_free(in_vec);
+        if (out_vec)  rpcmem_free(out_vec);
+        if (inv)      free(inv);
+        if (expected) free(expected);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    // Fill input with a recognizable pattern so any wrong-position write
+    // is visible by inspection if a trial fails.
+    for (int i = 0; i < head_dim; ++i) {
+        in_vec[i] = 0.0625f + (float)i;  // distinct per-index values
+    }
+
+    // Host scalar reference: expected[inv[j]] = in[j]
+    parity_compute_mobius_inv(head_dim, inv);
+    for (int j = 0; j < head_dim; ++j) expected[inv[j]] = in_vec[j];
+
+    // Dispatch HVX scatter via FastRPC.
+    int dsp_rc = sp_hex_mobius_scatter_f32(h, in_vec, head_dim, head_dim,
+                                            out_vec, head_dim);
+    int fail = 0;
+    if (dsp_rc != 0) {
+        printf("[mobius] DSP returned %d for head_dim=%d\n", dsp_rc, head_dim);
+        fail = 1;
+    } else {
+        // Compare bit-equal (cast to uint32 to avoid NaN-equality pitfalls,
+        // though here all values are finite). We expect exact equality —
+        // this is pure data movement.
+        int diffs = 0, first_diff_idx = -1;
+        for (int i = 0; i < head_dim; ++i) {
+            union { float f; uint32_t u; } a, b;
+            a.f = out_vec[i]; b.f = expected[i];
+            if (a.u != b.u) {
+                if (diffs == 0) first_diff_idx = i;
+                ++diffs;
+            }
+        }
+        if (diffs > 0) {
+            printf("[mobius] MISMATCH head_dim=%d: %d/%d positions differ\n",
+                   head_dim, diffs, head_dim);
+            printf("[mobius]   first diff @ i=%d: DSP=%g expected=%g\n",
+                   first_diff_idx, out_vec[first_diff_idx], expected[first_diff_idx]);
+            fail = 1;
+        } else {
+            printf("[mobius] head_dim=%-4d  %4d elements scattered bit-equal — vscatter ✓\n",
+                   head_dim, head_dim);
+        }
+    }
+
+    rpcmem_free(in_vec);
+    rpcmem_free(out_vec);
+    free(inv);
+    free(expected);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return fail;
+}
+
+// ============================================================================
+// Strike 7: FastRPC byte-equal parity for sp_hex_band_quantize.
+// ============================================================================
+//
+// Stricter than sp_hex_compress_decompress_validate (which checks per-element
+// fp32 recovery after compress→decompress round-trip). This compares the
+// COMPRESSED BYTES emitted by the HVX path against the host's sp_band_quantize
+// byte-for-byte. Same input, same byte stream — proves the disk-tier dump
+// from DSP is bit-identical to the dump from the engine running on ARM.
+
+int sp_hex_band_quantize_parity(int head_dim) {
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        printf("[bandq] invalid head_dim=%d\n", head_dim);
+        return 1;
+    }
+
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[bandq] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[bandq] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    // Production 5/5/4/3 band config — what the host engine ships.
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    const int packed_bytes = bc.total_bytes;
+
+    float   *in_vec      = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                    RPCMEM_DEFAULT_FLAGS,
+                                                    (int)(head_dim * sizeof(float)));
+    uint8_t *dsp_packed  = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                    RPCMEM_DEFAULT_FLAGS,
+                                                    packed_bytes);
+    uint8_t *host_packed = (uint8_t *)malloc((size_t)packed_bytes);
+    if (!in_vec || !dsp_packed || !host_packed) {
+        printf("[bandq] alloc failed\n");
+        if (in_vec)      rpcmem_free(in_vec);
+        if (dsp_packed)  rpcmem_free(dsp_packed);
+        if (host_packed) free(host_packed);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    // Build a deterministic VHT2-domain-like input — values with a mix of
+    // magnitudes so each band exercises a non-trivial amax and quantize.
+    // The mu-sieve permutation is NOT applied here; both sides see the
+    // same un-reordered input so we can isolate band_quantize parity.
+    for (int i = 0; i < head_dim; ++i) {
+        // Geometrically decreasing magnitudes per band — the typical VHT2
+        // spectrum shape — plus a per-element shift so amax differs from
+        // mean. Sign alternates for some elements to exercise negative quant.
+        float band_scale = 1.0f;
+        if (i >= head_dim / 4)      band_scale = 0.5f;
+        if (i >= 2 * head_dim / 4)  band_scale = 0.25f;
+        if (i >= 3 * head_dim / 4)  band_scale = 0.125f;
+        float t = (float)(i % 31) / 31.0f;
+        float v = band_scale * (0.1f + t);
+        if ((i & 1) == 0) v = -v;
+        in_vec[i] = v;
+    }
+
+    // Host reference.
+    sp_band_quantize(in_vec, host_packed, &bc);
+
+    // DSP HVX path via FastRPC.
+    int dsp_rc = sp_hex_band_quantize(h, in_vec, head_dim, head_dim,
+                                       dsp_packed, packed_bytes);
+    int fail = 0;
+    if (dsp_rc != 0) {
+        printf("[bandq] DSP returned %d for head_dim=%d\n", dsp_rc, head_dim);
+        fail = 1;
+    } else {
+        // Byte-by-byte comparison.
+        int diffs = 0, first = -1;
+        for (int i = 0; i < packed_bytes; ++i) {
+            if (dsp_packed[i] != host_packed[i]) {
+                if (diffs == 0) first = i;
+                ++diffs;
+            }
+        }
+        if (diffs > 0) {
+            printf("[bandq] MISMATCH head_dim=%d: %d/%d bytes differ\n",
+                   head_dim, diffs, packed_bytes);
+            printf("[bandq]   first diff @ byte %d: DSP=0x%02X host=0x%02X\n",
+                   first, dsp_packed[first], host_packed[first]);
+            fail = 1;
+        } else {
+            printf("[bandq] head_dim=%-4d  packed=%3d bytes  byte-equal — HVX amax + scalar pack ✓\n",
+                   head_dim, packed_bytes);
+        }
+    }
+
+    rpcmem_free(in_vec);
+    rpcmem_free(dsp_packed);
+    free(host_packed);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return fail;
+}
+
+// ============================================================================
+// Strike 9: FastRPC byte-equal parity for the grand fusion
+//           (VHT2 + Möbius + band_quantize on DSP).
+// ============================================================================
+
+int sp_hex_compress_f32_full_parity(int head_dim) {
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        printf("[fused] invalid head_dim=%d\n", head_dim);
+        return 1;
+    }
+
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[fused] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[fused] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    const int packed_bytes = bc.total_bytes;
+
+    float   *in_vec      = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                    RPCMEM_DEFAULT_FLAGS,
+                                                    (int)(head_dim * sizeof(float)));
+    uint8_t *dsp_packed  = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                    RPCMEM_DEFAULT_FLAGS,
+                                                    packed_bytes);
+    uint8_t *host_packed = (uint8_t *)malloc((size_t)packed_bytes);
+    float   *host_scratch = (float *)malloc((size_t)head_dim * sizeof(float));
+    float   *host_mscratch = (float *)malloc((size_t)head_dim * sizeof(float));
+    sp_mobius_mask_t mask;
+    int mask_rc = sp_mobius_mask_init(&mask, head_dim);
+    if (!in_vec || !dsp_packed || !host_packed || !host_scratch ||
+        !host_mscratch || mask_rc != 0) {
+        printf("[fused] alloc failed\n");
+        if (in_vec)        rpcmem_free(in_vec);
+        if (dsp_packed)    rpcmem_free(dsp_packed);
+        if (host_packed)   free(host_packed);
+        if (host_scratch)  free(host_scratch);
+        if (host_mscratch) free(host_mscratch);
+        if (mask_rc == 0)  sp_mobius_mask_free(&mask);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    // Deterministic input. Same distribution shape as Strike 7's bandq test.
+    for (int i = 0; i < head_dim; ++i) {
+        float bs = 1.0f;
+        if (i >= head_dim / 4)     bs = 0.5f;
+        if (i >= 2 * head_dim / 4) bs = 0.25f;
+        if (i >= 3 * head_dim / 4) bs = 0.125f;
+        float t = (float)(i % 31) / 31.0f;
+        float v = bs * (0.1f + t);
+        if ((i & 1) == 0) v = -v;
+        in_vec[i] = v;
+    }
+
+    // Host reference: full encode pipeline (VHT2 → Möbius → band_quantize).
+    memcpy(host_scratch, in_vec, sizeof(float) * (size_t)head_dim);
+    sp_vht2_forward_f32(host_scratch, head_dim);
+    sp_mobius_reorder_ex(host_scratch, &mask, host_mscratch);
+    sp_band_quantize(host_scratch, host_packed, &bc);
+
+    // DSP fused path: single FastRPC dispatch.
+    int dsp_used = 0;
+    int dsp_rc = sp_hex_compress_f32_full(h, in_vec, head_dim, head_dim,
+                                            dsp_packed, packed_bytes, &dsp_used);
+
+    int fail = 0;
+    if (dsp_rc != 0) {
+        printf("[fused] DSP returned %d for head_dim=%d\n", dsp_rc, head_dim);
+        fail = 1;
+    } else if (dsp_used != packed_bytes) {
+        printf("[fused] DSP packed_used=%d expected=%d\n", dsp_used, packed_bytes);
+        fail = 1;
+    } else {
+        int diffs = 0, first = -1;
+        for (int i = 0; i < packed_bytes; ++i) {
+            if (dsp_packed[i] != host_packed[i]) {
+                if (diffs == 0) first = i;
+                ++diffs;
+            }
+        }
+        if (diffs > 0) {
+            printf("[fused] MISMATCH head_dim=%d: %d/%d bytes differ\n",
+                   head_dim, diffs, packed_bytes);
+            printf("[fused]   first diff @ byte %d: DSP=0x%02X host=0x%02X\n",
+                   first, dsp_packed[first], host_packed[first]);
+            fail = 1;
+        } else {
+            printf("[fused] head_dim=%-4d  %3d bytes  byte-equal — VHT2+Möbius+bandq fused ✓\n",
+                   head_dim, packed_bytes);
+        }
+    }
+
+    rpcmem_free(in_vec);
+    rpcmem_free(dsp_packed);
+    free(host_packed);
+    free(host_scratch);
+    free(host_mscratch);
+    sp_mobius_mask_free(&mask);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return fail;
+}
+
+// ============================================================================
+// Strike 10b: FastRPC parity test for sp_hex_compress_f32_full_batch.
+// ============================================================================
+//
+// Stages n_vectors deterministic fp32 inputs contiguously, dispatches the
+// batched fused encoder via ONE FastRPC call, and compares byte-by-byte
+// against the host reference. Validates that the per-iteration VTCM reuse
+// inside the DSP loop produces independent, byte-identical encodes — i.e.
+// no inter-iteration aliasing inside the Möbius scatter or band_quantize.
+// ============================================================================
+
+int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors) {
+    if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
+        printf("[fused_batch] invalid head_dim=%d\n", head_dim);
+        return 1;
+    }
+    if (n_vectors <= 0 || n_vectors > 256) {
+        printf("[fused_batch] invalid n_vectors=%d\n", n_vectors);
+        return 1;
+    }
+
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[fused_batch] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[fused_batch] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    const int per_vec_bytes = bc.total_bytes;
+    const int batch_floats  = n_vectors * head_dim;
+    const int batch_bytes   = n_vectors * per_vec_bytes;
+
+    float   *in_vecs      = (float   *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                     RPCMEM_DEFAULT_FLAGS,
+                                                     (int)(batch_floats * sizeof(float)));
+    uint8_t *dsp_packed   = (uint8_t *)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                     RPCMEM_DEFAULT_FLAGS,
+                                                     batch_bytes);
+    uint8_t *host_packed  = (uint8_t *)malloc((size_t)batch_bytes);
+    float   *host_scratch = (float *)malloc((size_t)head_dim * sizeof(float));
+    float   *host_mscratch = (float *)malloc((size_t)head_dim * sizeof(float));
+    sp_mobius_mask_t mask;
+    int mask_rc = sp_mobius_mask_init(&mask, head_dim);
+    if (!in_vecs || !dsp_packed || !host_packed || !host_scratch ||
+        !host_mscratch || mask_rc != 0) {
+        printf("[fused_batch] alloc failed\n");
+        if (in_vecs)       rpcmem_free(in_vecs);
+        if (dsp_packed)    rpcmem_free(dsp_packed);
+        if (host_packed)   free(host_packed);
+        if (host_scratch)  free(host_scratch);
+        if (host_mscratch) free(host_mscratch);
+        if (mask_rc == 0)  sp_mobius_mask_free(&mask);
+        sp_hex_close(h); rpcmem_deinit();
+        return 1;
+    }
+
+    // Deterministic input per-vector — same distribution shape as the single-vec
+    // test, but with a per-vector seed offset so vec[i] != vec[j] (catches any
+    // cross-iteration aliasing inside the DSP loop).
+    for (int v = 0; v < n_vectors; ++v) {
+        float *in_vec = in_vecs + (size_t)v * (size_t)head_dim;
+        for (int i = 0; i < head_dim; ++i) {
+            float bs = 1.0f;
+            if (i >= head_dim / 4)     bs = 0.5f;
+            if (i >= 2 * head_dim / 4) bs = 0.25f;
+            if (i >= 3 * head_dim / 4) bs = 0.125f;
+            float t = (float)((i + v) % 31) / 31.0f;
+            float val = bs * (0.1f + t);
+            if (((i + v) & 1) == 0) val = -val;
+            in_vec[i] = val;
+        }
+    }
+
+    // Host reference: encode each vector through the host scalar chain.
+    for (int v = 0; v < n_vectors; ++v) {
+        const float *in_vec = in_vecs + (size_t)v * (size_t)head_dim;
+        uint8_t *out_slot = host_packed + (size_t)v * (size_t)per_vec_bytes;
+        memcpy(host_scratch, in_vec, sizeof(float) * (size_t)head_dim);
+        sp_vht2_forward_f32(host_scratch, head_dim);
+        sp_mobius_reorder_ex(host_scratch, &mask, host_mscratch);
+        sp_band_quantize(host_scratch, out_slot, &bc);
+    }
+
+    // DSP fused-batch path: single FastRPC dispatch over n_vectors.
+    int dsp_used = 0;
+    int dsp_rc = sp_hex_compress_f32_full_batch(h, in_vecs, batch_floats,
+                                                  head_dim, n_vectors,
+                                                  dsp_packed, batch_bytes,
+                                                  &dsp_used);
+
+    int fail = 0;
+    if (dsp_rc != 0) {
+        printf("[fused_batch] DSP returned %d for head_dim=%d n=%d\n",
+               dsp_rc, head_dim, n_vectors);
+        fail = 1;
+    } else if (dsp_used != batch_bytes) {
+        printf("[fused_batch] DSP packed_used=%d expected=%d\n",
+               dsp_used, batch_bytes);
+        fail = 1;
+    } else {
+        int diffs = 0, first = -1, first_v = -1;
+        for (int v = 0; v < n_vectors && diffs < 16; ++v) {
+            int base = v * per_vec_bytes;
+            for (int i = 0; i < per_vec_bytes; ++i) {
+                if (dsp_packed[base + i] != host_packed[base + i]) {
+                    if (diffs == 0) { first = i; first_v = v; }
+                    ++diffs;
+                }
+            }
+        }
+        if (diffs > 0) {
+            printf("[fused_batch] MISMATCH head_dim=%d n=%d: %d+ bytes differ\n",
+                   head_dim, n_vectors, diffs);
+            printf("[fused_batch]   first diff @ vec %d byte %d: DSP=0x%02X host=0x%02X\n",
+                   first_v, first,
+                   dsp_packed[first_v * per_vec_bytes + first],
+                   host_packed[first_v * per_vec_bytes + first]);
+            fail = 1;
+        } else {
+            printf("[fused_batch] head_dim=%-4d n=%-3d  %d bytes/vec  byte-equal — batched fused ✓\n",
+                   head_dim, n_vectors, per_vec_bytes);
+        }
+    }
+
+    rpcmem_free(in_vecs);
+    rpcmem_free(dsp_packed);
+    free(host_packed);
+    free(host_scratch);
+    free(host_mscratch);
+    sp_mobius_mask_free(&mask);
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return fail;
+}
+
+// ============================================================================
+// Strike 8a: FastRPC parity test for sp_hex_logit_argmax_u16.
+// ============================================================================
+
+// Scalar reference: first-occurrence argmax over a uint16 row. Matches the
+// DSP kernel's "ties go to lowest index" semantic.
+static int parity_scalar_argmax_u16(const uint16_t* buf, int n) {
+    int best_idx = 0;
+    uint16_t best_val = buf[0];
+    for (int i = 1; i < n; ++i) {
+        if (buf[i] > best_val) { best_val = buf[i]; best_idx = i; }
+    }
+    return best_idx;
+}
+
+// Build a deterministic UFIXED_16 row with a specific known max position.
+static void parity_build_logits(uint16_t* buf, int n, int max_pos, uint32_t seed) {
+    uint32_t s = seed;
+    for (int i = 0; i < n; ++i) {
+        s = s * 1103515245u + 12345u;
+        // Background range [100, 60000] — far below the 65535 max, far above 0.
+        buf[i] = (uint16_t)(100 + (s % 59901u));
+    }
+    // Plant the max at the requested position. Use 65000 (less than 65535
+    // so we can also seed a UNIQUE max — needed for tie-free first-occurrence).
+    buf[max_pos] = 65000;
+}
+
+int sp_hex_logit_argmax_parity(void) {
+    rpcmem_init();
+    remote_handle64 h = -1;
+
+    if (remote_session_control) {
+        struct remote_rpc_control_unsigned_module data;
+        data.domain = CDSP_DOMAIN_ID;
+        data.enable = 1;
+        int rc = remote_session_control(DSPRPC_CONTROL_UNSIGNED_MODULE,
+                                        (void *)&data, sizeof(data));
+        if (rc != AEE_SUCCESS) {
+            printf("[argmax] remote_session_control failed 0x%x\n", rc);
+            rpcmem_deinit();
+            return 1;
+        }
+    }
+
+    int rc = sp_hex_open(sp_hex_URI CDSP_DOMAIN, &h);
+    if (rc != AEE_SUCCESS) {
+        printf("[argmax] sp_hex_open failed 0x%x\n", rc);
+        rpcmem_deinit();
+        return 1;
+    }
+
+    // Test matrix: a few vocab sizes (aligned, misaligned, Qwen3-4B real size)
+    // × a few max positions (start, end, middle, irregular).
+    struct { int vocab; int max_pos; const char* label; } cases[] = {
+        {     64,      0, "vocab=64    max@0"        },  // tiny, max at head
+        {     64,     63, "vocab=64    max@end"      },  // tiny, max at tail
+        {   1024,    512, "vocab=1024  max@middle"   },  // aligned, mid
+        {   1023,    777, "vocab=1023  max@odd"      },  // misaligned vocab
+        {  32768,  12345, "vocab=32k   max@12345"    },  // larger
+        { 151936,  87654, "vocab=151k  max@87654"    },  // Qwen3-4B size
+        { 151936, 151935, "vocab=151k  max@last"     },  // Qwen3-4B, max at end
+        { 151936,      0, "vocab=151k  max@0"        },  // Qwen3-4B, max at head
+    };
+    const int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    int fail = 0;
+    for (int c = 0; c < n_cases; ++c) {
+        const int vocab   = cases[c].vocab;
+        const int max_pos = cases[c].max_pos;
+        const int bytes   = vocab * (int)sizeof(uint16_t);
+
+        uint16_t* logits = (uint16_t*)rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM,
+                                                    RPCMEM_DEFAULT_FLAGS, bytes);
+        if (!logits) {
+            printf("[argmax] rpcmem_alloc failed for vocab=%d\n", vocab);
+            fail = 1;
+            break;
+        }
+        parity_build_logits(logits, vocab, max_pos, 0xA5A5A5A5u + (uint32_t)c);
+
+        // Host reference.
+        int ref_idx = parity_scalar_argmax_u16(logits, vocab);
+
+        // DSP HVX argmax.
+        int dsp_idx_long = -1;
+        int dsp_rc = sp_hex_logit_argmax_u16(h, logits, vocab, vocab, &dsp_idx_long);
+
+        if (dsp_rc != 0) {
+            printf("[argmax] %s : DSP returned rc=%d\n", cases[c].label, dsp_rc);
+            fail = 1;
+        } else if (dsp_idx_long != ref_idx) {
+            printf("[argmax] %s : MISMATCH DSP=%d ref=%d\n",
+                   cases[c].label, dsp_idx_long, ref_idx);
+            fail = 1;
+        } else {
+            printf("[argmax] %-30s DSP=%-6d ref=%-6d ✓\n",
+                   cases[c].label, dsp_idx_long, ref_idx);
+        }
+
+        rpcmem_free(logits);
+        if (fail) break;
+    }
+
+    sp_hex_close(h);
+    rpcmem_deinit();
+    return fail;
+}
+

@@ -88,6 +88,69 @@ int sp_hex_weight_stream_bench(const char *weight_file_path,
                                 int n_slots,
                                 int head_dim);
 
+// Strike 5.5: FastRPC parity test for the new matmul_block_q8 IDL method.
+// Builds a synthetic (w_blocks, x_row) input, dispatches to the cDSP via
+// FastRPC, compares (acc_a, acc_b) bit-equal against the host's scalar
+// reference (sp_hex_matmul_ok_block_q8_inner). Validates:
+//   - ARM → cDSP IDL marshalling for sequence<octet> + sequence<long long>
+//   - SMMU page handoff (the 64-B aligned w_blocks arrive intact)
+//   - V69 vmpyieacc semantics match the scalar reference bit-for-bit
+//
+// blocks_per_row: how many 32-element blocks per matmul row (1, 4, 16, 64).
+// Returns 0 on success (all configurations bit-equal), non-zero on first
+// mismatch with details printed to stderr.
+int sp_hex_matmul_block_q8_parity(int blocks_per_row);
+
+// Strike 6: FastRPC parity test for the new mobius_scatter_f32 IDL method.
+// Generates a deterministic fp32 input vector, dispatches Möbius reorder via
+// HVX vscatter on the DSP, compares against the host scalar reference
+// (apply inverse permutation directly). Bit-equal contract: this is pure
+// data movement, no math involved.
+//
+// head_dim must be one of {64, 128, 256, 512} — the compile-time tables.
+int sp_hex_mobius_scatter_parity(int head_dim);
+
+// Strike 7: FastRPC byte-equal parity test for band_quantize.
+// Generates a deterministic fp32 input, dispatches HVX band_quantize on
+// the DSP, and compares the packed output BYTE-BY-BYTE against the host's
+// sp_band_quantize. This is the stricter contract — not just "decompresses
+// to the same fp32" but "the packed disk-tier byte format is identical".
+//
+// head_dim must be 64/128/256/512 (band_config_init covers these).
+int sp_hex_band_quantize_parity(int head_dim);
+
+// Strike 8a: FastRPC parity test for logit_argmax_u16.
+// Synthesizes a UFIXED_16 logit row at production vocab sizes (e.g. 151936
+// for Qwen3-4B), seeds known max positions, dispatches via FastRPC. Compares
+// against the scalar host argmax. Validates: alignment prologue, HVX vmax
+// scan, vror tree reduce, scalar index-find second pass.
+//
+// Tests both well-aligned (vocab_size multiple of 64) and misaligned
+// (vocab_size with a remainder) configurations, plus edge cases (max at
+// position 0, at the end, and in the middle).
+int sp_hex_logit_argmax_parity(void);
+
+// Strike 9: FastRPC parity test for compress_f32_full (the grand fusion).
+// Validates that the single DSP-side dispatch (VHT2 + HVX Möbius scatter
+// + HVX band_quantize, all chained through VTCM) produces byte-identical
+// output to the host-side sequence:
+//   sp_vht2_forward_f32 → sp_mobius_reorder_ex → sp_band_quantize.
+//
+// This is the strictest contract: every fp32 → byte transformation in
+// the encode path must match across all 4 supported head_dims.
+int sp_hex_compress_f32_full_parity(int head_dim);
+
+// Strike 10b: FastRPC parity test for compress_f32_full_batch (batched grand
+// fusion). Stages n_vectors deterministic fp32 inputs, dispatches via ONE
+// FastRPC call, asserts byte-equality vs host scalar reference per-vector.
+// Validates per-iteration VTCM reuse — i.e. that the DSP's batch loop is
+// race-free across iterations (each Möbius scatter overwrites the previous
+// before band_quantize touches it).
+//
+// head_dim must be one of {64, 128, 256, 512} (Möbius compile-time tables).
+// n_vectors in [1, 256] (allocation budget; production chunks are typically 32).
+int sp_hex_compress_f32_full_batch_parity(int head_dim, int n_vectors);
+
 #ifdef __cplusplus
 }
 #endif

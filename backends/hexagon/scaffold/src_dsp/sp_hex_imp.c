@@ -885,3 +885,314 @@ int sp_hex_probe_dma_raw(remote_handle64 h,
          "faults in unsigned PD — testsig no help on production S22U)");
     return 0x4E;  // EPERM: DMA engine inaccessible in unsigned PD
 }
+
+// ============================================================================
+// Strike 5: HVX cyclotomic matmul.
+//
+// The math library's sp_hex_matmul_ok_block_q8_inner is the kernel. It's
+// linked into this skel via the scaffold CMakeLists which now picks up
+// lib/shannon-prime/backends/hexagon/sp_hex_matmul_block_q8.c. The DSP
+// path compiles with __HVX__ defined, so the vectorised inner runs.
+// ============================================================================
+
+#include "../../sp_hex_matmul_block_q8.h"  // sp_hex_matmul_ok_block_q8_inner
+#include "../../sp_hex_mobius_scatter.h"   // sp_hex_mobius_scatter_f32
+#include "../../sp_hex_mobius_tables.h"    // sp_hex_mobius_supported_head_dim
+
+int sp_hex_matmul_block_q8(remote_handle64 h,
+                            const unsigned char* w_blocks_bytes,
+                            int w_blocks_bytes_len,
+                            const long long* x_row,
+                            int x_row_len,
+                            int blocks_per_row,
+                            long long* acc_a,
+                            long long* acc_b) {
+    (void)h;
+    if (!w_blocks_bytes || !x_row || !acc_a || blocks_per_row <= 0) return -1;
+
+    /* w_blocks_bytes_len must be blocks_per_row × sizeof(sp_ok_q8_block_t)=64. */
+    if (w_blocks_bytes_len != blocks_per_row * 64) {
+        FARF(RUNTIME_HIGH, "[sp_hex] matmul_block_q8: w bytes mismatch %d vs %d",
+             w_blocks_bytes_len, blocks_per_row * 64);
+        return -1;
+    }
+    /* x_row_len must be 2 × blocks_per_row × 32 int64 (interleaved a,b). */
+    const int expected_x_len = 2 * blocks_per_row * 32;
+    if (x_row_len != expected_x_len) {
+        FARF(RUNTIME_HIGH, "[sp_hex] matmul_block_q8: x len mismatch %d vs %d",
+             x_row_len, expected_x_len);
+        return -1;
+    }
+
+    /* x_row arrives as int64 pairs (a, b, a, b, ...) — reinterpret as sp_ok_t.
+     * The layout matches sp_ok_t = {int64 a; int64 b;}. */
+    const sp_ok_t* x_typed = (const sp_ok_t*)x_row;
+    const sp_ok_q8_block_t* w_typed = (const sp_ok_q8_block_t*)w_blocks_bytes;
+
+    int64_t a64 = 0, b64 = 0;
+    int64_t* p_b = acc_b ? &b64 : NULL;
+    sp_hex_matmul_ok_block_q8_inner(w_typed, x_typed, (size_t)blocks_per_row,
+                                     &a64, p_b);
+    *acc_a = a64;
+    if (acc_b) *acc_b = b64;
+    return 0;
+}
+
+// ============================================================================
+// Strike 6: HVX Möbius reorder via vscatter into session VTCM.
+// ============================================================================
+
+int sp_hex_mobius_scatter_f32(remote_handle64 h,
+                               const float* in_coeffs,
+                               int in_coeffs_len,
+                               int head_dim,
+                               float* out_reordered,
+                               int out_reordered_len) {
+    sp_hex_session_t *sess = (sp_hex_session_t *)h;
+    if (!sess) return -1;
+    if (!in_coeffs || !out_reordered) return -1;
+    if (in_coeffs_len != head_dim || out_reordered_len != head_dim) {
+        FARF(RUNTIME_HIGH, "[sp_hex] mobius_scatter: length mismatch in=%d out=%d hd=%d",
+             in_coeffs_len, out_reordered_len, head_dim);
+        return -1;
+    }
+    if (!sp_hex_mobius_supported_head_dim(head_dim)) {
+        FARF(RUNTIME_HIGH, "[sp_hex] mobius_scatter: unsupported head_dim=%d", head_dim);
+        return -1;
+    }
+    if (!sess->vtcm_ptr || sess->vtcm_bytes < (int)(head_dim * sizeof(float))) {
+        FARF(RUNTIME_HIGH, "[sp_hex] mobius_scatter: VTCM unavailable (ptr=%p bytes=%d)",
+             sess->vtcm_ptr, sess->vtcm_bytes);
+        return -1;
+    }
+    /* The kernel handles HVX scatter + scatter_release barrier internally. */
+    return (int)sp_hex_mobius_scatter_f32_dsp(in_coeffs, head_dim, out_reordered,
+                                               sess->vtcm_ptr,
+                                               (size_t)sess->vtcm_bytes);
+}
+
+// ============================================================================
+// Strike 9: Grand Fusion — VHT2 + HVX Möbius scatter + HVX band_quantize.
+//
+// One FastRPC dispatch executes the full encode pipeline on the DSP:
+//   1. VHT2 forward in a stack-resident fp32 scratch (DDR)
+//   2. HVX Möbius scatter: scratch (DDR) → session VTCM, no readback
+//   3. HVX band_quantize: VTCM → out_packed
+//
+// The vmem load inside band_quantize's amax pass naturally drains the
+// scatter queue (scatter_release semantics). No explicit barrier needed.
+// ============================================================================
+
+int sp_hex_compress_f32_full(remote_handle64 h,
+                              const float *in_vec, int in_len,
+                              int head_dim,
+                              unsigned char *out_packed, int out_capacity,
+                              int *packed_used) {
+    sp_hex_session_t *sess = (sp_hex_session_t *)h;
+    if (!sess || !packed_used) return -1;
+    *packed_used = 0;
+    if (in_len != head_dim) {
+        FARF(ERROR, "[sp_hex] compress_full: length mismatch in=%d hd=%d",
+             in_len, head_dim);
+        return -1;
+    }
+    if (!sp_hex_mobius_supported_head_dim(head_dim)) {
+        FARF(ERROR, "[sp_hex] compress_full: head_dim=%d not in {64,128,256,512}",
+             head_dim);
+        return -1;
+    }
+    if (!sess->vtcm_ptr || sess->vtcm_bytes < (int)(head_dim * sizeof(float))) {
+        FARF(ERROR, "[sp_hex] compress_full: VTCM unavailable");
+        return -1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    if (bc.total_bytes > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_full: packed=%d > capacity=%d",
+             bc.total_bytes, out_capacity);
+        return -1;
+    }
+
+    /* Step 1: VHT2 forward into 128-B aligned DDR scratch. */
+    float coeffs[1024] __attribute__((aligned(128)));
+    memcpy(coeffs, in_vec, sizeof(float) * (size_t)head_dim);
+    sp_hex_vht2_f32(coeffs, head_dim);
+
+    /* Step 2: HVX Möbius scatter coeffs → VTCM. NULL out_reordered means
+     * "leave data in VTCM, no DDR readback" — the next kernel's vmem
+     * load is the scatter_release barrier. */
+    int sc_rc = (int)sp_hex_mobius_scatter_f32_dsp(coeffs, head_dim,
+                                                    /*out_reordered=*/NULL,
+                                                    sess->vtcm_ptr,
+                                                    (size_t)sess->vtcm_bytes);
+    if (sc_rc != 0) {
+        FARF(ERROR, "[sp_hex] compress_full: mobius_scatter rc=%d", sc_rc);
+        return sc_rc;
+    }
+
+    /* Step 3: HVX band_quantize reading directly from VTCM. The first
+     * vmem inside the amax pass drains pending scatters from step 2. */
+    int written = 0;
+    int rc = sp_hex_band_quantize_scalar((const float *)sess->vtcm_ptr,
+                                          head_dim, out_packed,
+                                          out_capacity, &written);
+    if (rc != 0) {
+        FARF(ERROR, "[sp_hex] compress_full: band_quantize rc=%d", rc);
+        return rc;
+    }
+    *packed_used = written;
+    return 0;
+}
+
+// ============================================================================
+// compress_f32_full_batch — Strike 10b: batched grand fusion.
+// ============================================================================
+//
+// Loops the Strike 9 fused encode internally over n_vectors. Each iteration
+// reuses the same VTCM scratch — Möbius scatter overwrites the prior tile,
+// band_quantize drains via vmem load (scatter_release), packed bytes get
+// written straight to their per-vector offset in out_packed. No DDR round
+// trip between iterations beyond the unavoidable in_vecs read.
+// ============================================================================
+
+int sp_hex_compress_f32_full_batch(remote_handle64 h,
+                                    const float *in_vecs, int in_len,
+                                    int head_dim, int n_vectors,
+                                    unsigned char *out_packed, int out_capacity,
+                                    int *packed_used) {
+    sp_hex_session_t *sess = (sp_hex_session_t *)h;
+    if (!sess || !packed_used) return -1;
+    *packed_used = 0;
+    if (n_vectors <= 0) {
+        FARF(ERROR, "[sp_hex] compress_full_batch: n_vectors=%d <= 0", n_vectors);
+        return -1;
+    }
+    if (!sp_hex_mobius_supported_head_dim(head_dim)) {
+        FARF(ERROR, "[sp_hex] compress_full_batch: head_dim=%d not in {64,128,256,512}",
+             head_dim);
+        return -1;
+    }
+    if (in_len != n_vectors * head_dim) {
+        FARF(ERROR, "[sp_hex] compress_full_batch: in_len=%d != n_vec=%d * hd=%d",
+             in_len, n_vectors, head_dim);
+        return -1;
+    }
+    if (!sess->vtcm_ptr || sess->vtcm_bytes < (int)(head_dim * sizeof(float))) {
+        FARF(ERROR, "[sp_hex] compress_full_batch: VTCM unavailable");
+        return -1;
+    }
+
+    sp_band_config_t bc;
+    int default_bits[4] = {5, 5, 4, 3};
+    sp_band_config_init(&bc, head_dim, 4, default_bits);
+    int per_vec_bytes = bc.total_bytes;
+    int total_needed = n_vectors * per_vec_bytes;
+    if (total_needed > out_capacity) {
+        FARF(ERROR, "[sp_hex] compress_full_batch: needed=%d > capacity=%d",
+             total_needed, out_capacity);
+        return -1;
+    }
+
+    /* Reused across iterations — same alignment and size as the single-vec
+     * path. head_dim <= 512 by the supported-set check above, so 1024 is
+     * the safe upper bound and matches the existing batch convention. */
+    float coeffs[1024] __attribute__((aligned(128)));
+
+    for (int i = 0; i < n_vectors; ++i) {
+        const float *in_vec = in_vecs + (size_t)i * (size_t)head_dim;
+        unsigned char *out_slot = out_packed + (size_t)i * (size_t)per_vec_bytes;
+
+        /* Step 1: VHT2 forward into stack scratch. */
+        memcpy(coeffs, in_vec, sizeof(float) * (size_t)head_dim);
+        sp_hex_vht2_f32(coeffs, head_dim);
+
+        /* Step 2: HVX Möbius scatter coeffs → VTCM, NULL readback. */
+        int sc_rc = (int)sp_hex_mobius_scatter_f32_dsp(coeffs, head_dim,
+                                                        /*out_reordered=*/NULL,
+                                                        sess->vtcm_ptr,
+                                                        (size_t)sess->vtcm_bytes);
+        if (sc_rc != 0) {
+            FARF(ERROR, "[sp_hex] compress_full_batch: vec[%d] scatter rc=%d",
+                 i, sc_rc);
+            return sc_rc;
+        }
+
+        /* Step 3: HVX band_quantize drains scatter + writes to out_slot. */
+        int written = 0;
+        int rc = sp_hex_band_quantize_scalar((const float *)sess->vtcm_ptr,
+                                              head_dim, out_slot,
+                                              per_vec_bytes, &written);
+        if (rc != 0) {
+            FARF(ERROR, "[sp_hex] compress_full_batch: vec[%d] band_quantize rc=%d",
+                 i, rc);
+            return rc;
+        }
+        if (written != per_vec_bytes) {
+            FARF(ERROR, "[sp_hex] compress_full_batch: vec[%d] short write %d != %d",
+                 i, written, per_vec_bytes);
+            return -1;
+        }
+    }
+    *packed_used = total_needed;
+    return 0;
+}
+
+// ============================================================================
+// Strike 11: Hierarchical Spinor W-matrix predictor (dispatch stub).
+// ============================================================================
+//
+// Multiplies the `skeleton_size`-element Knight skeleton by a baked Q15 W
+// matrix (column-major .rodata) and writes `predicted_size` fp32 residuals.
+// The HVX inner kernel is in sp_hex_hier_predict_hvx_q15 (forward-declared
+// below); it lives in lib/shannon-prime/backends/hexagon/sp_hex_hier_predict.c
+// and gets compiled into the DSP skeleton alongside the other Strike kernels.
+//
+// Currently supports head_dim=154 (skeleton=14, predicted=140). Other dims
+// return -2 ("config not in rodata bank"). New mixed-radix configs land by
+// running `python scripts/gen_w_matrix.py` to bake the new W header and
+// adding a dispatch arm below.
+//
+// Q15 contract: int16 Q15 W × fp32 skeleton -> int32 accumulator -> fp32 out.
+// The kernel scales the skeleton into Q15 ints internally, runs the MACs in
+// int32, then divides by 32767 on the way out so callers see a clean fp32
+// interface. Quant error budget reported by gen_w_matrix.py at bake time.
+// ============================================================================
+
+#include "../../sp_hex_w_matrix_hd154.h"  // baked Q15 W matrix, column-major
+
+// Forward declaration — HVX kernel lives in a separate TU so the IDL stub
+// can compile cleanly even before the kernel ships (parity test stays red
+// in that interim window, which is the right diagnostic signal).
+extern int sp_hex_hier_predict_hvx_q15(const float *skeleton,
+                                        int skeleton_size,
+                                        const int16_t *w_matrix_q15_colmajor,
+                                        int predicted_size,
+                                        float *predicted);
+
+int sp_hex_hier_predict_f32(remote_handle64 h,
+                             const float *skeleton, int skeleton_len,
+                             float *predicted, int predicted_len) {
+    (void)h;
+    if (!skeleton || !predicted) {
+        FARF(ERROR, "[sp_hex] hier_predict: null pointer");
+        return -1;
+    }
+
+    /* Dispatch on (skeleton_len, predicted_len) against the rodata bank.
+     * Currently a single config; expand with `else if` arms as new W
+     * tables land. The shape pair uniquely identifies the head_dim. */
+    if (skeleton_len == SP_HEX_W_MATRIX_HD154_SKELETON &&
+        predicted_len == SP_HEX_W_MATRIX_HD154_PREDICTED) {
+        return sp_hex_hier_predict_hvx_q15(skeleton, skeleton_len,
+                                            sp_hex_w_matrix_hd154,
+                                            predicted_len, predicted);
+    }
+
+    FARF(ERROR,
+         "[sp_hex] hier_predict: shape (%d, %d) not in rodata bank "
+         "(supported: (14, 140) for head_dim=154)",
+         skeleton_len, predicted_len);
+    return -2;
+}

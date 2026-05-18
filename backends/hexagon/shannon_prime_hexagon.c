@@ -551,20 +551,46 @@ static void sp_hex_cache_write_one(sp_hexagon_cache_t *cache,
     memcpy(cache->vec_in_f32, vec, sizeof(float) * hd);
     sp_hex_rpcmem_sync_for_dsp(cache->vec_in_f32, sizeof(float) * hd);
     int packed_used = 0;
-    int rc = is_k
-        ? sp_hex_compress_f32  (cache->ctx->fastrpc_handle,
-                                  cache->vec_in_f32, hd, hd,
-                                  out_scratch, bc->total_bytes,
-                                  &packed_used)
-        : sp_hex_compress_f32_v(cache->ctx->fastrpc_handle,
+    int rc;
+    // Strike 10 wire-up: on the K path, dispatch through sp_hex_compress_f32_full
+    // (Strike 9 grand fusion — VHT2 + HVX Möbius scatter + HVX band_quantize
+    // chained through VTCM in a single FastRPC call) when head_dim is one of
+    // the supported compile-time tables {64, 128, 256, 512}. Falls back to the
+    // legacy 3-step sp_hex_compress_f32 path for unsupported dims (e.g., 96).
+    // Output is byte-identical — validated by sp_hex_compress_f32_full_parity.
+    //
+    // Env override: SP_HEX_DISABLE_COMPRESS_F32_FULL=1 forces the legacy path
+    // (for A/B comparison and recovery if a future kernel change regresses).
+    static int strike9_disabled = -1;
+    if (strike9_disabled < 0) {
+        const char *e = getenv("SP_HEX_DISABLE_COMPRESS_F32_FULL");
+        strike9_disabled = (e && *e == '1') ? 1 : 0;
+    }
+    const int hd_supports_fused =
+        (hd == 64 || hd == 128 || hd == 256 || hd == 512);
+    if (is_k && hd_supports_fused && !strike9_disabled) {
+        rc = sp_hex_compress_f32_full(cache->ctx->fastrpc_handle,
+                                       cache->vec_in_f32, hd, hd,
+                                       out_scratch, bc->total_bytes,
+                                       &packed_used);
+    } else if (is_k) {
+        rc = sp_hex_compress_f32(cache->ctx->fastrpc_handle,
                                   cache->vec_in_f32, hd, hd,
                                   out_scratch, bc->total_bytes,
                                   &packed_used);
+    } else {
+        rc = sp_hex_compress_f32_v(cache->ctx->fastrpc_handle,
+                                    cache->vec_in_f32, hd, hd,
+                                    out_scratch, bc->total_bytes,
+                                    &packed_used);
+    }
     if (rc != AEE_SUCCESS || packed_used != bc->total_bytes) {
         static int warned = 0;
         if (!warned) {
-            fprintf(stderr, "[Shannon-Prime] hexagon: compress_f32 rc=0x%x "
+            fprintf(stderr, "[Shannon-Prime] hexagon: compress_f32%s rc=0x%x "
                     "used=%d expect=%d (slot=%d pos=%d)\n",
+                    (is_k && hd_supports_fused && !strike9_disabled)
+                        ? "_full" : (is_k ? "" : "_v"),
                     rc, packed_used, bc->total_bytes, slot, pos);
             warned = 1;
         }
@@ -674,6 +700,16 @@ void sp_hexagon_cache_read_v_partial(const sp_hexagon_cache_t *cache, int layer,
 // output into the host-only cache slot. Net effect: 256K dispatches becomes
 // 256K / chunk_size — at chunk=32 that's ~8K, a ~32× reduction.
 //
+// Strike 10/10b status: BOTH paths now route through the grand-fusion
+// IDL on supported head_dims (64/128/256/512).
+//   - sp_hex_cache_write_one (single-vec, generation) → sp_hex_compress_f32_full
+//   - sp_hex_cache_write_k_batch_chunk (chunk, prefill) → sp_hex_compress_f32_full_batch
+// Both collapse the legacy 3-pass DSP chain (VHT2 → Möbius → band_quantize
+// across three separate kernels) into a single VTCM-resident dispatch.
+// Output bytes are identical to the legacy chain (validated by
+// sp_hex_compress_f32_full_parity). Env override
+// SP_HEX_DISABLE_COMPRESS_F32_FULL=1 reverts both to the legacy paths.
+//
 // Generation (n_pos=1) skips the batch path and uses single-position
 // write_k, since chunk=1 has no benefit and adds the in-scratch copy.
 static void sp_hex_cache_write_k_batch_chunk(sp_hexagon_cache_t *cache,
@@ -700,17 +736,40 @@ static void sp_hex_cache_write_k_batch_chunk(sp_hexagon_cache_t *cache,
     memcpy(in_scratch, k_vecs, (size_t)chunk_n * hd * sizeof(float));
     sp_hex_rpcmem_sync_for_dsp(in_scratch, (size_t)chunk_n * hd * sizeof(float));
 
+    // Strike 10b wire-up: dispatch through compress_f32_full_batch — the
+    // batched fused Strike 9 pipeline — when head_dim is one of the
+    // Möbius compile-time tables. Falls back to compress_f32_batch (the
+    // legacy DSP-side 3-pass chain) for unsupported dims. Env override
+    // SP_HEX_DISABLE_COMPRESS_F32_FULL=1 keeps the whole pipeline on the
+    // legacy path for A/B comparison.
+    static int strike9_batch_disabled = -1;
+    if (strike9_batch_disabled < 0) {
+        const char *e = getenv("SP_HEX_DISABLE_COMPRESS_F32_FULL");
+        strike9_batch_disabled = (e && *e == '1') ? 1 : 0;
+    }
+    const int hd_supports_fused =
+        (hd == 64 || hd == 128 || hd == 256 || hd == 512);
     int packed_used = 0;
-    int rc = sp_hex_compress_f32_batch(cache->ctx->fastrpc_handle,
+    int rc;
+    if (hd_supports_fused && !strike9_batch_disabled) {
+        rc = sp_hex_compress_f32_full_batch(cache->ctx->fastrpc_handle,
+                                             in_scratch, chunk_n * hd,
+                                             hd, chunk_n,
+                                             out_scratch, chunk_n * bc->total_bytes,
+                                             &packed_used);
+    } else {
+        rc = sp_hex_compress_f32_batch(cache->ctx->fastrpc_handle,
                                         in_scratch, chunk_n * hd,
                                         hd, chunk_n,
                                         out_scratch, chunk_n * bc->total_bytes,
                                         &packed_used);
+    }
     if (rc != AEE_SUCCESS || packed_used != chunk_n * bc->total_bytes) {
         static int warned = 0;
         if (!warned) {
-            fprintf(stderr, "[Shannon-Prime] hexagon: compress_f32_batch rc=0x%x "
+            fprintf(stderr, "[Shannon-Prime] hexagon: compress_f32%s_batch rc=0x%x "
                     "used=%d expect=%d (slot=%d start=%d n=%d)\n",
+                    (hd_supports_fused && !strike9_batch_disabled) ? "_full" : "",
                     rc, packed_used, chunk_n * bc->total_bytes,
                     slot, start_pos, chunk_n);
             warned = 1;

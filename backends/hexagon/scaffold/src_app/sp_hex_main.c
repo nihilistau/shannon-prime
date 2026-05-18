@@ -107,6 +107,95 @@ int main(int argc, char *argv[]) {
         printf("ERROR: kq_matmul_bench failed (err=%d)\n", kqErr);
         // non-fatal — print and continue
     }
+
+    // Strike 5.5: validate the HVX cyclotomic matmul kernel via FastRPC.
+    // Walks blocks_per_row through (1, 4, 16, 64) and asserts bit-equal
+    // (acc_a, acc_b) between the DSP HVX path and the host scalar reference.
+    printf("\n[parity] === Strike 5: matmul_block_q8 FastRPC parity test ===\n");
+    int parity_fail = 0;
+    int parity_widths[] = {1, 4, 16, 64};
+    for (int i = 0; i < 4; ++i) {
+        int rc = sp_hex_matmul_block_q8_parity(parity_widths[i]);
+        if (rc) { parity_fail = 1; break; }
+    }
+    if (parity_fail) {
+        printf("[parity] FAIL — HVX kernel diverged from host reference\n");
+    } else {
+        printf("[parity] all configurations bit-equal\n");
+    }
+
+    // Strike 6: validate HVX vscatter-based Möbius reorder via FastRPC.
+    printf("\n[mobius] === Strike 6: mobius_scatter_f32 FastRPC parity test ===\n");
+    int mobius_fail = 0;
+    int mobius_dims[] = {64, 128, 256, 512};
+    for (int i = 0; i < 4; ++i) {
+        int rc = sp_hex_mobius_scatter_parity(mobius_dims[i]);
+        if (rc) { mobius_fail = 1; break; }
+    }
+    if (mobius_fail) {
+        printf("[mobius] FAIL — HVX scatter diverged from host reorder\n");
+    } else {
+        printf("[mobius] all 4 head_dims (64/128/256/512) bit-equal\n");
+    }
+
+    // Strike 7: byte-equal parity for HVX band_quantize (5/5/4/3).
+    printf("\n[bandq] === Strike 7: band_quantize FastRPC byte-equal parity ===\n");
+    int bandq_fail = 0;
+    int bandq_dims[] = {64, 128, 256, 512};
+    for (int i = 0; i < 4; ++i) {
+        int rc = sp_hex_band_quantize_parity(bandq_dims[i]);
+        if (rc) { bandq_fail = 1; break; }
+    }
+    if (bandq_fail) {
+        printf("[bandq] FAIL — packed bytes diverged from host sp_band_quantize\n");
+    } else {
+        printf("[bandq] all 4 head_dims byte-equal — disk-tier format locked\n");
+    }
+
+    // Strike 8a: HVX logit argmax — kill the 300 KB FastRPC choke on decode.
+    printf("\n[argmax] === Strike 8a: logit_argmax_u16 FastRPC parity test ===\n");
+    int argmax_fail = sp_hex_logit_argmax_parity();
+    if (argmax_fail) {
+        printf("[argmax] FAIL — HVX argmax diverged from host scalar\n");
+    } else {
+        printf("[argmax] all cases match — 300 KB IPC choke collapsed to 4 bytes\n");
+    }
+
+    // Strike 9: Grand Fusion — VHT2 + Möbius + band_quantize in one dispatch.
+    printf("\n[fused] === Strike 9: compress_f32_full FastRPC parity test ===\n");
+    int fused_fail = 0;
+    int fused_dims[] = {64, 128, 256, 512};
+    for (int i = 0; i < 4; ++i) {
+        int rc = sp_hex_compress_f32_full_parity(fused_dims[i]);
+        if (rc) { fused_fail = 1; break; }
+    }
+    if (fused_fail) {
+        printf("[fused] FAIL — fused pipeline diverged from host reference\n");
+    } else {
+        printf("[fused] all 4 head_dims byte-equal — 3 dispatches → 1, DSP autonomous\n");
+    }
+
+    // Strike 10b: Batched Grand Fusion — single dispatch encodes a whole chunk.
+    // Sweep representative prefill chunk sizes: 1 (degenerate, should match the
+    // single-vec path), 8 (small batch), 32 (production default chunk size),
+    // 64 (max chunk on long contexts).
+    printf("\n[fused_batch] === Strike 10b: compress_f32_full_batch FastRPC parity ===\n");
+    int fused_batch_fail = 0;
+    int fbatch_dims[] = {64, 128, 256, 512};
+    int fbatch_ns[]   = {1, 8, 32, 64};
+    for (int i = 0; i < 4 && !fused_batch_fail; ++i) {
+        for (int j = 0; j < 4 && !fused_batch_fail; ++j) {
+            int rc = sp_hex_compress_f32_full_batch_parity(fbatch_dims[i],
+                                                            fbatch_ns[j]);
+            if (rc) { fused_batch_fail = 1; }
+        }
+    }
+    if (fused_batch_fail) {
+        printf("[fused_batch] FAIL — batched fused pipeline diverged from host\n");
+    } else {
+        printf("[fused_batch] all 4 head_dims × 4 batch sizes byte-equal — prefill collapsed\n");
+    }
+
     printf("\n[sp_hex] All paths green\n\n");
     return 0;
 }

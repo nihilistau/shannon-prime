@@ -299,4 +299,135 @@ interface sp_hex : remote_handle64 {
    long probe_dma_raw(in sequence<unsigned short> src_buf,
                       in long src_len_words,
                       rout long timing_us);
+
+   // -------------------------------------------------------------------
+   // matmul_block_q8 — Strike 5: HVX cyclotomic matmul over packed
+   // sp_ok_q8_block_t weights with sp_ok_t activations.
+   //
+   // Computes one (i, j) output coefficient of  Y[i,j] = sum_k W[i,k] * X[j,k]
+   // where W's row is a contiguous array of 64-B sp_ok_q8_block_t structs
+   // (pre-fused Frobenius B_a/B_b headers + 32 int8 codepoints per block)
+   // and X's row is a contiguous array of sp_ok_t = (int64 a, int64 b)
+   // = 16 B per element.
+   //
+   // The two-phase math (sp_hex_matmul_block_q8.c on the DSP side):
+   //   Phase 1: per-block byte-vs-int64 dot products D_a, D_b — HVX hot loop
+   //   Phase 2: per-block (B_a, B_b) cyclotomic fold — scalar tail
+   //
+   // SMMU contract: w_blocks_bytes points at SMMU-mapped ION pages that
+   // the host allocated via sp_oracle_prefetch_create_rpcmem(). FastRPC
+   // passes the page-aligned pointer via the rpcmem heap, NOT a marshal
+   // copy — same physical pages the cDSP sees through the SMMU.
+   //
+   // Args:
+   //   w_blocks_bytes  : blocks_per_row × 64 octets, pre-fused weights
+   //   x_row           : blocks_per_row × 32 sp_ok_t coordinates,
+   //                     marshalled as 2 * blocks_per_row * 32 int64s
+   //                     (interleaved a, b, a, b, ...)
+   //   blocks_per_row  : number of 32-element blocks (K / 32)
+   //   acc_a           : O_K-ring real coordinate accumulator
+   //   acc_b           : O_K-ring ω coordinate accumulator
+   //
+   // Returns 0 on success, -1 on shape/null mismatch.
+   // -------------------------------------------------------------------
+   long matmul_block_q8(in sequence<octet> w_blocks_bytes,
+                        in sequence<long long> x_row,
+                        in long blocks_per_row,
+                        rout long long acc_a,
+                        rout long long acc_b);
+
+   // -------------------------------------------------------------------
+   // mobius_scatter_f32 — Strike 6: HVX Möbius reorder via vscatter.
+   //
+   // Reorders an fp32 vector via squarefree-first Möbius permutation
+   // using HVX vscatter into the session's VTCM region, then reads
+   // back to drain the scatter queue (scatter_release barrier).
+   //
+   // head_dim must be in {64, 128, 256, 512} — the compile-time tables
+   // cover these. Unsupported dims return -1 so callers can fall back
+   // to the scalar host reorder.
+   //
+   // The output is bit-equal to the host's sp_mobius_reorder_ex —
+   // pure data movement, no math. Validates:
+   //   - vscatter writes 32 lanes per issue at byte offsets from Vv
+   //   - vmem load from VTCM correctly stalls until scatters drain
+   //   - the compile-time offset tables match the host's mu-sieve
+   // -------------------------------------------------------------------
+   long mobius_scatter_f32(in sequence<float> in_coeffs,
+                           in long head_dim,
+                           rout sequence<float> out_reordered);
+
+   // -------------------------------------------------------------------
+   // compress_f32_full — Strike 9: Grand Fusion.
+   //
+   // Single FastRPC dispatch executes the full K-cache encode pipeline:
+   //   in_vec (raw fp32) ──▶ VHT2 forward ──▶ HVX Möbius scatter ──▶
+   //   HVX band_quantize ──▶ out_packed (disk-tier bytes)
+   //
+   // The Möbius scatter writes into the session VTCM region; the
+   // band_quantize amax pass reads back from VTCM via vmem load, which
+   // is the implicit scatter_release barrier. No DDR round-trip between
+   // the scatter and quantize stages — the data stays in VTCM across
+   // both kernel passes.
+   //
+   // Output byte format: identical to host's
+   //   sp_vht2_forward_f32 ──▶ sp_mobius_reorder_ex ──▶ sp_band_quantize
+   // sequence, validated by sp_hex_compress_f32_full_parity.
+   // -------------------------------------------------------------------
+   long compress_f32_full(in sequence<float> in_vec,
+                          in long head_dim,
+                          rout sequence<octet> out_packed,
+                          rout long packed_used);
+
+   // -------------------------------------------------------------------
+   // compress_f32_full_batch — Strike 10b: batched grand fusion.
+   //
+   // Loops sp_hex_compress_f32_full internally over n_vectors so the host
+   // pays one FastRPC dispatch per chunk instead of one per position AND
+   // each per-vector encode runs the full Strike 9 fused pipeline (VHT2
+   // + HVX Möbius scatter + HVX band_quantize through VTCM).
+   //
+   // Layout:
+   //   in_vecs    = n_vectors * head_dim contiguous fp32
+   //   out_packed = n_vectors * bc.total_bytes contiguous octets
+   //   packed_used = n_vectors * bc.total_bytes on success
+   //
+   // head_dim must be one of {64, 128, 256, 512} (the Möbius compile-time
+   // tables). For unsupported head_dim, the bridge falls back to
+   // compress_f32_batch (the legacy 3-pass DSP-side chain).
+   //
+   // The VTCM scratch region is reused across vectors — each iteration's
+   // scatter overwrites the previous iteration's coefficients before the
+   // band_quantize pass touches them, so no inter-iteration race.
+   // -------------------------------------------------------------------
+   long compress_f32_full_batch(in sequence<float> in_vecs,
+                                in long head_dim,
+                                in long n_vectors,
+                                rout sequence<octet> out_packed,
+                                rout long packed_used);
+
+   // -------------------------------------------------------------------
+   // hier_predict_f32 — Strike 11: Hierarchical Spinor W-matrix predict.
+   //
+   // Takes the `skeleton_size`-element Knight skeleton (fp32) and returns
+   // `predicted_size`-element predicted residuals (fp32). The matrix
+   // multiply is performed in int16 Q15 fixed-point on V69's HVX MAC
+   // units; the DSP converts to/from fp32 internally so the host sees
+   // a clean fp32 interface (matching the desktop sp_hier_predict_f32
+   // reference exactly modulo Q15 quantization error of the W matrix).
+   //
+   // The W matrix is baked into the DSP .rodata, keyed off head_dim.
+   // Currently supported config:
+   //   head_dim=154 : skeleton_size=14, predicted_size=140
+   //                   (mixed-radix 154 = 2 * 7 * 11)
+   //
+   // Layout contract:
+   //   skeleton  : length 14 fp32 contiguous
+   //   predicted : length 140 fp32 contiguous, output
+   //
+   // Other head_dims fall through with an error code; calibration adds
+   // more entries to the rodata bank as new mixed-radix configs land.
+   // -------------------------------------------------------------------
+   long hier_predict_f32(in sequence<float> skeleton,
+                         rout sequence<float> predicted);
 };
