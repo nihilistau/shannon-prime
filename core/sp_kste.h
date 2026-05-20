@@ -277,6 +277,30 @@ int sp_kste_embed_unordered   (const sp_kste_tree *Q, const sp_kste_tree *K);
 int sp_kste_embed_unordered_ex(const sp_kste_tree *Q, const sp_kste_tree *K,
                                sp_kste_embed_stats *stats);
 
+/* ---------- Choice operator F (Phase 7 / Paper IV §10) ------------------ */
+
+/* The choice operator F : finite set of sp_kste_tree -> sp_kste_tree
+ * picks the canonical representative of a ⪯_d-equivalence class.
+ *
+ * Implementation: lex-min over the packed 64-byte sp_kste_tree
+ * representation (labels[15] || parents[45] || node_count || _pad[3]).
+ * Comparison is byte-wise via memcmp, deterministic and
+ * order-invariant — given the same multiset of input trees in any
+ * order, the same canonical tree is returned.
+ *
+ * Returns NULL iff trees == NULL or n <= 0.
+ * Returns a pointer to one of the input trees on success (no copy).
+ *
+ * T3.6 verification: 1000 shuffled invocations on the same multiset
+ * must return the same canonical pointer-by-content. */
+const sp_kste_tree* sp_kste_select_canonical(const sp_kste_tree * const *trees,
+                                             int n);
+
+/* Lex-compare two trees by their packed-byte representation.  Returns
+ * negative / zero / positive in the usual memcmp convention.  Useful
+ * for testing the choice operator's total-order property. */
+int sp_kste_tree_compare(const sp_kste_tree *a, const sp_kste_tree *b);
+
 #ifdef __cplusplus
 }
 #endif
