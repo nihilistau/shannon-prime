@@ -133,7 +133,7 @@ Aligned with [Paper I §12](https://github.com/nihilistau/Position_Is_Arithmetic
 
 - **T1 — Endomorphism realization.** Hidden-state trajectory through $L$ layers embeds in $E^L$ exactly.
 - **T2 — Möbius UFD compression.** Reconstruction over $\mathcal{O}_K$ at squarefree basis is exact.
-- **T3 — Hasse–Weil = Shannon limit.** $|\#E_p(\mathbb{F}_p) - (p+1)| \le 2\sqrt p$.
+- **T3 — Hasse–Weil = Shannon limit.** $|E_p(\mathbb{F}_p) - (p+1)| \le 2\sqrt p$.
 - **T4 — Frobenius cancellation.** Validated bit-identical at six significant figures on Gemma3-1B (PPL 13.11 vs 13.12).
 - **T5 — Deuring / CM Sato–Tate.** Asymmetric distribution of $a_p$ between split and inert primes.
 - **T6 — CRT exact sharding.** Dual-prime kernel bit-identical to 60-bit reference; portable.
