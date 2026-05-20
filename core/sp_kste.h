@@ -301,6 +301,35 @@ const sp_kste_tree* sp_kste_select_canonical(const sp_kste_tree * const *trees,
  * for testing the choice operator's total-order property. */
 int sp_kste_tree_compare(const sp_kste_tree *a, const sp_kste_tree *b);
 
+/* ---------- Ramanujan-Fourier modulation (Phase 9 / Paper IV §10+) ----
+ *
+ * Inject position-aware coprimality structure into the K-vector before
+ * the KSTE encoder runs.  For each component i, adds
+ *     λ · c_{q_i}(position) / q_i²
+ * where q_i = BANK[i mod |BANK|] cycles through the fixed q-bank
+ * {2, 3, 5, 6, 10} and c_q(p) is computed via Kluyver's theorem
+ * (Σ_{d | gcd(p,q)} μ(q/d) · d).
+ *
+ * Properties:
+ *   - λ == 0 is a strict no-op (preserves pre-Phase-9 baseline).
+ *   - Bounded: |perturbation_i| ≤ λ for all dims (|c_q| ≤ φ(q),
+ *     weighted by 1/q² → ≤ 1).
+ *   - Pure C, no overflow, no __int128.  ~20 ops to build the bank
+ *     per call + one fp32 add per dim.
+ *
+ * Two K-vectors that agree pointwise but sit at different integer
+ * positions p, p' will receive different perturbations and therefore
+ * produce different packed sp_kste_tree outputs after encoding —
+ * which is the discriminative property the ⪯_d-based ultraproduct
+ * path needs to break ties via the Choice Operator F. */
+void sp_kste_ramanujan_modulate(float       *K,
+                                int          head_dim,
+                                int          position,
+                                float        lambda);
+
+/* Exposed for unit testing of Kluyver's identity. */
+int sp_kste_ramanujan_cq_for_test(int q, int p);
+
 #ifdef __cplusplus
 }
 #endif
