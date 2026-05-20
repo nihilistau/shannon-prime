@@ -22,7 +22,11 @@
  * We use a small q-bank {2, 3, 5, 6, 10} weighted by 1/q² and apply
  * the result as an additive perturbation to K:
  *     K'[i] = K[i] + λ · c_{q_i}(p) / q_i²
- * where q_i = BANK[i mod |BANK|] cycles through the bank across dims.
+ * where q_i = BANK[SHUFFLE[i mod 256]] with SHUFFLE a 256-entry table
+ * of precomputed splitmix64(seed ^ i) mod |BANK| values (Phase 10).
+ * The original (i mod |BANK|) cycling produced a period-|BANK| carrier
+ * wave that VHT2 locked onto upstream — the shuffled lookup breaks the
+ * periodicity without disturbing the c_q(p) math.
  *
  * Properties:
  *   - λ == 0 makes this a no-op (preserves Phase 8 baseline exactly).
@@ -129,6 +133,40 @@ static const float sp_kste_ramanujan_inv_q2[SP_KSTE_RAMANUJAN_BANK_SIZE] = {
     1.0f / 100.0f   /*  q=10 */
 };
 
+/* ---------- Phase 10: shuffled q-bank index table -------------------- *
+ * Replaces the original (i mod |BANK|) bank-index lookup whose period-5
+ * cycling produced a deterministic carrier wave that VHT2 locked onto
+ * (see Phase 9 negative result, SESSION-STATE-friedman-9.md).
+ *
+ * Each entry is splitmix64(0x9E3779B97F4A7C15 ^ i) mod |BANK|,
+ * precomputed offline so the modulation loop has zero hash-arithmetic
+ * at runtime.  Same deterministic i → bank_idx mapping as a runtime
+ * hash, but with aperiodic distribution.  Reference for the underlying
+ * hash: http://prng.di.unimi.it/splitmix64.c (public domain).
+ *
+ * For head_dim > 256 (none of our current models), the index wraps
+ * via (i & 0xFF); the table itself is aperiodic so wrapping stays
+ * well-distributed.
+ */
+static const unsigned char sp_kste_ramanujan_shuffled[256] = {
+    0, 1, 0, 0, 1, 4, 3, 3, 2, 2, 1, 3, 3, 3, 2, 3,
+    4, 4, 2, 2, 1, 1, 1, 1, 0, 2, 4, 2, 2, 3, 1, 1,
+    1, 0, 4, 1, 1, 4, 0, 0, 3, 4, 3, 3, 1, 0, 2, 2,
+    0, 1, 0, 4, 3, 3, 3, 0, 3, 1, 4, 3, 4, 1, 1, 3,
+    1, 0, 1, 4, 0, 1, 2, 4, 0, 3, 3, 3, 0, 3, 4, 1,
+    2, 0, 4, 2, 1, 0, 3, 1, 3, 3, 2, 3, 2, 2, 0, 2,
+    1, 3, 3, 0, 2, 3, 3, 1, 1, 3, 2, 1, 4, 3, 0, 1,
+    0, 2, 0, 2, 4, 0, 1, 2, 0, 1, 4, 2, 3, 3, 1, 2,
+    0, 1, 1, 3, 3, 0, 0, 3, 0, 0, 4, 2, 4, 0, 1, 0,
+    3, 2, 3, 1, 3, 0, 2, 4, 0, 4, 1, 0, 4, 1, 3, 0,
+    2, 2, 0, 0, 4, 1, 1, 1, 3, 1, 4, 3, 2, 1, 1, 0,
+    2, 2, 2, 2, 3, 3, 1, 1, 1, 4, 3, 0, 4, 1, 2, 1,
+    3, 1, 3, 4, 2, 2, 0, 0, 2, 2, 3, 2, 3, 2, 3, 2,
+    2, 1, 0, 4, 1, 0, 3, 0, 3, 1, 0, 4, 2, 0, 4, 0,
+    0, 1, 2, 0, 0, 4, 3, 0, 0, 4, 1, 2, 1, 0, 4, 0,
+    3, 0, 2, 2, 3, 1, 4, 3, 3, 3, 0, 4, 1, 3, 3, 0
+};
+
 /* ---------- Public API ------------------------------------------------ */
 
 void sp_kste_ramanujan_modulate(float *K, int head_dim,
@@ -145,9 +183,12 @@ void sp_kste_ramanujan_modulate(float *K, int head_dim,
         cq_weighted[j] = (float)cq * sp_kste_ramanujan_inv_q2[j];
     }
 
-    /* Modulate each dim with the bank entry chosen by (i mod |BANK|). */
+    /* Phase 10 — bank index comes from the shuffled table (above).
+     * Same deterministic i → bank mapping as before, but with the
+     * period-|BANK| carrier wave destroyed. */
     for (int i = 0; i < head_dim; ++i) {
-        K[i] += lambda * cq_weighted[i % SP_KSTE_RAMANUJAN_BANK_SIZE];
+        int bank_ix = sp_kste_ramanujan_shuffled[i & 0xFF];
+        K[i] += lambda * cq_weighted[bank_ix];
     }
 }
 
