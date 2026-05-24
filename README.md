@@ -5,6 +5,9 @@
 Shannon-Prime is not a KV-cache compression library. It is the algebraic substrate on which an end-to-end transformer system runs: integer matmul over $\mathcal{O}_K$, polynomial-ring attention, CRT-NTT, Frobenius lifting for low-bit weight storage, and the **Friedman sieve** — an order-invariant cache admission policy built on Dickson's Lemma. The headline scientific claim of the framework is that the sieve **sharpens attention rather than degrading it**: at the calibrated threshold $\tau_A = 0.20$ on `functiongemma-270M`, the sieve evicts 8.77% of K-vectors and perplexity drops **14.80% below the unmodified baseline**. Companion engine: [shannon-prime-engine](https://github.com/nihilistau/shannon-prime-engine). Papers: [Position_Is_Arithmetic](https://github.com/nihilistau/Position_Is_Arithmetic).
 
 ---
+All of the interesting and ongoing work has now moved to [Shannon-Prime-Latice](https://github.com/nihilistau/shannon-prime-lattice), [Shannon-Prime-System](https://github.com/nihilistau/shannon-prime-system) and [Shannon-Prime-System-Engine](https://github.com/nihilistau/shannon-prime-system-engine)
+
+---
 
 ## Table of contents
 
